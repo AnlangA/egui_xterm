@@ -1,0 +1,5791 @@
+//! Core terminal state machine (`Terminal`), configuration, events, snapshots, and VT handlers.
+
+pub mod cursor;
+pub mod modes;
+pub mod mouse;
+pub mod osc;
+pub mod selection;
+pub mod sgr;
+pub mod tabs;
+
+use std::fmt::Write as _;
+
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::cell::{Cell, CellExtra, CellFlags, HyperlinkPool, UnderlineStyle};
+use crate::color::{ColorScheme, PackedColor, Theme};
+#[cfg(feature = "hyperlinks")]
+use crate::features::hyperlinks::{
+    HyperlinkInfo, HyperlinkSpan, ImplicitLinkStore, collect_grid_hyperlink_ids,
+    explicit_visible_spans,
+};
+#[cfg(feature = "kitty-keyboard")]
+use crate::features::kitty_keyboard::{KittyKeyboardFlags, KittyKeyboardState};
+#[cfg(feature = "metrics")]
+use crate::features::metrics::TerminalMetrics;
+#[cfg(feature = "search")]
+use crate::features::search::{SearchError, SearchMatch, SearchQuery, SearchState};
+#[cfg(feature = "shell-integration")]
+use crate::features::shell_integration::{ShellIntegrationState, ShellZone};
+#[cfg(feature = "serde")]
+use crate::grid::GridSnapshot;
+use crate::grid::reflow::{EvictionColPolicy, SelectionReflowInput};
+use crate::grid::{AbsLine, CellExtraTable, Grid, GridPoint, ReflowAnchors, Row, ScreenKind};
+use crate::parser::{C1Policy, CsiParams, DEFAULT_MAX_OSC_BYTES, OscTerminator, Parser, VtHandler};
+use crate::term::osc::OscContext;
+
+pub use self::cursor::{Charset, CharsetSlots, Cursor, CursorAttrs, SavedCursor};
+pub use self::modes::{CursorShape, CursorStyle, Modes, MouseEncoding, MouseProtocol};
+pub use self::mouse::{
+    MouseButton, MouseEventKind, MouseInputEvent, MouseModifiers, encode_mouse_event,
+    focus_event_bytes, format_paste_bytes,
+};
+pub use self::selection::{Selection, SelectionKind, SelectionMode};
+pub use self::tabs::TabStops;
+
+const MAX_COMBINING_PER_CELL: usize = 32;
+
+/// Configuration options for constructing a [`Terminal`].
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct CoreConfig {
+    /// Maximum scrollback lines retained on the primary screen (default: `10_000`).
+    pub scrollback_limit: usize,
+    /// Parser C1 control handling policy (default: [`C1Policy::Utf8Only`]).
+    pub c1_policy: C1Policy,
+    /// Visual theme and base color palette (default: [`Theme::dark()`]).
+    pub theme: Theme,
+    /// Default cursor shape before `DECSCUSR` overrides (default: [`CursorShape::Block`]).
+    pub default_cursor_shape: CursorShape,
+    /// Default cursor blink setting before `DECSCUSR`/`ATT610` overrides (default: `true`).
+    pub default_cursor_blink: bool,
+    /// Watchdog timeout in seconds for DEC Mode 2026 synchronized output (default: `0.250`).
+    pub sync_output_timeout_secs: f64,
+    /// Whether `OSC 52` clipboard read (`?`) requests emit [`TerminalEvent::ClipboardReadRequested`]
+    /// (default: `false`).
+    pub allow_osc52_read: bool,
+    /// Delimiter characters used to bound tokens during word selection.
+    pub word_separators: String,
+    /// Maximum `OSC` payload byte budget passed to [`Parser`] (default: `4 MiB`).
+    pub max_osc_bytes: usize,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            scrollback_limit: 10_000,
+            c1_policy: C1Policy::Utf8Only,
+            theme: Theme::dark(),
+            default_cursor_shape: CursorShape::Block,
+            default_cursor_blink: true,
+            sync_output_timeout_secs: 0.250,
+            allow_osc52_read: false,
+            word_separators: " \t\r\n\"'`()[]{}<>|;:,=*+-/\\".to_owned(),
+            max_osc_bytes: DEFAULT_MAX_OSC_BYTES,
+        }
+    }
+}
+
+/// Target clipboard buffer named in an `OSC 52` sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ClipboardSelection {
+    /// System clipboard (`c`).
+    Clipboard,
+    /// X11 primary selection (`p`).
+    Primary,
+    /// X11 secondary selection (`s`).
+    Secondary,
+    /// Cut buffer / select (`q`, `0..=7`).
+    Select,
+}
+
+/// Semantic events emitted by the terminal engine for the host UI or runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum TerminalEvent {
+    /// Window title updated (`OSC 0` or `OSC 2`).
+    TitleChanged(String),
+    /// Icon name updated (`OSC 0` or `OSC 1`).
+    IconNameChanged(String),
+    /// Current working directory updated (`OSC 7`).
+    CwdChanged(String),
+    /// Audible or visual bell (`BEL`, `0x07`).
+    Bell,
+    /// Host clipboard write requested (`OSC 52`).
+    ClipboardWrite(String),
+    /// Host clipboard read requested (`OSC 52 ; Pc ; ?`) when `allow_osc52_read` is enabled.
+    ClipboardReadRequested {
+        /// Requested clipboard target buffer.
+        selection: ClipboardSelection,
+    },
+    /// Palette colors updated (`OSC 4/10/11/12/104/110/111/112`).
+    PaletteChanged,
+    /// Cursor shape or blink updated (`DECSCUSR`).
+    CursorStyleChanged(CursorStyle),
+    /// Hyperlink activated by explicit click or host action (`hyperlinks` feature).
+    HyperlinkActivated {
+        /// Target URI of the activated hyperlink.
+        uri: String,
+        /// Optional `id=` parameter from `OSC 8`.
+        id: Option<String>,
+    },
+    /// Shell command finished as reported by `OSC 133;D` (`shell-integration` feature).
+    CommandFinished {
+        /// Exit status code reported by the shell, if present and valid.
+        exit_code: Option<i32>,
+    },
+}
+
+/// Storage-agnostic inspection snapshot of a single visible cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CellSnapshot {
+    /// Primary Unicode scalar value (`' '` for blank cells).
+    pub ch: char,
+    /// Full grapheme cluster string (combining marks included; empty for spacer cells).
+    pub grapheme: String,
+    /// Column width occupied by this cell (`1` or `2`, `0` for `WIDE_SPACER`/`WRAP_SPACER`).
+    pub width: u8,
+    /// Whether this cell is the leading cell of a double-width character.
+    pub is_wide: bool,
+    /// Whether this cell is the trailing spacer of a double-width character.
+    pub is_wide_spacer: bool,
+    /// Foreground color.
+    pub fg: PackedColor,
+    /// Background color.
+    pub bg: PackedColor,
+    /// Optional `SGR 58` underline color override.
+    pub underline_color: Option<PackedColor>,
+    /// Active underline style.
+    pub underline_style: UnderlineStyle,
+    /// Raw cell attribute and layout flags.
+    pub flags: CellFlags,
+}
+
+/// Cursor geometry and visibility inside a [`RenderSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CursorSnapshot {
+    /// Zero-based visible viewport row.
+    pub row: u16,
+    /// Zero-based column.
+    pub col: u16,
+    /// Whether the cursor should be rendered (`DECTCEM` and `display_offset == 0`).
+    pub visible: bool,
+    /// Cursor shape and blink state.
+    pub style: CursorStyle,
+}
+
+#[derive(Debug, Clone)]
+enum SnapshotExtras<'a> {
+    Live(&'a CellExtraTable),
+    Latched(&'a [(u32, CellExtra)]),
+}
+
+/// Tracks which base palette slots have been explicitly overridden via `OSC 4/10/11/12`
+/// sequences rather than inherited from [`Theme::scheme`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PaletteOverrides {
+    /// Whether default foreground was overridden via `OSC 10`.
+    pub foreground: bool,
+    /// Whether default background was overridden via `OSC 11`.
+    pub background: bool,
+    /// Whether cursor fill was overridden via `OSC 12`.
+    pub cursor: bool,
+    /// Whether each ANSI color slot (`0..16`) was overridden via `OSC 4`.
+    pub ansi: [bool; 16],
+}
+
+/// Read-only view of the visible terminal frame, frozen during DEC Mode 2026 synchronized output.
+#[derive(Debug, Clone)]
+pub struct RenderSnapshot<'a> {
+    /// Visible column count.
+    pub cols: u16,
+    /// Visible row count.
+    pub rows: u16,
+    /// Visible viewport rows from top to bottom.
+    pub visible_rows: Vec<&'a Row>,
+    /// Effective cursor state for this frame.
+    pub cursor: CursorSnapshot,
+    /// Terminal modes active for this frame.
+    pub modes: &'a Modes,
+    /// Effective color palette for this frame.
+    pub palette: &'a ColorScheme,
+    /// Explicit `OSC 4/10/11/12` override flags for base palette slots.
+    pub palette_overrides: PaletteOverrides,
+    /// Extended 256-color `OSC 4` overrides for indices `16..=255`.
+    pub extended_palette: &'a [Option<[u8; 3]>; 240],
+    /// Active selection, if any.
+    pub selection: Option<&'a Selection>,
+    /// Scrollback display offset (`0` = live bottom).
+    pub display_offset: usize,
+    /// Number of retained scrollback lines.
+    pub scrollback_len: usize,
+    /// Whether the alternate screen is active.
+    pub is_alt_screen: bool,
+    /// Whether DEC Mode 2026 synchronized output is currently latched.
+    pub is_synchronized_output: bool,
+    /// Monotonic frame/damage epoch for renderer cache invalidation.
+    pub damage_epoch: u64,
+    /// [`AbsLine`] corresponding to `visible_rows[0]`.
+    pub top_abs_line: AbsLine,
+    extras: SnapshotExtras<'a>,
+}
+
+impl RenderSnapshot<'_> {
+    /// Looks up [`CellExtra`] for `extra_id` (`0` returns `None`).
+    #[must_use]
+    pub fn cell_extra(&self, extra_id: u32) -> Option<&CellExtra> {
+        if extra_id == 0 {
+            return None;
+        }
+        match self.extras {
+            SnapshotExtras::Live(table) => table.get(extra_id),
+            SnapshotExtras::Latched(slice) => slice
+                .binary_search_by_key(&extra_id, |(id, _)| *id)
+                .ok()
+                .map(|idx| &slice[idx].1),
+        }
+    }
+
+    /// Extracts trimmed plain text for visible `row` (`0..self.rows`).
+    #[must_use]
+    pub fn line_text(&self, row: u16) -> Option<String> {
+        let r = self.visible_rows.get(usize::from(row))?;
+        let mut out = String::new();
+        let end = r.trimmed_len();
+        for cell in &r.cells()[..end] {
+            if cell.is_wide_spacer() || cell.is_wrap_spacer() {
+                continue;
+            }
+            if cell.extra_id != 0
+                && let Some(ext) = self.cell_extra(cell.extra_id)
+            {
+                ext.write_grapheme(cell.codepoint, &mut out);
+                continue;
+            }
+            out.push(cell.codepoint);
+        }
+        Some(out)
+    }
+
+    /// Returns `true` if cell `(viewport_row, col)` falls inside the active selection.
+    #[must_use]
+    pub fn is_cell_selected(&self, viewport_row: usize, col: usize) -> bool {
+        let Some(sel) = self.selection else {
+            return false;
+        };
+        let Some(row) = self.visible_rows.get(viewport_row) else {
+            return false;
+        };
+        let line = AbsLine(self.top_abs_line.0 + viewport_row as u64);
+        sel.row_col_range(line, row)
+            .is_some_and(|(c0, c1)| col >= c0 && col <= c1)
+    }
+
+    /// Resolves xterm 256-color `index` against this snapshot's effective palette, honoring
+    /// `OSC 4` overrides for both `0..16` and `16..=255`.
+    #[must_use]
+    pub const fn resolve_indexed_color(&self, index: u8) -> [u8; 3] {
+        if index < 16 {
+            self.palette.ansi[index as usize]
+        } else if let Some(rgb) = self.extended_palette[(index - 16) as usize] {
+            rgb
+        } else {
+            ColorScheme::xterm_256_color(index, &self.palette.ansi)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LatchedFrame {
+    cols: u16,
+    rows: u16,
+    visible_rows: Vec<Row>,
+    extras: Vec<(u32, CellExtra)>,
+    cursor: CursorSnapshot,
+    modes: Modes,
+    palette: ColorScheme,
+    palette_overrides: PaletteOverrides,
+    extended_palette: [Option<[u8; 3]>; 240],
+    selection: Option<Selection>,
+    display_offset: usize,
+    scrollback_len: usize,
+    is_alt_screen: bool,
+    damage_epoch: u64,
+    top_abs_line: AbsLine,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastWrittenCell {
+    row: usize,
+    col: usize,
+    ended_with_zwj: bool,
+    is_unpaired_ri: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LastGraphic {
+    base: char,
+    combining: Vec<char>,
+}
+
+/// Serializable full-state snapshot of a [`Terminal`] for persistence and session restore
+/// (`serde` feature).
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalSnapshot {
+    cols: u16,
+    rows: u16,
+    primary: GridSnapshot,
+    alternate: GridSnapshot,
+    modes: Modes,
+    cursor: Cursor,
+    alt_cursor_backup: Option<Cursor>,
+    primary_saved_cursor: Option<SavedCursor>,
+    alt_saved_cursor: Option<SavedCursor>,
+    tabs: TabStops,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    palette: ColorScheme,
+    #[serde(default)]
+    palette_overrides: PaletteOverrides,
+    extended_palette: Vec<(u8, [u8; 3])>,
+    title: String,
+    icon_name: String,
+    cwd: Option<String>,
+    hyperlink_pool: HyperlinkPool,
+    selection: Option<Selection>,
+    #[cfg(feature = "shell-integration")]
+    #[serde(default)]
+    shell_integration: Option<ShellIntegrationState>,
+    #[cfg(feature = "kitty-keyboard")]
+    #[serde(default)]
+    kitty_primary_stack: Vec<KittyKeyboardFlags>,
+    #[cfg(feature = "kitty-keyboard")]
+    #[serde(default)]
+    kitty_alt_stack: Vec<KittyKeyboardFlags>,
+}
+
+#[cfg(all(test, feature = "serde", feature = "shell-integration"))]
+impl TerminalSnapshot {
+    pub(crate) fn shell_integration_mut(&mut self) -> Option<&mut ShellIntegrationState> {
+        self.shell_integration.as_mut()
+    }
+}
+
+/// Complete, pure-Rust terminal emulator combining VT500 parsing, primary/alternate grids,
+/// lossless resize reflow, DEC 2026 synchronized output, selection, mouse, and OSC state.
+#[derive(Debug)]
+pub struct Terminal {
+    config: CoreConfig,
+    parser: Parser,
+    primary: Grid,
+    alternate: Grid,
+    modes: Modes,
+    cursor: Cursor,
+    alt_cursor_backup: Option<Cursor>,
+    primary_saved_cursor: Option<SavedCursor>,
+    alt_saved_cursor: Option<SavedCursor>,
+    tabs: TabStops,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    palette: ColorScheme,
+    palette_overrides: PaletteOverrides,
+    extended_palette: [Option<[u8; 3]>; 240],
+    title: String,
+    icon_name: String,
+    cwd: Option<String>,
+    hyperlink_pool: HyperlinkPool,
+    selection: Option<Selection>,
+    outgoing: Vec<u8>,
+    events: Vec<TerminalEvent>,
+    sync_started_at: Option<f64>,
+    last_time_secs: Option<f64>,
+    latched_frame: Option<LatchedFrame>,
+    last_written: Option<LastWrittenCell>,
+    last_graphic: Option<LastGraphic>,
+    grapheme_scratch: String,
+    #[cfg(feature = "search")]
+    search_state: SearchState,
+    #[cfg(feature = "hyperlinks")]
+    primary_implicit_links: ImplicitLinkStore,
+    #[cfg(feature = "hyperlinks")]
+    alt_implicit_links: ImplicitLinkStore,
+    #[cfg(feature = "hyperlinks")]
+    osc8_inserts_since_gc: usize,
+    #[cfg(feature = "shell-integration")]
+    shell_integration: ShellIntegrationState,
+    #[cfg(feature = "kitty-keyboard")]
+    kitty_keyboard: KittyKeyboardState,
+    #[cfg(feature = "metrics")]
+    metrics: TerminalMetrics,
+}
+
+impl Terminal {
+    /// Creates a new [`Terminal`] sized to `(cols.max(1), rows.max(1))` with `config`.
+    #[must_use]
+    pub fn new(cols: u16, rows: u16, config: CoreConfig) -> Self {
+        let cols_u = usize::from(cols.max(1));
+        let rows_u = usize::from(rows.max(1));
+        let parser =
+            Parser::with_c1_policy(config.c1_policy).with_max_osc_bytes(config.max_osc_bytes);
+        let primary = Grid::new(ScreenKind::Primary, cols_u, rows_u, config.scrollback_limit);
+        let alternate = Grid::new(ScreenKind::Alternate, cols_u, rows_u, 0);
+        let modes = Modes::with_default_blink(config.default_cursor_blink);
+        let cursor = Cursor {
+            style: CursorStyle {
+                shape: config.default_cursor_shape,
+                blink: config.default_cursor_blink,
+            },
+            ..Cursor::default()
+        };
+        let palette = config.theme.scheme.clone();
+        #[cfg(feature = "shell-integration")]
+        let shell_integration = ShellIntegrationState::new(config.scrollback_limit, rows_u);
+        Self {
+            config,
+            parser,
+            primary,
+            alternate,
+            modes,
+            cursor,
+            alt_cursor_backup: None,
+            primary_saved_cursor: None,
+            alt_saved_cursor: None,
+            tabs: TabStops::new(cols_u),
+            scroll_top: 0,
+            scroll_bottom: rows_u - 1,
+            palette,
+            palette_overrides: PaletteOverrides::default(),
+            extended_palette: [None; 240],
+            title: String::new(),
+            icon_name: String::new(),
+            cwd: None,
+            hyperlink_pool: HyperlinkPool::new(),
+            selection: None,
+            outgoing: Vec::new(),
+            events: Vec::new(),
+            sync_started_at: None,
+            last_time_secs: None,
+            latched_frame: None,
+            last_written: None,
+            last_graphic: None,
+            grapheme_scratch: String::with_capacity(16),
+            #[cfg(feature = "search")]
+            search_state: SearchState::default(),
+            #[cfg(feature = "hyperlinks")]
+            primary_implicit_links: ImplicitLinkStore::default(),
+            #[cfg(feature = "hyperlinks")]
+            alt_implicit_links: ImplicitLinkStore::default(),
+            #[cfg(feature = "hyperlinks")]
+            osc8_inserts_since_gc: 0,
+            #[cfg(feature = "shell-integration")]
+            shell_integration,
+            #[cfg(feature = "kitty-keyboard")]
+            kitty_keyboard: KittyKeyboardState::default(),
+            #[cfg(feature = "metrics")]
+            metrics: TerminalMetrics::new(),
+        }
+    }
+
+    /// Streams raw VT/ANSI `bytes` into the terminal without updating the DEC 2026 clock.
+    pub fn advance(&mut self, bytes: &[u8]) {
+        #[cfg(feature = "metrics")]
+        self.metrics.record_bytes(bytes.len());
+        let mut parser = std::mem::take(&mut self.parser);
+        parser.advance(bytes, self);
+        self.parser = parser;
+        #[cfg(feature = "hyperlinks")]
+        self.refresh_implicit_hyperlinks();
+        #[cfg(feature = "shell-integration")]
+        self.shell_integration.sync_with_grid(&self.primary);
+    }
+
+    /// Streams raw VT/ANSI `bytes` into the terminal using `now_secs` for the DEC Mode 2026
+    /// synchronized-output watchdog.
+    pub fn advance_with_time(&mut self, bytes: &[u8], now_secs: f64) {
+        if now_secs.is_finite() {
+            self.last_time_secs = Some(now_secs);
+        }
+        let _ = self.check_sync_timeout(now_secs);
+        if !bytes.is_empty() {
+            self.advance(bytes);
+        }
+        let _ = self.check_sync_timeout(now_secs);
+    }
+
+    /// Checks whether an active DEC Mode 2026 latch has exceeded `sync_output_timeout_secs` at
+    /// `now_secs`, releasing the frozen snapshot if expired. Returns `true` if flushed.
+    pub fn check_sync_timeout(&mut self, now_secs: f64) -> bool {
+        if !self.modes.sync_output || !now_secs.is_finite() {
+            return false;
+        }
+        let Some(started) = self.sync_started_at else {
+            self.sync_started_at = Some(now_secs);
+            return false;
+        };
+        if !started.is_finite() {
+            self.sync_started_at = Some(now_secs);
+            return false;
+        }
+        if (now_secs - started) >= self.config.sync_output_timeout_secs {
+            self.exit_sync_mode();
+            return true;
+        }
+        false
+    }
+
+    /// Resizes the terminal to `(cols.max(1), rows.max(1))`, reflowing primary scrollback and
+    /// remapping cursor and selection anchors.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        let new_cols = usize::from(cols.max(1));
+        let new_rows = usize::from(rows.max(1));
+        if new_cols == self.primary.cols() && new_rows == self.primary.viewport_rows() {
+            return;
+        }
+
+        #[cfg(feature = "metrics")]
+        self.metrics.record_reflow();
+
+        if self.modes.sync_output {
+            self.exit_sync_mode();
+        }
+
+        #[cfg(feature = "shell-integration")]
+        let (shell_extra_points, shell_tracking_cursor, shell_pending_wrap_idx) = {
+            self.shell_integration
+                .sync_after_eviction_if_needed(&self.primary);
+            let pri_cur = if self.modes.alt_screen {
+                self.alt_cursor_backup
+                    .as_ref()
+                    .map(|c| (c.row, c.col, c.pending_wrap))
+            } else {
+                Some((self.cursor.row, self.cursor.col, self.cursor.pending_wrap))
+            };
+            let tracking = self
+                .shell_integration
+                .prepare_for_reflow(&self.primary, pri_cur);
+            let mut pts = Vec::new();
+            let pw_idx = self.shell_integration.collect_reflow_points(&mut pts);
+            (pts, tracking, if tracking { None } else { pw_idx })
+        };
+        #[cfg(not(feature = "shell-integration"))]
+        let (shell_extra_points, shell_pending_wrap_idx): (Vec<GridPoint>, Option<usize>) =
+            (Vec::new(), None);
+
+        let sel_input = self.selection.map(|s| SelectionReflowInput {
+            anchor: s.anchor,
+            anchor_past_eol: s.anchor_past_eol,
+            head: s.head,
+            head_past_eol: s.head_past_eol,
+            origin_start: s.origin_start,
+            origin_start_past_eol: s.origin_start_past_eol,
+            origin_end: s.origin_end,
+            origin_end_past_eol: s.origin_end_past_eol,
+            origin_evicted: s.origin_evicted,
+            origin_cropped_bottom: s.origin_cropped_bottom,
+            col_policy: if s.mode == SelectionMode::Block {
+                EvictionColPolicy::PreserveColumn
+            } else {
+                EvictionColPolicy::ResetToZero
+            },
+        });
+
+        let (sel_res, pri_extra_mapped, pri_extra_pw) = if self.modes.alt_screen {
+            let alt_anchors = ReflowAnchors {
+                cursor_row: self.cursor.row,
+                cursor_col: self.cursor.col,
+                pending_wrap: self.cursor.pending_wrap,
+                selection: None,
+                extra_points: Vec::new(),
+            };
+            let (alt_res, alt_sel_res, _) = self.alternate.resize_with_selection(
+                new_cols,
+                new_rows,
+                alt_anchors,
+                sel_input,
+                None,
+            );
+            self.cursor.row = alt_res.cursor_row;
+            self.cursor.col = alt_res.cursor_col;
+            self.cursor.pending_wrap = alt_res.pending_wrap;
+
+            let (pri_res, _, pri_pw) = if let Some(ref mut pri_cur) = self.alt_cursor_backup {
+                let pri_anchors = ReflowAnchors {
+                    cursor_row: pri_cur.row,
+                    cursor_col: pri_cur.col,
+                    pending_wrap: pri_cur.pending_wrap,
+                    selection: None,
+                    extra_points: shell_extra_points,
+                };
+                let (pri_res, pri_sel, pri_pw) = self.primary.resize_with_selection(
+                    new_cols,
+                    new_rows,
+                    pri_anchors,
+                    None,
+                    shell_pending_wrap_idx,
+                );
+                pri_cur.row = pri_res.cursor_row;
+                pri_cur.col = pri_res.cursor_col;
+                pri_cur.pending_wrap = pri_res.pending_wrap;
+                (pri_res, pri_sel, pri_pw)
+            } else {
+                let pri_anchors = ReflowAnchors {
+                    extra_points: shell_extra_points,
+                    ..ReflowAnchors::default()
+                };
+                self.primary.resize_with_selection(
+                    new_cols,
+                    new_rows,
+                    pri_anchors,
+                    None,
+                    shell_pending_wrap_idx,
+                )
+            };
+            (alt_sel_res, pri_res.extra_points, pri_pw)
+        } else {
+            let anchors = ReflowAnchors {
+                cursor_row: self.cursor.row,
+                cursor_col: self.cursor.col,
+                pending_wrap: self.cursor.pending_wrap,
+                selection: None,
+                extra_points: shell_extra_points,
+            };
+            let (res, pri_sel_res, pri_pw) = self.primary.resize_with_selection(
+                new_cols,
+                new_rows,
+                anchors,
+                sel_input,
+                shell_pending_wrap_idx,
+            );
+            self.cursor.row = res.cursor_row;
+            self.cursor.col = res.cursor_col;
+            self.cursor.pending_wrap = res.pending_wrap;
+            let _ = self.alternate.resize_with_selection(
+                new_cols,
+                new_rows,
+                ReflowAnchors::default(),
+                None,
+                None,
+            );
+            (pri_sel_res, res.extra_points, pri_pw)
+        };
+
+        #[cfg(feature = "shell-integration")]
+        {
+            let post_pri_cur = if self.modes.alt_screen {
+                self.alt_cursor_backup
+                    .as_ref()
+                    .map(|c| (c.row, c.col, c.pending_wrap))
+            } else {
+                Some((self.cursor.row, self.cursor.col, self.cursor.pending_wrap))
+            };
+            self.shell_integration.apply_reflow_points(
+                &self.primary,
+                &pri_extra_mapped,
+                pri_extra_pw,
+                post_pri_cur,
+                shell_tracking_cursor,
+                self.config.scrollback_limit,
+            );
+        }
+        #[cfg(not(feature = "shell-integration"))]
+        let _ = (pri_extra_mapped, pri_extra_pw);
+
+        if let Some(sr) = sel_res {
+            if let Some(sel) = &mut self.selection {
+                sel.anchor = sr.anchor;
+                sel.anchor_past_eol = sr.anchor_past_eol;
+                sel.head = sr.head;
+                sel.head_past_eol = sr.head_past_eol;
+                sel.origin_start = sr.origin_start;
+                sel.origin_start_past_eol = sr.origin_start_past_eol;
+                sel.origin_end = sr.origin_end;
+                sel.origin_end_past_eol = sr.origin_end_past_eol;
+                sel.origin_evicted = sr.origin_evicted;
+                sel.origin_cropped_bottom = sr.origin_cropped_bottom;
+            }
+        } else {
+            self.selection = None;
+        }
+
+        self.tabs.resize(new_cols);
+        let clamp_saved = |saved: &mut SavedCursor| {
+            saved.row = saved.row.min(new_rows - 1);
+            saved.col = saved.col.min(new_cols - 1);
+            saved.pending_wrap &= saved.col == new_cols - 1;
+        };
+        if let Some(saved) = &mut self.primary_saved_cursor {
+            clamp_saved(saved);
+        }
+        if let Some(saved) = &mut self.alt_saved_cursor {
+            clamp_saved(saved);
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = new_rows - 1;
+        self.last_written = None;
+        self.last_graphic = None;
+        #[cfg(feature = "hyperlinks")]
+        self.refresh_implicit_hyperlinks();
+        #[cfg(feature = "shell-integration")]
+        self.shell_integration.sync_with_grid(&self.primary);
+    }
+
+    /// Returns the terminal dimensions as `(cols, rows)`.
+    #[must_use]
+    pub fn size(&self) -> (u16, u16) {
+        let g = self.grid();
+        #[expect(clippy::cast_possible_truncation, reason = "grid initialized from u16")]
+        (g.cols() as u16, g.viewport_rows() as u16)
+    }
+
+    /// Scrolls the viewport display offset (`delta_lines > 0` scrolls up into history).
+    pub fn scroll_display(&mut self, delta_lines: i32) {
+        if !self.modes.alt_screen {
+            self.primary.scroll_display(delta_lines);
+        }
+    }
+
+    /// Scrolls the viewport back to the live bottom (`display_offset = 0`).
+    pub fn scroll_to_bottom(&mut self) {
+        if !self.modes.alt_screen {
+            self.primary.scroll_to_bottom();
+        }
+    }
+
+    /// Returns the current scrollback offset (`0` = live bottom, always `0` on alternate screen).
+    #[must_use]
+    pub fn display_offset(&self) -> usize {
+        if self.modes.alt_screen {
+            0
+        } else {
+            self.primary.display_offset()
+        }
+    }
+
+    /// Drains all pending outgoing VT protocol response bytes (e.g., `DSR`, `DA1/2`, `DECRQM`).
+    pub fn drain_outgoing(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.outgoing)
+    }
+
+    /// Drains all pending [`TerminalEvent`] notifications.
+    pub fn drain_events(&mut self) -> Vec<TerminalEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Starts an interactive selection at visible `(viewport_row, col)`.
+    pub fn selection_start(&mut self, viewport_row: usize, col: usize, kind: SelectionKind) {
+        let pt = self.viewport_to_grid_point(viewport_row, col);
+        match kind {
+            SelectionMode::Word => {
+                let (a, h) =
+                    selection::word_bounds_at(self.grid(), pt, &self.config.word_separators);
+                self.selection = Some(Selection::new(SelectionMode::Word, a, h));
+            }
+            SelectionMode::Line => {
+                let (a, h) = selection::line_bounds_at(self.grid(), pt.line);
+                self.selection = Some(Selection::new(SelectionMode::Line, a, h));
+            }
+            SelectionMode::Stream | SelectionMode::Block => {
+                self.selection = Some(Selection::new(kind, pt, pt));
+            }
+        }
+    }
+
+    /// Updates the moving head endpoint of the active selection to `(viewport_row, col)`.
+    pub fn selection_update(&mut self, viewport_row: usize, col: usize) {
+        let pt = self.viewport_to_grid_point(viewport_row, col);
+        let Some(sel) = self.selection else {
+            return;
+        };
+        match sel.mode {
+            SelectionMode::Stream | SelectionMode::Block => {
+                if let Some(active) = &mut self.selection {
+                    active.head = pt;
+                    active.head_past_eol = false;
+                    active.finished = false;
+                }
+            }
+            SelectionMode::Word => {
+                let (wa, wh) =
+                    selection::word_bounds_at(self.grid(), pt, &self.config.word_separators);
+                if let Some(active) = &mut self.selection {
+                    let pt_lt_origin_start = pt.line < active.origin_start.line
+                        || (pt.line == active.origin_start.line
+                            && (active.origin_start_past_eol || pt.col < active.origin_start.col));
+                    let pt_gt_origin_end = pt.line > active.origin_end.line
+                        || (!active.origin_end_past_eol
+                            && pt.line == active.origin_end.line
+                            && pt.col > active.origin_end.col);
+                    if active.origin_evicted {
+                        active.anchor = active.origin_start;
+                        active.anchor_past_eol = active.origin_start_past_eol;
+                        active.head = wh;
+                        active.head_past_eol = false;
+                    } else if active.origin_cropped_bottom {
+                        if pt.line <= active.origin_end.line {
+                            active.anchor = active.origin_end;
+                            active.anchor_past_eol = true;
+                            active.head = wa;
+                            active.head_past_eol = false;
+                        } else {
+                            active.anchor =
+                                GridPoint::new(AbsLine(active.origin_start.line.0 + 1), 0);
+                            active.anchor_past_eol = false;
+                            active.head = wh;
+                            active.head_past_eol = false;
+                        }
+                    } else if pt_lt_origin_start {
+                        active.anchor = active.origin_end;
+                        active.anchor_past_eol = active.origin_end_past_eol;
+                        active.head = wa;
+                        active.head_past_eol = false;
+                    } else if pt_gt_origin_end {
+                        active.anchor = active.origin_start;
+                        active.anchor_past_eol = active.origin_start_past_eol;
+                        active.head = wh;
+                        active.head_past_eol = false;
+                    } else {
+                        active.anchor = active.origin_start;
+                        active.anchor_past_eol = active.origin_start_past_eol;
+                        active.head = active.origin_end;
+                        active.head_past_eol = active.origin_end_past_eol;
+                    }
+                    active.finished = false;
+                }
+            }
+            SelectionMode::Line => {
+                let (la, lh) = selection::line_bounds_at(self.grid(), pt.line);
+                if let Some(active) = &mut self.selection {
+                    if active.origin_evicted {
+                        active.anchor = active.origin_start;
+                        active.anchor_past_eol = active.origin_start_past_eol;
+                        active.head = lh;
+                        active.head_past_eol = false;
+                    } else if active.origin_cropped_bottom {
+                        if pt.line <= active.origin_end.line {
+                            active.anchor = active.origin_end;
+                            active.anchor_past_eol = true;
+                            active.head = la;
+                            active.head_past_eol = false;
+                        } else {
+                            active.anchor =
+                                GridPoint::new(AbsLine(active.origin_start.line.0 + 1), 0);
+                            active.anchor_past_eol = false;
+                            active.head = lh;
+                            active.head_past_eol = false;
+                        }
+                    } else if pt.line < active.origin_start.line {
+                        active.anchor = active.origin_end;
+                        active.anchor_past_eol = active.origin_end_past_eol;
+                        active.head = la;
+                        active.head_past_eol = false;
+                    } else if pt.line > active.origin_end.line {
+                        active.anchor = active.origin_start;
+                        active.anchor_past_eol = active.origin_start_past_eol;
+                        active.head = lh;
+                        active.head_past_eol = false;
+                    } else {
+                        active.anchor = active.origin_start;
+                        active.anchor_past_eol = active.origin_start_past_eol;
+                        active.head = active.origin_end;
+                        active.head_past_eol = active.origin_end_past_eol;
+                    }
+                    active.finished = false;
+                }
+            }
+        }
+    }
+
+    /// Marks the active selection as finished.
+    pub fn selection_finish(&mut self) {
+        if let Some(sel) = &mut self.selection {
+            sel.finished = true;
+        }
+    }
+
+    /// Clears any active selection.
+    pub fn selection_clear(&mut self) {
+        self.selection = None;
+    }
+
+    /// Selects the word containing visible `(viewport_row, col)`.
+    pub fn selection_word(&mut self, viewport_row: usize, col: usize) {
+        self.selection_start(viewport_row, col, SelectionMode::Word);
+        self.selection_finish();
+    }
+
+    /// Selects the entire logical line containing visible `(viewport_row, col)`.
+    pub fn selection_line(&mut self, viewport_row: usize, col: usize) {
+        self.selection_start(viewport_row, col, SelectionMode::Line);
+        self.selection_finish();
+    }
+
+    /// Starts a rectangular block selection at visible `(viewport_row, col)`.
+    pub fn selection_block(&mut self, viewport_row: usize, col: usize) {
+        self.selection_start(viewport_row, col, SelectionMode::Block);
+    }
+
+    /// Returns a reference to the active [`Selection`], if any.
+    #[must_use]
+    pub const fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    /// Extracts the selected text from the active grid, or `None` if no selection is active.
+    #[must_use]
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        selection::extract_text(self.grid(), sel)
+    }
+
+    /// Returns `true` if visible cell `(viewport_row, col)` is covered by the active selection.
+    #[must_use]
+    pub fn is_cell_selected(&self, viewport_row: usize, col: usize) -> bool {
+        let Some(sel) = &self.selection else {
+            return false;
+        };
+        let grid = self.grid();
+        let Some(row) = grid.visible_row(viewport_row) else {
+            return false;
+        };
+        let line = grid.screen_to_abs(viewport_row);
+        sel.row_col_range(line, row)
+            .is_some_and(|(c0, c1)| col >= c0 && col <= c1)
+    }
+
+    /// Returns a read-only reference to the active [`Grid`] (`primary` or `alternate`).
+    #[must_use]
+    pub const fn grid(&self) -> &Grid {
+        if self.modes.alt_screen {
+            &self.alternate
+        } else {
+            &self.primary
+        }
+    }
+
+    /// Returns a read-only reference to the primary [`Grid`] regardless of active screen.
+    #[must_use]
+    pub const fn primary_grid(&self) -> &Grid {
+        &self.primary
+    }
+
+    /// Returns active terminal [`Modes`].
+    #[must_use]
+    pub const fn modes(&self) -> &Modes {
+        &self.modes
+    }
+
+    /// Returns the live [`Cursor`].
+    #[must_use]
+    pub const fn cursor(&self) -> &Cursor {
+        &self.cursor
+    }
+
+    /// Returns the effective [`ColorScheme`] (including `OSC 4/10/11/12` overrides).
+    #[must_use]
+    pub const fn palette(&self) -> &ColorScheme {
+        &self.palette
+    }
+
+    /// Returns the base [`Theme`] configured at construction or updated via [`Self::set_theme`].
+    #[must_use]
+    pub const fn theme(&self) -> &Theme {
+        &self.config.theme
+    }
+
+    /// Updates the base [`Theme`], updating non-overridden palette slots while preserving
+    /// explicit `OSC 4/10/11/12` overrides.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if !self.palette_overrides.foreground {
+            self.palette.foreground = theme.scheme.foreground;
+        }
+        if !self.palette_overrides.background {
+            self.palette.background = theme.scheme.background;
+        }
+        if !self.palette_overrides.cursor {
+            self.palette.cursor = theme.scheme.cursor;
+        }
+        self.palette.cursor_text = theme.scheme.cursor_text;
+        self.palette.selection_bg = theme.scheme.selection_bg;
+        self.palette.selection_fg = theme.scheme.selection_fg;
+        for (i, overridden) in self.palette_overrides.ansi.iter().enumerate() {
+            if !*overridden {
+                self.palette.ansi[i] = theme.scheme.ansi[i];
+            }
+        }
+        self.config.theme = theme;
+    }
+
+    /// Returns explicit `OSC 4/10/11/12` override flags for the base palette.
+    #[must_use]
+    pub const fn palette_overrides(&self) -> &PaletteOverrides {
+        &self.palette_overrides
+    }
+
+    /// Returns extended 256-color `OSC 4` overrides for indices `16..=255`.
+    #[must_use]
+    pub const fn extended_palette(&self) -> &[Option<[u8; 3]>; 240] {
+        &self.extended_palette
+    }
+
+    /// Returns the effective window title set by `OSC 0/2`.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Returns the effective icon name set by `OSC 0/1`.
+    #[must_use]
+    pub fn icon_name(&self) -> &str {
+        &self.icon_name
+    }
+
+    /// Returns the current working directory set by `OSC 7`, if known.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    /// Returns the active grid's monotonic `damage_epoch`.
+    #[must_use]
+    pub const fn damage_epoch(&self) -> u64 {
+        self.grid().damage_epoch()
+    }
+
+    /// Returns `true` when the alternate screen buffer is active.
+    #[must_use]
+    pub const fn is_alt_screen(&self) -> bool {
+        self.modes.alt_screen
+    }
+
+    /// Returns `true` when DEC Mode 2026 synchronized output is currently latched.
+    #[must_use]
+    pub const fn is_synchronized_output(&self) -> bool {
+        self.modes.sync_output
+    }
+
+    /// Returns the number of scrollback history lines retained on the active grid.
+    #[must_use]
+    pub fn scrollback_len(&self) -> usize {
+        self.grid().history_len()
+    }
+
+    /// Returns total lines retained on the active grid (`scrollback_len() + rows`).
+    #[must_use]
+    pub fn total_lines(&self) -> usize {
+        self.grid().total_len()
+    }
+
+    /// Looks up [`CellExtra`] on the active grid (`0` returns `None`).
+    #[must_use]
+    pub fn cell_extra(&self, extra_id: u32) -> Option<&CellExtra> {
+        self.grid().cell_extra(extra_id)
+    }
+
+    /// Returns the [`HyperlinkPool`] storing interned `OSC 8` links.
+    #[must_use]
+    pub const fn hyperlink_pool(&self) -> &HyperlinkPool {
+        &self.hyperlink_pool
+    }
+
+    /// Returns 0-based cursor position `(col, row)`.
+    #[must_use]
+    #[expect(clippy::cast_possible_truncation, reason = "viewport fits in u16")]
+    pub const fn cursor_pos(&self) -> (u16, u16) {
+        (self.cursor.col as u16, self.cursor.row as u16)
+    }
+
+    /// Returns the active [`CursorShape`].
+    #[must_use]
+    pub const fn cursor_shape(&self) -> CursorShape {
+        self.cursor.style.shape
+    }
+
+    /// Returns whether cursor blinking is enabled.
+    #[must_use]
+    pub const fn cursor_blink(&self) -> bool {
+        self.cursor.style.blink
+    }
+
+    /// Returns whether the cursor is visible (`DECTCEM`).
+    #[must_use]
+    pub const fn cursor_visible(&self) -> bool {
+        self.modes.cursor_visible
+    }
+
+    /// Returns trimmed plain text for visible viewport `row` (`0..rows`), respecting
+    /// `display_offset()`.
+    #[must_use]
+    pub fn visible_line_text(&self, row: u16) -> Option<String> {
+        let grid = self.grid();
+        let r = grid.visible_row(usize::from(row))?;
+        Some(r.text(grid.extras()))
+    }
+
+    /// Returns trimmed plain text for all visible viewport rows from top to bottom.
+    #[must_use]
+    pub fn visible_lines(&self) -> Vec<String> {
+        let (_, rows) = self.size();
+        (0..rows)
+            .filter_map(|r| self.visible_line_text(r))
+            .collect()
+    }
+
+    /// Returns trimmed plain text for historical scrollback line `index` (`0` = oldest retained).
+    #[must_use]
+    pub fn scrollback_line_text(&self, index: usize) -> Option<String> {
+        let grid = self.grid();
+        if index >= grid.history_len() {
+            return None;
+        }
+        grid.row_by_buf(index).map(|r| r.text(grid.extras()))
+    }
+
+    /// Returns all retained scrollback and active logical lines joined by `\n`, omitting trailing
+    /// completely empty logical lines and rejoining `soft_wrapped` physical lines.
+    #[must_use]
+    pub fn full_text(&self) -> String {
+        let grid = self.grid();
+        let total = grid.total_len();
+        let mut out = String::new();
+        let mut non_empty_out_len: Option<usize> = None;
+
+        let mut phys_start = 0usize;
+        while phys_start < total {
+            let mut phys_end = phys_start;
+            while phys_end + 1 < total && grid.row_by_buf(phys_end).is_some_and(Row::soft_wrapped) {
+                phys_end += 1;
+            }
+
+            if phys_start > 0 {
+                out.push('\n');
+            }
+
+            // Locate the last non-empty cell across the logical line `phys_start..=phys_end`,
+            // matching `reflow.rs` logical-line collection and trimming trailing default blank
+            // cells even when a soft-wrapped continuation row was erased (e.g., via `EL 2`).
+            let mut last_non_empty_pos: Option<(usize, usize)> = None;
+            for r in (phys_start..=phys_end).rev() {
+                let Some(row) = grid.row_by_buf(r) else {
+                    continue;
+                };
+                let cells = row.cells();
+                let limit = if r < phys_end {
+                    if !cells.is_empty() && cells[cells.len() - 1].is_wrap_spacer() {
+                        cells.len() - 1
+                    } else {
+                        cells.len()
+                    }
+                } else {
+                    row.trimmed_len()
+                };
+                if let Some(pos) = cells[..limit].iter().rposition(|c| !c.is_empty()) {
+                    last_non_empty_pos = Some((r, pos + 1));
+                    break;
+                }
+            }
+
+            if let Some((last_r, last_end)) = last_non_empty_pos {
+                for r in phys_start..=last_r {
+                    let Some(row) = grid.row_by_buf(r) else {
+                        continue;
+                    };
+                    let cells = row.cells();
+                    let take_end = if r == last_r {
+                        last_end
+                    } else if !cells.is_empty() && cells[cells.len() - 1].is_wrap_spacer() {
+                        cells.len() - 1
+                    } else {
+                        cells.len()
+                    };
+                    for cell in &cells[..take_end] {
+                        if cell.is_wide_spacer() || cell.is_wrap_spacer() {
+                            continue;
+                        }
+                        if cell.extra_id != 0
+                            && let Some(ext) = grid.cell_extra(cell.extra_id)
+                        {
+                            ext.write_grapheme(cell.codepoint, &mut out);
+                        } else {
+                            out.push(cell.codepoint);
+                        }
+                    }
+                }
+                non_empty_out_len = Some(out.len());
+            }
+
+            phys_start = phys_end + 1;
+        }
+
+        match non_empty_out_len {
+            Some(len) => {
+                out.truncate(len);
+                out
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Returns the trimmed plain text of visible `row` from the active [`RenderSnapshot`]
+    /// (returning the frozen pre-sync content when DEC Mode 2026 is latched).
+    #[must_use]
+    pub fn render_snapshot_line_text(&self, row: u16) -> Option<String> {
+        self.active_snapshot().line_text(row)
+    }
+
+    /// Returns an immutable [`CellSnapshot`] for visible cell `(col, row)` respecting
+    /// `display_offset()`.
+    #[must_use]
+    pub fn cell_at(&self, col: u16, row: u16) -> Option<CellSnapshot> {
+        let grid = self.grid();
+        let r = grid.visible_row(usize::from(row))?;
+        let cell = *r.cells().get(usize::from(col))?;
+        let is_wide = cell.is_wide_lead();
+        let is_wide_spacer = cell.is_wide_spacer();
+        let width = if is_wide_spacer || cell.is_wrap_spacer() {
+            0
+        } else if is_wide {
+            2
+        } else {
+            1
+        };
+
+        let mut grapheme = String::new();
+        let mut underline_color = None;
+        if !is_wide_spacer && !cell.is_wrap_spacer() {
+            if cell.extra_id != 0
+                && let Some(ext) = grid.cell_extra(cell.extra_id)
+            {
+                ext.write_grapheme(cell.codepoint, &mut grapheme);
+                underline_color = ext.underline_color;
+            } else {
+                grapheme.push(cell.codepoint);
+            }
+        }
+
+        Some(CellSnapshot {
+            ch: cell.codepoint,
+            grapheme,
+            width,
+            is_wide,
+            is_wide_spacer,
+            fg: cell.fg,
+            bg: cell.bg,
+            underline_color,
+            underline_style: cell.underline_style(),
+            flags: cell.flags,
+        })
+    }
+
+    /// Returns the active [`RenderSnapshot`] for rendering (latched pre-sync snapshot during
+    /// DEC Mode 2026, or the live grid view otherwise).
+    #[must_use]
+    pub fn active_snapshot(&self) -> RenderSnapshot<'_> {
+        if self.modes.sync_output
+            && let Some(latched) = &self.latched_frame
+        {
+            return RenderSnapshot {
+                cols: latched.cols,
+                rows: latched.rows,
+                visible_rows: latched.visible_rows.iter().collect(),
+                cursor: latched.cursor,
+                modes: &latched.modes,
+                palette: &latched.palette,
+                palette_overrides: latched.palette_overrides,
+                extended_palette: &latched.extended_palette,
+                selection: latched.selection.as_ref(),
+                display_offset: latched.display_offset,
+                scrollback_len: latched.scrollback_len,
+                is_alt_screen: latched.is_alt_screen,
+                is_synchronized_output: true,
+                damage_epoch: latched.damage_epoch,
+                top_abs_line: latched.top_abs_line,
+                extras: SnapshotExtras::Latched(&latched.extras),
+            };
+        }
+
+        let grid = self.grid();
+        let (cols, rows) = self.size();
+        let visible_rows = (0..grid.viewport_rows())
+            .filter_map(|y| grid.visible_row(y))
+            .collect();
+        let display_offset = self.display_offset();
+        let cursor = self.live_cursor_snapshot(display_offset);
+        RenderSnapshot {
+            cols,
+            rows,
+            visible_rows,
+            cursor,
+            modes: &self.modes,
+            palette: &self.palette,
+            palette_overrides: self.palette_overrides,
+            extended_palette: &self.extended_palette,
+            selection: self.selection.as_ref(),
+            display_offset,
+            scrollback_len: grid.history_len(),
+            is_alt_screen: self.modes.alt_screen,
+            is_synchronized_output: false,
+            damage_epoch: grid.damage_epoch(),
+            top_abs_line: grid.screen_to_abs(0),
+            extras: SnapshotExtras::Live(grid.extras()),
+        }
+    }
+
+    /// Encodes a grid-relative [`MouseInputEvent`] according to active mouse modes.
+    #[must_use]
+    pub fn encode_mouse_event(&self, ev: MouseInputEvent) -> Option<Vec<u8>> {
+        encode_mouse_event(&self.modes, ev)
+    }
+
+    /// Formats pasted text for transmission according to DEC `?2004` bracketed paste mode.
+    #[must_use]
+    pub fn format_paste(&self, text: &str) -> Vec<u8> {
+        format_paste_bytes(&self.modes, text)
+    }
+
+    /// Returns focus report bytes (`\x1b[I` / `\x1b[O`) if DEC `?1004` focus reporting is active.
+    #[must_use]
+    pub const fn focus_report(&self, focused: bool) -> Option<&'static [u8]> {
+        focus_event_bytes(&self.modes, focused)
+    }
+
+    /// Enqueues an `OSC 52` clipboard read response after the host fulfills
+    /// [`TerminalEvent::ClipboardReadRequested`].
+    pub fn provide_clipboard_read(&mut self, selection: ClipboardSelection, text: &str) {
+        let sel_char = match selection {
+            ClipboardSelection::Clipboard => 'c',
+            ClipboardSelection::Primary => 'p',
+            ClipboardSelection::Secondary => 's',
+            ClipboardSelection::Select => 'q',
+        };
+        let encoded = encode_base64(text.as_bytes());
+        let reply = format!("\x1b]52;{sel_char};{encoded}\x1b\\");
+        self.outgoing.extend_from_slice(reply.as_bytes());
+    }
+
+    // -------------------------------------------------------------------------
+    // Feature-gated public APIs (search, hyperlinks, shell-integration,
+    // kitty-keyboard, serde, metrics)
+    // -------------------------------------------------------------------------
+
+    /// Searches the active terminal grid (including primary scrollback) for `query` and stores
+    /// the resulting matches for navigation via [`Self::next_search_match`] and
+    /// [`Self::prev_search_match`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidRegex`] without mutating terminal or existing search state
+    /// if `query.is_regex` is `true` and the pattern fails to compile.
+    #[cfg(feature = "search")]
+    pub fn search(&mut self, query: &SearchQuery) -> Result<Vec<SearchMatch>, SearchError> {
+        let grid = if self.modes.alt_screen {
+            &self.alternate
+        } else {
+            &self.primary
+        };
+        self.search_state.execute(grid, query)
+    }
+
+    /// Advances to the next search match (wrapping to the first match), scrolls it into view
+    /// on the primary screen, and returns it.
+    #[cfg(feature = "search")]
+    pub fn next_search_match(&mut self) -> Option<&SearchMatch> {
+        let target_line = {
+            let grid = if self.modes.alt_screen {
+                &self.alternate
+            } else {
+                &self.primary
+            };
+            self.search_state.step_next(grid)?.line
+        };
+        self.scroll_match_into_view(target_line);
+        self.search_state.active_match(self.grid())
+    }
+
+    /// Steps backward to the previous search match (wrapping to the last match), scrolls it into
+    /// view on the primary screen, and returns it.
+    #[cfg(feature = "search")]
+    pub fn prev_search_match(&mut self) -> Option<&SearchMatch> {
+        let target_line = {
+            let grid = if self.modes.alt_screen {
+                &self.alternate
+            } else {
+                &self.primary
+            };
+            self.search_state.step_prev(grid)?.line
+        };
+        self.scroll_match_into_view(target_line);
+        self.search_state.active_match(self.grid())
+    }
+
+    /// Returns the currently focused search match, if still valid for the active screen content.
+    #[cfg(feature = "search")]
+    #[must_use]
+    pub fn active_search_match(&self) -> Option<&SearchMatch> {
+        self.search_state.active_match(self.grid())
+    }
+
+    /// Returns all currently cached search matches, or an empty slice if stale.
+    #[cfg(feature = "search")]
+    #[must_use]
+    pub fn search_matches(&self) -> &[SearchMatch] {
+        self.search_state.matches(self.grid())
+    }
+
+    /// Clears any active search matches and focus state.
+    #[cfg(feature = "search")]
+    pub fn clear_search(&mut self) {
+        self.search_state.clear();
+    }
+
+    /// Resolves an explicit `OSC 8` or implicitly detected URL at visible `(col, row)`,
+    /// respecting `display_offset()`.
+    #[cfg(feature = "hyperlinks")]
+    #[must_use]
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<&HyperlinkInfo> {
+        let grid = self.grid();
+        let r = grid.visible_row(usize::from(row))?;
+        let mut c_idx = usize::from(col);
+        let cells = r.cells();
+        let cell = *cells.get(c_idx)?;
+        if cell.is_wrap_spacer() {
+            return None;
+        }
+        if cell.is_wide_spacer() {
+            if c_idx == 0 || !cells[c_idx - 1].is_wide_lead() {
+                return None;
+            }
+            c_idx -= 1;
+        }
+        let resolved_cell = cells[c_idx];
+        if resolved_cell.extra_id != 0
+            && let Some(ext) = grid.cell_extra(resolved_cell.extra_id)
+            && let Some(hid) = ext.hyperlink_id
+        {
+            return self.hyperlink_pool.get(hid);
+        }
+        let store = if self.modes.alt_screen {
+            &self.alt_implicit_links
+        } else {
+            &self.primary_implicit_links
+        };
+        let abs_line = grid.screen_to_abs(usize::from(row));
+        store.find_at(abs_line, u16::try_from(c_idx).unwrap_or(u16::MAX))
+    }
+
+    /// Activates any hyperlink at visible `(col, row)`, emitting
+    /// [`TerminalEvent::HyperlinkActivated`] and returning `true` if a link was found.
+    #[cfg(feature = "hyperlinks")]
+    pub fn activate_hyperlink_at(&mut self, col: u16, row: u16) -> bool {
+        let Some(info) = self.hyperlink_at(col, row).cloned() else {
+            return false;
+        };
+        self.events.push(TerminalEvent::HyperlinkActivated {
+            uri: info.uri,
+            id: info.id,
+        });
+        true
+    }
+
+    /// Resolves the hyperlink at visible `(col, row)` together with all visible viewport
+    /// [`HyperlinkSpan`] segments belonging to that link (for hover underline highlights).
+    #[cfg(feature = "hyperlinks")]
+    #[must_use]
+    pub fn hyperlink_visible_spans_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<(&HyperlinkInfo, Vec<HyperlinkSpan>)> {
+        let grid = self.grid();
+        let r = grid.visible_row(usize::from(row))?;
+        let mut c_idx = usize::from(col);
+        let cells = r.cells();
+        let cell = *cells.get(c_idx)?;
+        if cell.is_wrap_spacer() {
+            return None;
+        }
+        if cell.is_wide_spacer() {
+            if c_idx == 0 || !cells[c_idx - 1].is_wide_lead() {
+                return None;
+            }
+            c_idx -= 1;
+        }
+        let resolved_cell = cells[c_idx];
+        if resolved_cell.extra_id != 0
+            && let Some(ext) = grid.cell_extra(resolved_cell.extra_id)
+            && let Some(hid) = ext.hyperlink_id
+            && let Some(info) = self.hyperlink_pool.get(hid)
+        {
+            let spans = explicit_visible_spans(
+                grid,
+                hid,
+                info.id.is_some(),
+                row,
+                u16::try_from(c_idx).unwrap_or(u16::MAX),
+            );
+            return Some((info, spans));
+        }
+
+        let store = if self.modes.alt_screen {
+            &self.alt_implicit_links
+        } else {
+            &self.primary_implicit_links
+        };
+        let abs_line = grid.screen_to_abs(usize::from(row));
+        store.visible_spans_at(grid, abs_line, u16::try_from(c_idx).unwrap_or(u16::MAX))
+    }
+
+    /// Returns all currently retained `OSC 133` semantic [`ShellZone`]s on the primary screen.
+    #[cfg(feature = "shell-integration")]
+    #[must_use]
+    pub fn shell_zones(&self) -> &[ShellZone] {
+        self.shell_integration.zones()
+    }
+
+    /// Scrolls the primary viewport to the `delta`-th previous (`delta < 0`) or next
+    /// (`delta > 0`) `OSC 133` prompt zone, returning `true` if `display_offset()` changed.
+    #[cfg(feature = "shell-integration")]
+    pub fn jump_to_prompt(&mut self, delta: i32) -> bool {
+        if self.modes.alt_screen {
+            return false;
+        }
+        self.shell_integration
+            .jump_to_prompt(&mut self.primary, delta)
+    }
+
+    /// Extracts the plain text of the `OSC 133` command output zone associated with 0-based
+    /// retained `line` (`0..total_lines()`), if any.
+    #[cfg(feature = "shell-integration")]
+    #[must_use]
+    pub fn command_output_at(&self, line: usize) -> Option<String> {
+        self.shell_integration
+            .command_output_at(&self.primary, line)
+    }
+
+    /// Returns the currently active Kitty Keyboard Protocol enhancement flags for the active
+    /// screen (`primary` or `alternate`).
+    #[cfg(feature = "kitty-keyboard")]
+    #[must_use]
+    pub fn kitty_keyboard_flags(&self) -> KittyKeyboardFlags {
+        self.kitty_keyboard.flags(self.modes.alt_screen)
+    }
+
+    /// Exports a serializable full-state [`TerminalSnapshot`] (`serde` feature).
+    #[cfg(feature = "serde")]
+    #[must_use]
+    pub fn export_snapshot(&self) -> TerminalSnapshot {
+        #[expect(clippy::cast_possible_truncation, reason = "grid initialized from u16")]
+        let cols = self.primary.cols() as u16;
+        #[expect(clippy::cast_possible_truncation, reason = "grid initialized from u16")]
+        let rows = self.primary.viewport_rows() as u16;
+        let mut extended_palette = Vec::new();
+        for (idx, entry) in self.extended_palette.iter().enumerate() {
+            if let Some(rgb) = entry {
+                #[expect(clippy::cast_possible_truncation, reason = "16 + 239 <= 255")]
+                let color_idx = (16 + idx) as u8;
+                extended_palette.push((color_idx, *rgb));
+            }
+        }
+        #[cfg(feature = "kitty-keyboard")]
+        let (kitty_primary_stack, kitty_alt_stack) = self.kitty_keyboard.export_stacks();
+
+        TerminalSnapshot {
+            cols,
+            rows,
+            primary: self.primary.export_snapshot(),
+            alternate: self.alternate.export_snapshot(),
+            modes: self.modes,
+            cursor: self.cursor,
+            alt_cursor_backup: self.alt_cursor_backup,
+            primary_saved_cursor: self.primary_saved_cursor,
+            alt_saved_cursor: self.alt_saved_cursor,
+            tabs: self.tabs.clone(),
+            scroll_top: self.scroll_top,
+            scroll_bottom: self.scroll_bottom,
+            palette: self.palette.clone(),
+            palette_overrides: self.palette_overrides,
+            extended_palette,
+            title: self.title.clone(),
+            icon_name: self.icon_name.clone(),
+            cwd: self.cwd.clone(),
+            hyperlink_pool: self.hyperlink_pool.clone(),
+            selection: self.selection,
+            #[cfg(feature = "shell-integration")]
+            shell_integration: Some(self.shell_integration.snapshot_clone()),
+            #[cfg(feature = "kitty-keyboard")]
+            kitty_primary_stack,
+            #[cfg(feature = "kitty-keyboard")]
+            kitty_alt_stack,
+        }
+    }
+
+    /// Restores a [`Terminal`] from a [`TerminalSnapshot`] and `config`, defensively sanitizing
+    /// dimensions, cursor bounds, scroll margins, hyperlink pools, and sparse `CellExtra` ownership.
+    #[cfg(feature = "serde")]
+    #[must_use]
+    pub fn from_snapshot(snapshot: TerminalSnapshot, config: CoreConfig) -> Self {
+        let mut hyperlink_pool = snapshot.hyperlink_pool;
+        hyperlink_pool.sanitize();
+
+        let primary = Grid::from_snapshot(
+            ScreenKind::Primary,
+            snapshot.primary,
+            config.scrollback_limit,
+            &hyperlink_pool,
+        );
+        let mut alternate = Grid::from_snapshot(
+            ScreenKind::Alternate,
+            snapshot.alternate,
+            0,
+            &hyperlink_pool,
+        );
+        let actual_cols = primary.cols();
+        let actual_rows = primary.viewport_rows();
+        if alternate.cols() != actual_cols || alternate.viewport_rows() != actual_rows {
+            alternate.resize(actual_cols, actual_rows, ReflowAnchors::default());
+        }
+
+        let mut modes = snapshot.modes;
+        modes.sync_output = false;
+
+        let clamp_cursor = |mut cur: Cursor| -> Cursor {
+            cur.row = cur.row.min(actual_rows - 1);
+            cur.col = cur.col.min(actual_cols - 1);
+            cur.pending_wrap &= cur.col == actual_cols - 1;
+            cur.attrs.flags &= CellFlags::SGR_MASK;
+            if cur
+                .attrs
+                .hyperlink_id
+                .is_some_and(|hid| hyperlink_pool.get(hid).is_none())
+            {
+                cur.attrs.hyperlink_id = None;
+            }
+            cur
+        };
+        let clamp_saved = |mut saved: SavedCursor| -> SavedCursor {
+            saved.row = saved.row.min(actual_rows - 1);
+            saved.col = saved.col.min(actual_cols - 1);
+            saved.pending_wrap &= saved.col == actual_cols - 1;
+            saved.attrs.flags &= CellFlags::SGR_MASK;
+            if saved
+                .attrs
+                .hyperlink_id
+                .is_some_and(|hid| hyperlink_pool.get(hid).is_none())
+            {
+                saved.attrs.hyperlink_id = None;
+            }
+            saved
+        };
+
+        let cursor = clamp_cursor(snapshot.cursor);
+        let alt_cursor_backup = snapshot.alt_cursor_backup.map(clamp_cursor);
+        let primary_saved_cursor = snapshot.primary_saved_cursor.map(clamp_saved);
+        let alt_saved_cursor = snapshot.alt_saved_cursor.map(clamp_saved);
+
+        let mut tabs = snapshot.tabs;
+        tabs.resize(actual_cols);
+
+        let (scroll_top, scroll_bottom) = if snapshot.scroll_top < snapshot.scroll_bottom
+            && snapshot.scroll_bottom < actual_rows
+        {
+            (snapshot.scroll_top, snapshot.scroll_bottom)
+        } else {
+            (0, actual_rows - 1)
+        };
+
+        let mut extended_palette = [None; 240];
+        for (idx, rgb) in snapshot.extended_palette {
+            if idx >= 16 {
+                extended_palette[(idx - 16) as usize] = Some(rgb);
+            }
+        }
+
+        let active = if modes.alt_screen {
+            &alternate
+        } else {
+            &primary
+        };
+        let oldest = active.oldest_abs_line();
+        let newest = active.newest_abs_line();
+        let selection = snapshot.selection.filter(|sel| {
+            [sel.anchor, sel.head, sel.origin_start, sel.origin_end]
+                .into_iter()
+                .all(|pt| pt.line >= oldest && pt.line <= newest)
+        });
+
+        let parser =
+            Parser::with_c1_policy(config.c1_policy).with_max_osc_bytes(config.max_osc_bytes);
+
+        #[cfg(feature = "shell-integration")]
+        let shell_integration = {
+            let mut si = snapshot.shell_integration.unwrap_or_else(|| {
+                ShellIntegrationState::new(config.scrollback_limit, actual_rows)
+            });
+            si.sanitize_snapshot(&primary);
+            si.set_viewport_rows(config.scrollback_limit, actual_rows);
+            si
+        };
+
+        #[cfg(feature = "kitty-keyboard")]
+        let kitty_keyboard = {
+            let mut ks = KittyKeyboardState::default();
+            ks.restore_stacks(snapshot.kitty_primary_stack, snapshot.kitty_alt_stack);
+            ks
+        };
+
+        let term = Self {
+            config,
+            parser,
+            primary,
+            alternate,
+            modes,
+            cursor,
+            alt_cursor_backup,
+            primary_saved_cursor,
+            alt_saved_cursor,
+            tabs,
+            scroll_top,
+            scroll_bottom,
+            palette: snapshot.palette,
+            palette_overrides: snapshot.palette_overrides,
+            extended_palette,
+            title: snapshot.title,
+            icon_name: snapshot.icon_name,
+            cwd: snapshot.cwd,
+            hyperlink_pool,
+            selection,
+            outgoing: Vec::new(),
+            events: Vec::new(),
+            sync_started_at: None,
+            last_time_secs: None,
+            latched_frame: None,
+            last_written: None,
+            last_graphic: None,
+            grapheme_scratch: String::with_capacity(16),
+            #[cfg(feature = "search")]
+            search_state: SearchState::default(),
+            #[cfg(feature = "hyperlinks")]
+            primary_implicit_links: ImplicitLinkStore::default(),
+            #[cfg(feature = "hyperlinks")]
+            alt_implicit_links: ImplicitLinkStore::default(),
+            #[cfg(feature = "hyperlinks")]
+            osc8_inserts_since_gc: 0,
+            #[cfg(feature = "shell-integration")]
+            shell_integration,
+            #[cfg(feature = "kitty-keyboard")]
+            kitty_keyboard,
+            #[cfg(feature = "metrics")]
+            metrics: TerminalMetrics::new(),
+        };
+
+        #[cfg(feature = "hyperlinks")]
+        let term = {
+            let mut term = term;
+            term.refresh_implicit_hyperlinks();
+            term
+        };
+        term
+    }
+
+    /// Returns monotonic parser/render/reflow [`TerminalMetrics`] (`metrics` feature).
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub const fn metrics(&self) -> &TerminalMetrics {
+        &self.metrics
+    }
+
+    /// Records a rendered frame with `dirty_rows` updated rows (`metrics` feature).
+    #[cfg(feature = "metrics")]
+    pub fn record_frame_rendered(&mut self, dirty_rows: u64) {
+        self.metrics.record_frame(dirty_rows);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "search")]
+    fn scroll_match_into_view(&mut self, line: usize) {
+        if self.modes.alt_screen {
+            return;
+        }
+        let vrows = self.primary.viewport_rows();
+        let history_len = self.primary.history_len();
+        let top = history_len.saturating_sub(self.primary.display_offset());
+        if line < top || line >= top + vrows {
+            let desired_top = line.saturating_sub(vrows / 2).min(history_len);
+            let target_offset = history_len.saturating_sub(desired_top);
+            self.primary.set_display_offset(target_offset);
+        }
+    }
+
+    #[cfg(feature = "hyperlinks")]
+    fn refresh_implicit_hyperlinks(&mut self) {
+        self.primary_implicit_links.refresh(&self.primary);
+        self.alt_implicit_links.refresh(&self.alternate);
+    }
+
+    #[cfg(feature = "hyperlinks")]
+    fn maybe_gc_hyperlink_pool(&mut self) {
+        if self.hyperlink_pool.len() <= 256 || self.osc8_inserts_since_gc < 64 {
+            return;
+        }
+        let mut live = std::collections::HashSet::new();
+        collect_grid_hyperlink_ids(&self.primary, &mut live);
+        collect_grid_hyperlink_ids(&self.alternate, &mut live);
+        if let Some(hid) = self.cursor.attrs.hyperlink_id {
+            live.insert(hid);
+        }
+        if let Some(ref cur) = self.alt_cursor_backup
+            && let Some(hid) = cur.attrs.hyperlink_id
+        {
+            live.insert(hid);
+        }
+        if let Some(ref saved) = self.primary_saved_cursor
+            && let Some(hid) = saved.attrs.hyperlink_id
+        {
+            live.insert(hid);
+        }
+        if let Some(ref saved) = self.alt_saved_cursor
+            && let Some(hid) = saved.attrs.hyperlink_id
+        {
+            live.insert(hid);
+        }
+        if let Some(ref latched) = self.latched_frame {
+            for (_, ext) in &latched.extras {
+                if let Some(hid) = ext.hyperlink_id {
+                    live.insert(hid);
+                }
+            }
+        }
+        self.hyperlink_pool.gc_unreferenced(&live);
+        self.osc8_inserts_since_gc = 0;
+    }
+
+    #[expect(clippy::cast_possible_truncation, reason = "viewport fits in u16")]
+    const fn live_cursor_snapshot(&self, display_offset: usize) -> CursorSnapshot {
+        CursorSnapshot {
+            row: self.cursor.row as u16,
+            col: self.cursor.col as u16,
+            visible: self.modes.cursor_visible && display_offset == 0,
+            style: self.cursor.style,
+        }
+    }
+
+    const fn active_grid(&self) -> &Grid {
+        if self.modes.alt_screen {
+            &self.alternate
+        } else {
+            &self.primary
+        }
+    }
+
+    const fn active_grid_mut(&mut self) -> &mut Grid {
+        if self.modes.alt_screen {
+            &mut self.alternate
+        } else {
+            &mut self.primary
+        }
+    }
+
+    fn viewport_to_grid_point(&self, screen_y: usize, col: usize) -> GridPoint {
+        let grid = self.grid();
+        let clamped_y = screen_y.min(grid.viewport_rows().saturating_sub(1));
+        let clamped_col = col.min(grid.cols().saturating_sub(1));
+        GridPoint::new(grid.screen_to_abs(clamped_y), clamped_col)
+    }
+
+    fn enter_sync_mode(&mut self) {
+        if self.modes.sync_output {
+            return;
+        }
+        let (cols, rows) = self.size();
+        let display_offset = self.display_offset();
+        let cursor = self.live_cursor_snapshot(display_offset);
+        let grid = self.grid();
+        let (visible_rows, extras) = grid.clone_visible_snapshot();
+        self.latched_frame = Some(LatchedFrame {
+            cols,
+            rows,
+            visible_rows,
+            extras,
+            cursor,
+            modes: self.modes,
+            palette: self.palette.clone(),
+            palette_overrides: self.palette_overrides,
+            extended_palette: self.extended_palette,
+            selection: self.selection,
+            display_offset,
+            scrollback_len: grid.history_len(),
+            is_alt_screen: self.modes.alt_screen,
+            damage_epoch: grid.damage_epoch(),
+            top_abs_line: grid.screen_to_abs(0),
+        });
+        self.modes.sync_output = true;
+        self.sync_started_at = self.last_time_secs;
+    }
+
+    fn exit_sync_mode(&mut self) {
+        if !self.modes.sync_output && self.latched_frame.is_none() {
+            return;
+        }
+        self.modes.sync_output = false;
+        self.sync_started_at = None;
+        self.latched_frame = None;
+        self.active_grid_mut().bump_damage_epoch();
+        self.active_grid_mut().mark_all_dirty();
+    }
+
+    fn save_cursor(&mut self) {
+        let saved = SavedCursor {
+            row: self.cursor.row,
+            col: self.cursor.col,
+            attrs: self.cursor.attrs,
+            origin_mode: self.modes.origin_mode,
+            pending_wrap: self.cursor.pending_wrap,
+            charsets: self.cursor.charsets,
+        };
+        if self.modes.alt_screen {
+            self.alt_saved_cursor = Some(saved);
+        } else {
+            self.primary_saved_cursor = Some(saved);
+        }
+    }
+
+    fn restore_cursor(&mut self) {
+        let saved = if self.modes.alt_screen {
+            self.alt_saved_cursor
+        } else {
+            self.primary_saved_cursor
+        };
+        let rows = self.active_grid().viewport_rows();
+        let cols = self.active_grid().cols();
+
+        if let Some(s) = saved {
+            self.modes.origin_mode = s.origin_mode;
+            self.cursor.attrs = s.attrs;
+            self.cursor.charsets = s.charsets;
+            self.cursor.row = if self.modes.origin_mode {
+                s.row.clamp(self.scroll_top, self.scroll_bottom)
+            } else {
+                s.row.min(rows - 1)
+            };
+            self.cursor.col = s.col.min(cols - 1);
+            self.cursor.pending_wrap = s.pending_wrap && self.cursor.col == cols - 1;
+        } else {
+            self.cursor.attrs.reset_all();
+            self.cursor.charsets = CharsetSlots::default();
+            self.cursor.row = if self.modes.origin_mode {
+                self.scroll_top
+            } else {
+                0
+            };
+            self.cursor.col = 0;
+            self.cursor.pending_wrap = false;
+        }
+        self.last_written = None;
+    }
+
+    fn enter_alt_screen(&mut self, clear_alt: bool, save_primary: bool) {
+        if self.modes.alt_screen {
+            return;
+        }
+        if save_primary {
+            self.save_cursor();
+        }
+        self.alt_cursor_backup = Some(self.cursor);
+        self.modes.alt_screen = true;
+        self.selection = None;
+        if clear_alt {
+            self.alternate.clear_visible(PackedColor::Default);
+            #[cfg(feature = "kitty-keyboard")]
+            self.kitty_keyboard.reset_alt();
+            self.cursor.row = 0;
+            self.cursor.col = 0;
+            self.cursor.pending_wrap = false;
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = self.alternate.viewport_rows() - 1;
+        self.last_written = None;
+        self.last_graphic = None;
+    }
+
+    fn exit_alt_screen(&mut self, clear_alt: bool, restore_primary: bool) {
+        if !self.modes.alt_screen {
+            return;
+        }
+        if clear_alt {
+            self.alternate.clear_visible(PackedColor::Default);
+        }
+        self.modes.alt_screen = false;
+        self.selection = None;
+        let rows = self.primary.viewport_rows();
+        let cols = self.primary.cols();
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+
+        if let Some(backup) = self.alt_cursor_backup.take() {
+            self.cursor = backup;
+            self.cursor.row = self.cursor.row.min(rows - 1);
+            self.cursor.col = self.cursor.col.min(cols - 1);
+            self.cursor.pending_wrap = self.cursor.pending_wrap && self.cursor.col == cols - 1;
+        }
+        if restore_primary {
+            self.restore_cursor();
+        }
+        self.primary.mark_all_dirty();
+        self.last_written = None;
+        self.last_graphic = None;
+    }
+
+    fn linefeed_internal(&mut self, apply_lnm: bool) {
+        self.cursor.pending_wrap = false;
+        if apply_lnm && self.modes.linefeed_newline {
+            self.cursor.col = 0;
+        }
+        let rows = self.active_grid().viewport_rows();
+        let bg = self.cursor.attrs.bg;
+        if self.cursor.row == self.scroll_bottom {
+            let top = self.scroll_top;
+            let bottom = self.scroll_bottom;
+            self.active_grid_mut()
+                .scroll_up_region(top, bottom, 1, bg, true);
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen {
+                self.shell_integration
+                    .on_primary_scroll_up(&self.primary, top, bottom, rows);
+            }
+            self.shift_selection_after_scroll_if_full(top, bottom);
+        } else if self.cursor.row + 1 < rows {
+            self.cursor.row += 1;
+        }
+        self.last_written = None;
+    }
+
+    fn shift_selection_after_scroll_if_full(&mut self, top: usize, bottom: usize) {
+        let vrows = self.active_grid().viewport_rows();
+        if top != 0 || bottom != vrows - 1 || self.modes.alt_screen {
+            return;
+        }
+        let oldest_line = self.primary.oldest_abs_line();
+        if let Some(sel) = &mut self.selection {
+            if sel.anchor.line < oldest_line && sel.head.line < oldest_line {
+                self.selection = None;
+            } else {
+                if sel.origin_end.line < oldest_line {
+                    sel.origin_evicted = true;
+                    sel.origin_cropped_bottom = false;
+                }
+                let is_block = sel.mode == SelectionMode::Block;
+                let clamp_evicted = |pt: &mut GridPoint, past_eol: &mut bool| {
+                    if pt.line < oldest_line {
+                        pt.line = oldest_line;
+                        *past_eol = false;
+                        if !is_block {
+                            pt.col = 0;
+                        }
+                    }
+                };
+                clamp_evicted(&mut sel.anchor, &mut sel.anchor_past_eol);
+                clamp_evicted(&mut sel.head, &mut sel.head_past_eol);
+                clamp_evicted(&mut sel.origin_start, &mut sel.origin_start_past_eol);
+                clamp_evicted(&mut sel.origin_end, &mut sel.origin_end_past_eol);
+            }
+        }
+    }
+
+    fn reverse_index(&mut self) {
+        self.cursor.pending_wrap = false;
+        let bg = self.cursor.attrs.bg;
+        if self.cursor.row == self.scroll_top {
+            let top = self.scroll_top;
+            let bottom = self.scroll_bottom;
+            self.active_grid_mut()
+                .scroll_down_region(top, bottom, 1, bg);
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen {
+                self.shell_integration
+                    .on_primary_rows_mutated(&self.primary, top, bottom);
+            }
+        } else if self.cursor.row > 0 {
+            self.cursor.row -= 1;
+        }
+        self.last_written = None;
+    }
+
+    fn print_scalar(&mut self, raw_ch: char) {
+        let ch = self.cursor.charsets.translate(raw_ch);
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let is_ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch);
+        let is_skin_tone = ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch);
+
+        if let Some(lw) = self.last_written
+            && (ch_width == 0 || lw.ended_with_zwj || is_skin_tone || (is_ri && lw.is_unpaired_ri))
+        {
+            let cols = self.active_grid().cols();
+            let rows = self.active_grid().viewport_rows();
+            let Some(prev_cell) = self
+                .active_grid()
+                .viewport_row(lw.row)
+                .and_then(|r| r.cells().get(lw.col).copied())
+            else {
+                if ch_width == 0 {
+                    return;
+                }
+                self.write_new_cell(ch, ch_width, is_ri);
+                return;
+            };
+
+            let mut too_many_combining = false;
+            let mut scratch = std::mem::take(&mut self.grapheme_scratch);
+            scratch.clear();
+            if prev_cell.extra_id != 0
+                && let Some(ext) = self.active_grid().cell_extra(prev_cell.extra_id)
+            {
+                if ext.combining.len() >= MAX_COMBINING_PER_CELL {
+                    too_many_combining = true;
+                } else {
+                    ext.write_grapheme(prev_cell.codepoint, &mut scratch);
+                }
+            } else {
+                scratch.push(prev_cell.codepoint);
+            }
+            if too_many_combining {
+                self.grapheme_scratch = scratch;
+                return;
+            }
+            scratch.push(ch);
+
+            let is_single_grapheme =
+                UnicodeSegmentation::graphemes(scratch.as_str(), true).count() == 1;
+            let new_w = if is_single_grapheme {
+                UnicodeWidthStr::width(scratch.as_str()).clamp(1, 2)
+            } else {
+                1
+            };
+            self.grapheme_scratch = scratch;
+
+            if is_single_grapheme {
+                let was_wide = prev_cell.is_wide_lead();
+                let can_wrap_wide =
+                    self.modes.auto_wrap && (lw.row == self.scroll_bottom || lw.row + 1 < rows);
+                if !was_wide && new_w == 2 && cols >= 2 && lw.col == cols - 1 && !can_wrap_wide {
+                    return;
+                }
+
+                let bg = self.cursor.attrs.bg;
+                self.active_grid_mut()
+                    .append_combining_scalar(lw.row, lw.col, ch);
+                if let Some(ref mut lg) = self.last_graphic {
+                    lg.combining.push(ch);
+                }
+
+                let mut new_lw_row = lw.row;
+                let mut new_lw_col = lw.col;
+
+                if !was_wide && new_w == 2 && cols >= 2 {
+                    if lw.col + 1 < cols {
+                        self.active_grid_mut()
+                            .promote_cell_to_wide(lw.row, lw.col, bg);
+                        #[cfg(feature = "shell-integration")]
+                        if !self.modes.alt_screen {
+                            self.shell_integration
+                                .on_primary_row_mutated(&self.primary, lw.row);
+                        }
+                        if self.cursor.row == lw.row && self.cursor.col == lw.col + 1 {
+                            if lw.col + 2 < cols {
+                                self.cursor.col = lw.col + 2;
+                                self.cursor.pending_wrap = false;
+                            } else {
+                                self.cursor.col = cols - 1;
+                                self.cursor.pending_wrap = self.modes.auto_wrap;
+                            }
+                        }
+                    } else if lw.col == cols - 1 && self.modes.auto_wrap {
+                        let target_row = if lw.row == self.scroll_bottom {
+                            let top = self.scroll_top;
+                            let bottom = self.scroll_bottom;
+                            if top == bottom {
+                                if let Some((lead, extra)) = self
+                                    .active_grid_mut()
+                                    .take_cell_as_wrap_spacer(lw.row, lw.col)
+                                {
+                                    let spacer = Cell::new(
+                                        ' ',
+                                        lead.fg,
+                                        lead.bg,
+                                        CellFlags::WIDE_SPACER | (lead.flags & CellFlags::SGR_MASK),
+                                    );
+                                    self.active_grid_mut()
+                                        .scroll_up_region(top, bottom, 1, bg, true);
+                                    #[cfg(feature = "shell-integration")]
+                                    if !self.modes.alt_screen {
+                                        self.shell_integration.on_primary_scroll_up(
+                                            &self.primary,
+                                            top,
+                                            bottom,
+                                            rows,
+                                        );
+                                    }
+                                    self.shift_selection_after_scroll_if_full(top, bottom);
+                                    self.active_grid_mut()
+                                        .write_wide_cell(lw.row, 0, lead, spacer, extra, bg);
+                                    #[cfg(feature = "shell-integration")]
+                                    if !self.modes.alt_screen {
+                                        self.shell_integration
+                                            .on_primary_row_mutated(&self.primary, lw.row);
+                                    }
+                                }
+                                new_lw_row = lw.row;
+                                new_lw_col = 0;
+                                self.cursor.row = lw.row;
+                                if cols == 2 {
+                                    self.cursor.col = 1;
+                                    self.cursor.pending_wrap = true;
+                                } else {
+                                    self.cursor.col = 2;
+                                    self.cursor.pending_wrap = false;
+                                }
+                                self.last_written = Some(LastWrittenCell {
+                                    row: new_lw_row,
+                                    col: new_lw_col,
+                                    ended_with_zwj: ch == '\u{200D}',
+                                    is_unpaired_ri: false,
+                                });
+                                return;
+                            }
+                            self.active_grid_mut()
+                                .scroll_up_region(top, bottom, 1, bg, true);
+                            #[cfg(feature = "shell-integration")]
+                            if !self.modes.alt_screen {
+                                self.shell_integration.on_primary_scroll_up(
+                                    &self.primary,
+                                    top,
+                                    bottom,
+                                    rows,
+                                );
+                            }
+                            self.shift_selection_after_scroll_if_full(top, bottom);
+                            lw.row
+                        } else {
+                            lw.row + 1
+                        };
+                        let src_row = if lw.row == self.scroll_bottom {
+                            lw.row - 1
+                        } else {
+                            lw.row
+                        };
+                        self.active_grid_mut()
+                            .move_cell_to_wide_wrap(src_row, lw.col, target_row, bg);
+                        #[cfg(feature = "shell-integration")]
+                        if !self.modes.alt_screen {
+                            self.shell_integration
+                                .on_primary_row_mutated(&self.primary, target_row);
+                        }
+                        new_lw_row = target_row;
+                        new_lw_col = 0;
+                        self.cursor.row = target_row;
+                        if cols == 2 {
+                            self.cursor.col = 1;
+                            self.cursor.pending_wrap = true;
+                        } else {
+                            self.cursor.col = 2;
+                            self.cursor.pending_wrap = false;
+                        }
+                    }
+                } else if was_wide && new_w == 1 && lw.col + 1 < cols {
+                    self.active_grid_mut()
+                        .demote_wide_to_narrow(lw.row, lw.col, bg);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration
+                            .on_primary_row_mutated(&self.primary, lw.row);
+                    }
+                    if self.cursor.row == lw.row {
+                        if self.cursor.col == lw.col + 2 {
+                            self.cursor.col = lw.col + 1;
+                            self.cursor.pending_wrap = false;
+                        } else if self.cursor.col == lw.col + 1 && self.cursor.pending_wrap {
+                            self.cursor.pending_wrap = false;
+                        }
+                    }
+                }
+
+                self.last_written = Some(LastWrittenCell {
+                    row: new_lw_row,
+                    col: new_lw_col,
+                    ended_with_zwj: ch == '\u{200D}',
+                    is_unpaired_ri: false,
+                });
+                return;
+            }
+        }
+
+        if ch_width == 0 {
+            return;
+        }
+        self.write_new_cell(ch, ch_width, is_ri);
+    }
+
+    fn write_new_cell(&mut self, ch: char, raw_width: usize, is_ri: bool) {
+        let cols = self.active_grid().cols();
+        let w = if cols >= 2 && raw_width >= 2 { 2 } else { 1 };
+        let bg = self.cursor.attrs.bg;
+
+        if self.cursor.pending_wrap {
+            if self.modes.auto_wrap {
+                let row = self.cursor.row;
+                self.active_grid_mut().set_row_soft_wrapped(row, true);
+                self.linefeed_internal(false);
+                self.cursor.col = 0;
+            }
+            self.cursor.pending_wrap = false;
+        }
+
+        if w == 2 && self.cursor.col + 1 >= cols {
+            if self.modes.auto_wrap {
+                let row = self.cursor.row;
+                self.active_grid_mut().set_wrap_spacer(row, bg);
+                self.linefeed_internal(false);
+                self.cursor.col = 0;
+            } else {
+                self.cursor.col = cols.saturating_sub(2);
+            }
+        }
+
+        if self.modes.insert_mode {
+            let r = self.cursor.row;
+            let c = self.cursor.col;
+            self.active_grid_mut().insert_cells(r, c, w, bg);
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen {
+                self.shell_integration
+                    .on_primary_row_mutated(&self.primary, r);
+            }
+        }
+
+        let extra = if self.cursor.attrs.underline_color.is_some()
+            || self.cursor.attrs.hyperlink_id.is_some()
+        {
+            Some(CellExtra {
+                combining: Vec::new(),
+                underline_color: self.cursor.attrs.underline_color,
+                hyperlink_id: self.cursor.attrs.hyperlink_id,
+            })
+        } else {
+            None
+        };
+
+        let sgr_flags = self.cursor.attrs.flags & CellFlags::SGR_MASK;
+        let row = self.cursor.row;
+        let col = self.cursor.col;
+        if w == 2 && col + 1 < cols {
+            let lead = Cell::new(
+                ch,
+                self.cursor.attrs.fg,
+                bg,
+                sgr_flags | CellFlags::WIDE_LEAD,
+            );
+            let spacer = Cell::new(
+                ' ',
+                self.cursor.attrs.fg,
+                bg,
+                sgr_flags | CellFlags::WIDE_SPACER,
+            );
+            self.active_grid_mut()
+                .write_wide_cell(row, col, lead, spacer, extra, bg);
+        } else {
+            let cell = Cell::new(ch, self.cursor.attrs.fg, bg, sgr_flags);
+            self.active_grid_mut().write_cell(row, col, cell, extra, bg);
+        }
+        #[cfg(feature = "shell-integration")]
+        if !self.modes.alt_screen {
+            self.shell_integration
+                .on_primary_row_mutated(&self.primary, row);
+        }
+
+        self.last_written = Some(LastWrittenCell {
+            row,
+            col,
+            ended_with_zwj: false,
+            is_unpaired_ri: is_ri,
+        });
+        self.last_graphic = Some(LastGraphic {
+            base: ch,
+            combining: Vec::new(),
+        });
+
+        if col + w < cols {
+            self.cursor.col = col + w;
+        } else {
+            self.cursor.col = cols - 1;
+            if self.modes.auto_wrap {
+                self.cursor.pending_wrap = true;
+            }
+        }
+    }
+
+    fn set_mode_dec(&mut self, mode: u16, enable: bool) {
+        match mode {
+            1 => self.modes.app_cursor_keys = enable,
+            3 => {
+                self.modes.column_132 = enable;
+                let bg = self.cursor.attrs.bg;
+                let rows = self.active_grid().viewport_rows();
+                self.active_grid_mut().clear_visible(bg);
+                #[cfg(feature = "shell-integration")]
+                if !self.modes.alt_screen && rows > 0 {
+                    self.shell_integration
+                        .on_primary_rows_mutated(&self.primary, 0, rows - 1);
+                }
+                self.scroll_top = 0;
+                self.scroll_bottom = rows - 1;
+                self.cursor.row = 0;
+                self.cursor.col = 0;
+                self.cursor.pending_wrap = false;
+            }
+            5 => {
+                if self.modes.reverse_video != enable {
+                    self.modes.reverse_video = enable;
+                    self.active_grid_mut().mark_all_dirty();
+                }
+            }
+            6 => {
+                self.modes.origin_mode = enable;
+                self.cursor.row = if enable { self.scroll_top } else { 0 };
+                self.cursor.col = 0;
+                self.cursor.pending_wrap = false;
+            }
+            7 => {
+                self.modes.auto_wrap = enable;
+                if !enable {
+                    self.cursor.pending_wrap = false;
+                }
+            }
+            9 => {
+                self.modes.mouse_protocol = if enable {
+                    MouseProtocol::X10
+                } else {
+                    MouseProtocol::None
+                };
+            }
+            12 => {
+                self.modes.cursor_blink = enable;
+                self.cursor.style.blink = enable;
+            }
+            25 => self.modes.cursor_visible = enable,
+            47 => {
+                if enable {
+                    self.enter_alt_screen(false, false);
+                } else {
+                    self.exit_alt_screen(false, false);
+                }
+            }
+            1000 => {
+                self.modes.mouse_protocol = if enable {
+                    MouseProtocol::Normal
+                } else {
+                    MouseProtocol::None
+                };
+            }
+            1002 => {
+                self.modes.mouse_protocol = if enable {
+                    MouseProtocol::ButtonEvent
+                } else {
+                    MouseProtocol::None
+                };
+            }
+            1003 => {
+                self.modes.mouse_protocol = if enable {
+                    MouseProtocol::AnyEvent
+                } else {
+                    MouseProtocol::None
+                };
+            }
+            1004 => self.modes.focus_reporting = enable,
+            1005 => {
+                self.modes.mouse_encoding = if enable {
+                    MouseEncoding::Utf8
+                } else {
+                    MouseEncoding::Default
+                };
+            }
+            1006 => {
+                self.modes.mouse_encoding = if enable {
+                    MouseEncoding::Sgr
+                } else {
+                    MouseEncoding::Default
+                };
+            }
+            1007 => self.modes.alt_scroll = enable,
+            1047 => {
+                if enable {
+                    self.enter_alt_screen(true, false);
+                } else {
+                    self.exit_alt_screen(true, false);
+                }
+            }
+            1048 => {
+                if enable {
+                    self.save_cursor();
+                } else {
+                    self.restore_cursor();
+                }
+            }
+            1049 => {
+                if enable {
+                    self.enter_alt_screen(true, true);
+                } else {
+                    self.exit_alt_screen(false, true);
+                }
+            }
+            2004 => self.modes.bracketed_paste = enable,
+            2026 => {
+                if enable {
+                    self.enter_sync_mode();
+                } else {
+                    self.exit_sync_mode();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_mode_ansi(&mut self, mode: u16, enable: bool) {
+        match mode {
+            4 => self.modes.insert_mode = enable,
+            20 => self.modes.linefeed_newline = enable,
+            _ => {}
+        }
+    }
+
+    fn soft_reset(&mut self) {
+        let was_reverse = self.modes.reverse_video;
+        self.modes.reset_soft(self.config.default_cursor_blink);
+        self.exit_sync_mode();
+        if was_reverse {
+            self.active_grid_mut().mark_all_dirty();
+        }
+        let rows = self.active_grid().viewport_rows();
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+        self.cursor.attrs.reset_all();
+        self.cursor.charsets = CharsetSlots::default();
+        self.cursor.style = CursorStyle {
+            shape: self.config.default_cursor_shape,
+            blink: self.config.default_cursor_blink,
+        };
+        self.cursor.pending_wrap = false;
+        self.primary_saved_cursor = None;
+        self.alt_saved_cursor = None;
+        self.last_written = None;
+        self.last_graphic = None;
+    }
+
+    fn full_reset(&mut self) {
+        self.exit_sync_mode();
+        self.modes = Modes::with_default_blink(self.config.default_cursor_blink);
+        self.primary.clear_all();
+        self.alternate.clear_all();
+        let cols = self.primary.cols();
+        let rows = self.primary.viewport_rows();
+        self.tabs.reset(cols);
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+        self.cursor = Cursor {
+            style: CursorStyle {
+                shape: self.config.default_cursor_shape,
+                blink: self.config.default_cursor_blink,
+            },
+            ..Cursor::default()
+        };
+        self.alt_cursor_backup = None;
+        self.primary_saved_cursor = None;
+        self.alt_saved_cursor = None;
+        self.palette = self.config.theme.scheme.clone();
+        self.palette_overrides = PaletteOverrides::default();
+        self.extended_palette.fill(None);
+        self.title.clear();
+        self.icon_name.clear();
+        self.cwd = None;
+        self.hyperlink_pool.clear();
+        #[cfg(feature = "hyperlinks")]
+        {
+            self.primary_implicit_links.clear();
+            self.alt_implicit_links.clear();
+            self.osc8_inserts_since_gc = 0;
+        }
+        #[cfg(feature = "shell-integration")]
+        self.shell_integration.reset();
+        #[cfg(feature = "kitty-keyboard")]
+        self.kitty_keyboard.reset_all();
+        self.selection = None;
+        self.last_written = None;
+        self.last_graphic = None;
+    }
+}
+
+impl VtHandler for Terminal {
+    fn print(&mut self, ch: char) {
+        self.print_scalar(ch);
+    }
+
+    fn print_ascii_run(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.modes.insert_mode
+            || self.cursor.charsets.active() != Charset::Ascii
+            || self.cursor.attrs.underline_color.is_some()
+            || self.cursor.attrs.hyperlink_id.is_some()
+        {
+            for &b in bytes {
+                self.print_scalar(char::from(b));
+            }
+            return;
+        }
+
+        let cols = self.active_grid().cols();
+        let fg = self.cursor.attrs.fg;
+        let bg = self.cursor.attrs.bg;
+        let flags = self.cursor.attrs.flags;
+        let mut rem = bytes;
+
+        while !rem.is_empty() {
+            if self.cursor.pending_wrap {
+                if self.modes.auto_wrap {
+                    let row = self.cursor.row;
+                    self.active_grid_mut().set_row_soft_wrapped(row, true);
+                    self.linefeed_internal(false);
+                    self.cursor.col = 0;
+                    self.cursor.pending_wrap = false;
+                } else {
+                    // Overwrite last column repeatedly when DECAWM is disabled.
+                    self.cursor.pending_wrap = false;
+                }
+            }
+
+            if !self.modes.auto_wrap && self.cursor.col == cols - 1 && rem.len() > 1 {
+                let last_byte = rem[rem.len() - 1];
+                let row = self.cursor.row;
+                #[cfg(feature = "shell-integration")]
+                if !self.modes.alt_screen
+                    && self.shell_integration.row_has_live_eol(&self.primary, row)
+                    && fg.is_default()
+                    && bg.is_default()
+                    && (flags & CellFlags::SGR_MASK).is_empty()
+                    && rem[..rem.len() - 1].contains(&b' ')
+                {
+                    let blank = Cell::new(' ', fg, bg, flags & CellFlags::SGR_MASK);
+                    self.primary.write_cell(row, cols - 1, blank, None, bg);
+                    self.shell_integration
+                        .on_primary_row_mutated(&self.primary, row);
+                }
+                self.active_grid_mut().write_ascii_slice(
+                    row,
+                    cols - 1,
+                    &[last_byte],
+                    fg,
+                    bg,
+                    flags,
+                );
+                #[cfg(feature = "shell-integration")]
+                if !self.modes.alt_screen {
+                    self.shell_integration
+                        .on_primary_row_mutated(&self.primary, row);
+                }
+                self.last_written = Some(LastWrittenCell {
+                    row,
+                    col: cols - 1,
+                    ended_with_zwj: false,
+                    is_unpaired_ri: false,
+                });
+                break;
+            }
+
+            let avail = cols - self.cursor.col;
+            let take = rem.len().min(avail);
+            let row = self.cursor.row;
+            let start_col = self.cursor.col;
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen && self.shell_integration.row_has_live_eol(&self.primary, row)
+            {
+                let has_default_space = fg.is_default()
+                    && bg.is_default()
+                    && (flags & CellFlags::SGR_MASK).is_empty()
+                    && rem[..take].contains(&b' ');
+                let hits_wide = self.primary.viewport_row(row).is_some_and(|r| {
+                    r.cells()[start_col..start_col + take]
+                        .iter()
+                        .any(|c| c.is_wide_lead() || c.is_wide_spacer())
+                });
+                if has_default_space || hits_wide {
+                    for &b in &rem[..take] {
+                        self.print_scalar(char::from(b));
+                    }
+                    rem = &rem[take..];
+                    continue;
+                }
+            }
+            self.active_grid_mut()
+                .write_ascii_slice(row, start_col, &rem[..take], fg, bg, flags);
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen {
+                self.shell_integration
+                    .on_primary_row_mutated(&self.primary, row);
+            }
+            let written_col = start_col + take - 1;
+            self.last_written = Some(LastWrittenCell {
+                row,
+                col: written_col,
+                ended_with_zwj: false,
+                is_unpaired_ri: false,
+            });
+
+            if start_col + take < cols {
+                self.cursor.col = start_col + take;
+            } else {
+                self.cursor.col = cols - 1;
+                if self.modes.auto_wrap {
+                    self.cursor.pending_wrap = true;
+                }
+            }
+
+            rem = &rem[take..];
+        }
+
+        if let Some(&last_b) = bytes.last() {
+            self.last_graphic = Some(LastGraphic {
+                base: char::from(last_b),
+                combining: Vec::new(),
+            });
+        }
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.last_written = None;
+        self.last_graphic = None;
+        match byte {
+            0x07 => self.events.push(TerminalEvent::Bell),
+            0x08 => {
+                self.cursor.pending_wrap = false;
+                self.cursor.col = self.cursor.col.saturating_sub(1);
+            }
+            0x09 => {
+                self.cursor.pending_wrap = false;
+                self.cursor.col = self.tabs.next(self.cursor.col, 1);
+            }
+            0x0A..=0x0C => self.linefeed_internal(true),
+            0x0D => {
+                self.cursor.pending_wrap = false;
+                self.cursor.col = 0;
+            }
+            0x0E => self.cursor.charsets.gl_is_g1 = true,
+            0x0F => self.cursor.charsets.gl_is_g1 = false,
+            0x84 => self.linefeed_internal(false),
+            0x85 => {
+                self.cursor.pending_wrap = false;
+                self.cursor.col = 0;
+                self.linefeed_internal(false);
+            }
+            0x88 => self.tabs.set(self.cursor.col),
+            0x8D => self.reverse_index(),
+            _ => {}
+        }
+    }
+
+    fn hook(&mut self, _params: &CsiParams, _intermediates: &[u8], _action: u8) {
+        self.last_written = None;
+        self.last_graphic = None;
+    }
+
+    fn put(&mut self, _byte: u8) {}
+
+    fn unhook(&mut self) {}
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], terminator: OscTerminator) {
+        self.last_written = None;
+        self.last_graphic = None;
+        if params.first().copied() == Some(b"133") {
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen {
+                self.shell_integration.handle_osc_133(
+                    params,
+                    &self.primary,
+                    self.cursor.row,
+                    self.cursor.col,
+                    self.cursor.pending_wrap,
+                    &mut self.events,
+                );
+            }
+            return;
+        }
+        let default_palette = self.config.theme.scheme.clone();
+        let mut palette_changed = false;
+        #[cfg(feature = "hyperlinks")]
+        let mut hyperlink_inserted = false;
+        let mut ctx = OscContext {
+            palette: &mut self.palette,
+            default_palette: &default_palette,
+            palette_overrides: &mut self.palette_overrides,
+            extended_palette: &mut self.extended_palette,
+            title: &mut self.title,
+            icon_name: &mut self.icon_name,
+            cwd: &mut self.cwd,
+            allow_osc52_read: self.config.allow_osc52_read,
+            outgoing: &mut self.outgoing,
+            events: &mut self.events,
+            palette_changed: &mut palette_changed,
+            #[cfg(feature = "hyperlinks")]
+            hyperlink_pool: &mut self.hyperlink_pool,
+            #[cfg(feature = "hyperlinks")]
+            active_hyperlink: &mut self.cursor.attrs.hyperlink_id,
+            #[cfg(feature = "hyperlinks")]
+            hyperlink_inserted: &mut hyperlink_inserted,
+        };
+        osc::handle_osc(params, terminator, &mut ctx);
+        if palette_changed {
+            self.events.push(TerminalEvent::PaletteChanged);
+            self.active_grid_mut().mark_all_dirty();
+        }
+        #[cfg(feature = "hyperlinks")]
+        if hyperlink_inserted {
+            self.osc8_inserts_since_gc += 1;
+            self.maybe_gc_hyperlink_pool();
+        }
+    }
+
+    fn csi_dispatch(&mut self, params: &CsiParams, intermediates: &[u8], action: u8) {
+        self.last_written = None;
+        if !(intermediates.is_empty() && action == b'b') {
+            self.last_graphic = None;
+        }
+
+        let rows = self.active_grid().viewport_rows();
+        let cols = self.active_grid().cols();
+        let bg = self.cursor.attrs.bg;
+
+        match intermediates {
+            [] => match action {
+                b'A' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let min_row = if self.cursor.row >= self.scroll_top {
+                        self.scroll_top
+                    } else {
+                        0
+                    };
+                    self.cursor.row = self.cursor.row.saturating_sub(n).max(min_row);
+                    self.cursor.pending_wrap = false;
+                }
+                b'B' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let max_row = if self.cursor.row <= self.scroll_bottom {
+                        self.scroll_bottom
+                    } else {
+                        rows - 1
+                    };
+                    self.cursor.row = (self.cursor.row + n).min(max_row);
+                    self.cursor.pending_wrap = false;
+                }
+                b'C' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    self.cursor.col = (self.cursor.col + n).min(cols - 1);
+                    self.cursor.pending_wrap = false;
+                }
+                b'D' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    self.cursor.col = self.cursor.col.saturating_sub(n);
+                    self.cursor.pending_wrap = false;
+                }
+                b'E' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let max_row = if self.cursor.row <= self.scroll_bottom {
+                        self.scroll_bottom
+                    } else {
+                        rows - 1
+                    };
+                    self.cursor.row = (self.cursor.row + n).min(max_row);
+                    self.cursor.col = 0;
+                    self.cursor.pending_wrap = false;
+                }
+                b'F' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let min_row = if self.cursor.row >= self.scroll_top {
+                        self.scroll_top
+                    } else {
+                        0
+                    };
+                    self.cursor.row = self.cursor.row.saturating_sub(n).max(min_row);
+                    self.cursor.col = 0;
+                    self.cursor.pending_wrap = false;
+                }
+                b'G' | b'`' => {
+                    let c = usize::from(params.get_nonzero_or(0, 1));
+                    self.cursor.col = (c - 1).min(cols - 1);
+                    self.cursor.pending_wrap = false;
+                }
+                b'd' => {
+                    let r = usize::from(params.get_nonzero_or(0, 1));
+                    self.cursor.row = if self.modes.origin_mode {
+                        (self.scroll_top + r - 1).min(self.scroll_bottom)
+                    } else {
+                        (r - 1).min(rows - 1)
+                    };
+                    self.cursor.pending_wrap = false;
+                }
+                b'H' | b'f' => {
+                    let r = usize::from(params.get_nonzero_or(0, 1));
+                    let c = usize::from(params.get_nonzero_or(1, 1));
+                    self.cursor.row = if self.modes.origin_mode {
+                        (self.scroll_top + r - 1).min(self.scroll_bottom)
+                    } else {
+                        (r - 1).min(rows - 1)
+                    };
+                    self.cursor.col = (c - 1).min(cols - 1);
+                    self.cursor.pending_wrap = false;
+                }
+                b'@' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let r = self.cursor.row;
+                    let c = self.cursor.col;
+                    self.active_grid_mut().insert_cells(r, c, n, bg);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration
+                            .on_primary_row_mutated(&self.primary, r);
+                    }
+                    self.cursor.pending_wrap = false;
+                }
+                b'P' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let r = self.cursor.row;
+                    let c = self.cursor.col;
+                    self.active_grid_mut().delete_cells(r, c, n, bg);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration
+                            .on_primary_row_mutated(&self.primary, r);
+                    }
+                    self.cursor.pending_wrap = false;
+                }
+                b'L' => {
+                    if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom {
+                        let n = usize::from(params.get_nonzero_or(0, 1));
+                        let r = self.cursor.row;
+                        let bottom = self.scroll_bottom;
+                        self.active_grid_mut().scroll_down_region(r, bottom, n, bg);
+                        #[cfg(feature = "shell-integration")]
+                        if !self.modes.alt_screen {
+                            self.shell_integration.on_primary_rows_mutated(
+                                &self.primary,
+                                r,
+                                bottom,
+                            );
+                        }
+                        self.cursor.col = 0;
+                        self.cursor.pending_wrap = false;
+                    }
+                }
+                b'M' => {
+                    if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom {
+                        let n = usize::from(params.get_nonzero_or(0, 1));
+                        let r = self.cursor.row;
+                        let bottom = self.scroll_bottom;
+                        self.active_grid_mut()
+                            .scroll_up_region(r, bottom, n, bg, false);
+                        #[cfg(feature = "shell-integration")]
+                        if !self.modes.alt_screen {
+                            self.shell_integration.on_primary_rows_mutated(
+                                &self.primary,
+                                r,
+                                bottom,
+                            );
+                        }
+                        self.cursor.col = 0;
+                        self.cursor.pending_wrap = false;
+                    }
+                }
+                b'K' => {
+                    let mode = params.get_or(0, 0);
+                    let r = self.cursor.row;
+                    let c = self.cursor.col;
+                    self.active_grid_mut().erase_in_line(r, c, mode, bg);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration
+                            .on_primary_row_mutated(&self.primary, r);
+                    }
+                    self.cursor.pending_wrap = false;
+                }
+                b'J' => {
+                    let mode = params.get_or(0, 0);
+                    let r = self.cursor.row;
+                    let c = self.cursor.col;
+                    self.active_grid_mut().erase_in_display(r, c, mode, bg);
+                    if !self.modes.alt_screen {
+                        match mode {
+                            0 =>
+                            {
+                                #[cfg(feature = "shell-integration")]
+                                if rows > 0 {
+                                    self.shell_integration.on_primary_rows_mutated(
+                                        &self.primary,
+                                        r,
+                                        rows - 1,
+                                    );
+                                }
+                            }
+                            1 =>
+                            {
+                                #[cfg(feature = "shell-integration")]
+                                if rows > 0 {
+                                    self.shell_integration.on_primary_rows_mutated(
+                                        &self.primary,
+                                        0,
+                                        r.min(rows - 1),
+                                    );
+                                }
+                            }
+                            2 =>
+                            {
+                                #[cfg(feature = "shell-integration")]
+                                if rows > 0 {
+                                    self.shell_integration.on_primary_rows_mutated(
+                                        &self.primary,
+                                        0,
+                                        rows - 1,
+                                    );
+                                }
+                            }
+                            3 => {
+                                self.selection = None;
+                                #[cfg(feature = "shell-integration")]
+                                self.shell_integration
+                                    .sync_after_eviction_if_needed(&self.primary);
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.cursor.pending_wrap = false;
+                }
+                b'X' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let r = self.cursor.row;
+                    let c = self.cursor.col;
+                    self.active_grid_mut().erase_chars(r, c, n, bg);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration
+                            .on_primary_row_mutated(&self.primary, r);
+                    }
+                    self.cursor.pending_wrap = false;
+                }
+                b'S' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let top = self.scroll_top;
+                    let bottom = self.scroll_bottom;
+                    self.active_grid_mut()
+                        .scroll_up_region(top, bottom, n, bg, true);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration.on_primary_scroll_up(
+                            &self.primary,
+                            top,
+                            bottom,
+                            rows,
+                        );
+                    }
+                    self.shift_selection_after_scroll_if_full(top, bottom);
+                }
+                b'T' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let top = self.scroll_top;
+                    let bottom = self.scroll_bottom;
+                    self.active_grid_mut()
+                        .scroll_down_region(top, bottom, n, bg);
+                    #[cfg(feature = "shell-integration")]
+                    if !self.modes.alt_screen {
+                        self.shell_integration
+                            .on_primary_rows_mutated(&self.primary, top, bottom);
+                    }
+                }
+                b'I' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    self.cursor.col = self.tabs.next(self.cursor.col, n);
+                    self.cursor.pending_wrap = false;
+                }
+                b'Z' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    self.cursor.col = self.tabs.prev(self.cursor.col, n);
+                    self.cursor.pending_wrap = false;
+                }
+                b'g' => match params.get_or(0, 0) {
+                    0 => self.tabs.clear(self.cursor.col),
+                    3 => self.tabs.clear_all(),
+                    _ => {}
+                },
+                b'r' => {
+                    let top = usize::from(params.get_nonzero_or(0, 1));
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "viewport_rows fits in u16"
+                    )]
+                    let bottom_default = rows as u16;
+                    let bottom = usize::from(params.get_nonzero_or(1, bottom_default)).min(rows);
+                    if top < bottom {
+                        self.scroll_top = top - 1;
+                        self.scroll_bottom = bottom - 1;
+                        self.cursor.row = if self.modes.origin_mode {
+                            self.scroll_top
+                        } else {
+                            0
+                        };
+                        self.cursor.col = 0;
+                        self.cursor.pending_wrap = false;
+                    }
+                }
+                b'b' => {
+                    let n = usize::from(params.get_nonzero_or(0, 1)).min(cols * rows);
+                    if let Some(lg) = self.last_graphic.clone() {
+                        for _ in 0..n {
+                            self.print_scalar(lg.base);
+                            for &comb in &lg.combining {
+                                self.print_scalar(comb);
+                            }
+                        }
+                    }
+                }
+                b'm' => sgr::apply_sgr(params, &mut self.cursor.attrs),
+                b'h' => {
+                    for sub in params {
+                        if let Some(&m) = sub.first() {
+                            self.set_mode_ansi(m, true);
+                        }
+                    }
+                }
+                b'l' => {
+                    for sub in params {
+                        if let Some(&m) = sub.first() {
+                            self.set_mode_ansi(m, false);
+                        }
+                    }
+                }
+                b's' => self.save_cursor(),
+                b'u' => self.restore_cursor(),
+                b'c' => {
+                    if params.get_or(0, 0) == 0 {
+                        self.outgoing.extend_from_slice(b"\x1b[?62;4;22c");
+                    }
+                }
+                b'n' => match params.get_or(0, 0) {
+                    5 => self.outgoing.extend_from_slice(b"\x1b[0n"),
+                    6 => {
+                        let r = if self.modes.origin_mode {
+                            self.cursor.row.saturating_sub(self.scroll_top) + 1
+                        } else {
+                            self.cursor.row + 1
+                        };
+                        let c = self.cursor.col + 1;
+                        let mut reply = String::with_capacity(16);
+                        let _ = write!(reply, "\x1b[{r};{c}R");
+                        self.outgoing.extend_from_slice(reply.as_bytes());
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            b"?" => match action {
+                b'h' => {
+                    for sub in params {
+                        if let Some(&m) = sub.first() {
+                            self.set_mode_dec(m, true);
+                        }
+                    }
+                }
+                b'l' => {
+                    for sub in params {
+                        if let Some(&m) = sub.first() {
+                            self.set_mode_dec(m, false);
+                        }
+                    }
+                }
+                b'n' if params.get_or(0, 0) == 6 => {
+                    let r = if self.modes.origin_mode {
+                        self.cursor.row.saturating_sub(self.scroll_top) + 1
+                    } else {
+                        self.cursor.row + 1
+                    };
+                    let c = self.cursor.col + 1;
+                    let mut reply = String::with_capacity(18);
+                    let _ = write!(reply, "\x1b[?{r};{c}R");
+                    self.outgoing.extend_from_slice(reply.as_bytes());
+                }
+                #[cfg(feature = "kitty-keyboard")]
+                b'u' if params.is_empty() => {
+                    let bits = self.kitty_keyboard.flags(self.modes.alt_screen).bits();
+                    let mut reply = String::with_capacity(8);
+                    let _ = write!(reply, "\x1b[?{bits}u");
+                    self.outgoing.extend_from_slice(reply.as_bytes());
+                }
+                _ => {}
+            },
+            b"!" if action == b'p' => self.soft_reset(),
+            b" " if action == b'q' => {
+                let code = params.get_or(0, 0);
+                let style = match code {
+                    0 => CursorStyle {
+                        shape: self.config.default_cursor_shape,
+                        blink: self.config.default_cursor_blink,
+                    },
+                    1 => CursorStyle {
+                        shape: CursorShape::Block,
+                        blink: true,
+                    },
+                    2 => CursorStyle {
+                        shape: CursorShape::Block,
+                        blink: false,
+                    },
+                    3 => CursorStyle {
+                        shape: CursorShape::Underline,
+                        blink: true,
+                    },
+                    4 => CursorStyle {
+                        shape: CursorShape::Underline,
+                        blink: false,
+                    },
+                    5 => CursorStyle {
+                        shape: CursorShape::Bar,
+                        blink: true,
+                    },
+                    6 => CursorStyle {
+                        shape: CursorShape::Bar,
+                        blink: false,
+                    },
+                    _ => return,
+                };
+                self.cursor.style = style;
+                self.modes.cursor_blink = style.blink;
+                self.events.push(TerminalEvent::CursorStyleChanged(style));
+            }
+            b">" => match action {
+                b'c' if params.get_or(0, 0) == 0 => {
+                    self.outgoing.extend_from_slice(b"\x1b[>0;100;0c");
+                }
+                #[cfg(feature = "kitty-keyboard")]
+                b'u' => {
+                    let flags =
+                        KittyKeyboardFlags::from_bits_truncate((params.get_or(0, 0) & 0x1F) as u8);
+                    let mode = params.get_or(1, 1);
+                    self.kitty_keyboard.push(self.modes.alt_screen, flags, mode);
+                }
+                _ => {}
+            },
+            #[cfg(feature = "kitty-keyboard")]
+            b"<" if action == b'u' => {
+                let count = usize::from(params.get_nonzero_or(0, 1));
+                self.kitty_keyboard.pop(self.modes.alt_screen, count);
+            }
+            #[cfg(feature = "kitty-keyboard")]
+            b"=" if action == b'u' => {
+                let flags =
+                    KittyKeyboardFlags::from_bits_truncate((params.get_or(0, 0) & 0x1F) as u8);
+                let mode = params.get_or(1, 1);
+                self.kitty_keyboard.set(self.modes.alt_screen, flags, mode);
+            }
+            b"$" if action == b'p' => {
+                if let Some(m) = params.get(0) {
+                    let pm = self.modes.decrqm_ansi(m);
+                    let mut reply = String::with_capacity(16);
+                    let _ = write!(reply, "\x1b[{m};{pm}$y");
+                    self.outgoing.extend_from_slice(reply.as_bytes());
+                }
+            }
+            b"?$" if action == b'p' => {
+                if let Some(m) = params.get(0) {
+                    let pm = self.modes.decrqm_dec(m);
+                    let mut reply = String::with_capacity(18);
+                    let _ = write!(reply, "\x1b[?{m};{pm}$y");
+                    self.outgoing.extend_from_slice(reply.as_bytes());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], action: u8) {
+        self.last_written = None;
+        self.last_graphic = None;
+        match (intermediates, action) {
+            ([], b'7') => self.save_cursor(),
+            ([], b'8') => self.restore_cursor(),
+            ([], b'D') => self.linefeed_internal(false),
+            ([], b'E') => {
+                self.cursor.col = 0;
+                self.linefeed_internal(false);
+            }
+            ([], b'H') => self.tabs.set(self.cursor.col),
+            ([], b'M') => self.reverse_index(),
+            ([], b'=') => self.modes.app_keypad = true,
+            ([], b'>') => self.modes.app_keypad = false,
+            ([], b'c') => self.full_reset(),
+            (b"(", b'B') => self.cursor.charsets.g0 = Charset::Ascii,
+            (b"(", b'0') => self.cursor.charsets.g0 = Charset::DecSpecialGraphics,
+            (b")", b'B') => self.cursor.charsets.g1 = Charset::Ascii,
+            (b")", b'0') => self.cursor.charsets.g1 = Charset::DecSpecialGraphics,
+            // Includes 7-bit ST (`ESC \`) following OSC or DCS payloads, which is a no-op terminator.
+            _ => {}
+        }
+    }
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut i = 0usize;
+    while i + 3 <= input.len() {
+        let triple =
+            (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8) | u32::from(input[i + 2]);
+        out.push(char::from(TABLE[((triple >> 18) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 12) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 6) & 0x3F) as usize]));
+        out.push(char::from(TABLE[(triple & 0x3F) as usize]));
+        i += 3;
+    }
+    let rem = input.len() - i;
+    if rem == 1 {
+        let triple = u32::from(input[i]) << 16;
+        out.push(char::from(TABLE[((triple >> 18) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 12) & 0x3F) as usize]));
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let triple = (u32::from(input[i]) << 16) | (u32::from(input[i + 1]) << 8);
+        out.push(char::from(TABLE[((triple >> 18) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 12) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 6) & 0x3F) as usize]));
+        out.push('=');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_term(cols: u16, rows: u16) -> Terminal {
+        Terminal::new(cols, rows, CoreConfig::default())
+    }
+
+    #[test]
+    fn public_inspection_api_and_cell_snapshot() {
+        let mut term = new_term(10, 4);
+        assert_eq!(term.size(), (10, 4));
+        term.advance("hello中文".as_bytes());
+        assert_eq!(term.visible_line_text(0), Some("hello中文".to_owned()));
+        assert_eq!(term.visible_lines().len(), 4);
+        assert_eq!(term.cursor_pos(), (9, 0));
+        assert_eq!(term.cursor_shape(), CursorShape::Block);
+        assert!(term.cursor_blink());
+        assert!(term.cursor_visible());
+        assert!(!term.is_alt_screen());
+        assert!(!term.is_synchronized_output());
+        assert_eq!(term.full_text(), "hello中文");
+
+        let c_mid = term.cell_at(5, 0).unwrap();
+        assert_eq!(c_mid.ch, '中');
+        assert_eq!(c_mid.grapheme, "中");
+        assert_eq!(c_mid.width, 2);
+        assert!(c_mid.is_wide);
+        assert!(!c_mid.is_wide_spacer);
+
+        let c_sp = term.cell_at(6, 0).unwrap();
+        assert!(!c_sp.is_wide);
+        assert!(c_sp.is_wide_spacer);
+        assert_eq!(c_sp.width, 0);
+        assert!(c_sp.grapheme.is_empty());
+
+        term.grid().debug_verify_extra_invariants();
+        term.grid().debug_verify_wide_invariants();
+    }
+
+    #[test]
+    fn grapheme_combining_vs16_zwj_ri_and_zalgo_cap() {
+        let mut term = new_term(12, 4);
+        // Combining acute accent + VS16 promotion + ZWJ + Regional Indicator flag.
+        term.advance("e\u{0301}\u{2764}\u{FE0F}👩\u{200D}🔬🇺🇸".as_bytes());
+        let line = term.visible_line_text(0).unwrap();
+        assert_eq!(line, "e\u{0301}\u{2764}\u{FE0F}👩\u{200D}🔬🇺🇸");
+
+        let e_cell = term.cell_at(0, 0).unwrap();
+        assert_eq!(e_cell.grapheme, "e\u{0301}");
+        assert_eq!(e_cell.width, 1);
+
+        let heart = term.cell_at(1, 0).unwrap();
+        assert_eq!(heart.grapheme, "\u{2764}\u{FE0F}");
+        assert!(heart.is_wide);
+        assert!(term.cell_at(2, 0).unwrap().is_wide_spacer);
+
+        // VS16 promotion at right margin wraps atomically.
+        let mut t2 = new_term(5, 3);
+        t2.advance("abcd\u{2764}\u{FE0F}".as_bytes());
+        assert_eq!(t2.visible_line_text(0).unwrap(), "abcd");
+        assert_eq!(t2.visible_line_text(1).unwrap(), "\u{2764}\u{FE0F}");
+        t2.grid().debug_verify_wide_invariants();
+
+        // VS15 demotion from wide back to narrow.
+        let mut t3 = new_term(10, 2);
+        t3.advance("\u{2764}\u{FE0F}\u{FE0E}".as_bytes());
+        // After VS16 then VS15, unicode-width stays >=1; test direct demotion invariant.
+        t3.grid().debug_verify_wide_invariants();
+
+        // 32-mark Zalgo cap.
+        let mut t4 = new_term(10, 2);
+        let mut zalgo = String::from("a");
+        for _ in 0..64 {
+            zalgo.push('\u{0301}');
+        }
+        t4.advance(zalgo.as_bytes());
+        let snap = t4.cell_at(0, 0).unwrap();
+        assert_eq!(snap.grapheme.chars().count(), 1 + MAX_COMBINING_PER_CELL);
+        t4.grid().debug_verify_extra_invariants();
+    }
+
+    #[test]
+    fn pending_wrap_decstbm_decom_il_dl_and_alt_screen() {
+        let mut term = new_term(5, 5);
+        // Pending wrap cleared by CUB 1 before printing.
+        term.advance(b"ABCDE\x1b[DZ");
+        assert_eq!(term.visible_line_text(0).unwrap(), "ABCZE");
+        assert_eq!(term.visible_line_text(1).unwrap(), "");
+        // Pending wrap cleared by CR overwrites col 0 without wrapping.
+        term.advance(b"!\rX");
+        assert_eq!(term.visible_line_text(0).unwrap(), "XBCZ!");
+        assert_eq!(term.visible_line_text(1).unwrap(), "");
+
+        // DECSTBM + DECOM clamping.
+        term.advance(b"\x1b[2;4r\x1b[?6h\x1b[1;1Hrow1\x1b[99;1Hrow3");
+        assert_eq!(term.visible_line_text(1).unwrap(), "row1");
+        assert_eq!(term.visible_line_text(3).unwrap(), "row3");
+
+        // IL/DL outside scroll margins is a no-op (cursor remains at col 1, row 0).
+        term.advance(b"\x1b[?6l\x1b[1;1H\x1b[2K\x1b[1;2Htop\x1b[1;2H\x1b[2L");
+        assert_eq!(term.visible_line_text(0).unwrap(), " top");
+        assert_eq!(term.cursor_pos(), (1, 0));
+
+        // IL inside scroll margins resets col to 0.
+        term.advance(b"\x1b[2;3H\x1b[1L");
+        assert_eq!(term.cursor_pos(), (0, 1));
+        assert_eq!(term.visible_line_text(1).unwrap(), "");
+        assert_eq!(term.visible_line_text(2).unwrap(), "row1");
+
+        // Independent per-screen DECSC/DECRC with ?1049.
+        term.advance(b"\x1b[1;2H\x1b7\x1b[?1049h\x1b[3;2Halt\x1b7");
+        assert!(term.is_alt_screen());
+        assert_eq!(term.visible_line_text(2).unwrap(), " alt");
+        // Redundant ?1049h must not clobber primary saved cursor.
+        term.advance(b"\x1b[?1049h\x1b[?1049l");
+        assert!(!term.is_alt_screen());
+        assert_eq!(term.cursor_pos(), (1, 0));
+    }
+
+    #[test]
+    fn sgr_colon_semicolon_and_underline_colors() {
+        let mut term = new_term(20, 2);
+        term.advance(b"\x1b[1;3;21;38:2::10:20:30;48;5;196;58:5:42;53mX\x1b[0mY");
+        let x = term.cell_at(0, 0).unwrap();
+        assert_eq!(x.ch, 'X');
+        assert!(
+            x.flags
+                .contains(CellFlags::BOLD | CellFlags::ITALIC | CellFlags::OVERLINE)
+        );
+        assert_eq!(x.underline_style, UnderlineStyle::Double);
+        assert_eq!(x.fg, PackedColor::rgb(10, 20, 30));
+        assert_eq!(x.bg, PackedColor::indexed(196));
+        assert_eq!(x.underline_color, Some(PackedColor::indexed(42)));
+
+        let y = term.cell_at(1, 0).unwrap();
+        assert_eq!(y.fg, PackedColor::Default);
+        assert_eq!(y.bg, PackedColor::Default);
+        assert_eq!(y.underline_style, UnderlineStyle::None);
+        assert_eq!(y.underline_color, None);
+    }
+
+    #[test]
+    fn dec_2026_synchronized_output_and_watchdog() {
+        let mut term = new_term(20, 3);
+        term.advance_with_time(b"frame0", 1.0);
+        assert_eq!(term.render_snapshot_line_text(0).unwrap(), "frame0");
+
+        // Enter BSU at t = 2.0, write partial frame1.
+        term.advance_with_time(b"\x1b[?2026h\rframe1", 2.0);
+        assert!(term.is_synchronized_output());
+        assert_eq!(term.visible_line_text(0).unwrap(), "frame1");
+        assert_eq!(term.render_snapshot_line_text(0).unwrap(), "frame0");
+
+        // DECRQM ? 2026 -> 1 (set).
+        term.advance_with_time(b"\x1b[?2026$p", 2.1);
+        assert_eq!(term.drain_outgoing(), b"\x1b[?2026;1$y");
+
+        // Still latched at +200ms.
+        term.advance_with_time(b"", 2.20);
+        assert!(term.is_synchronized_output());
+        assert_eq!(term.render_snapshot_line_text(0).unwrap(), "frame0");
+
+        // Watchdog expires at +250ms.
+        term.advance_with_time(b"", 2.26);
+        assert!(!term.is_synchronized_output());
+        assert_eq!(term.render_snapshot_line_text(0).unwrap(), "frame1");
+
+        // Explicit ESU release.
+        term.advance_with_time(b"\x1b[?2026h\rframe2", 3.0);
+        assert_eq!(term.render_snapshot_line_text(0).unwrap(), "frame1");
+        term.advance_with_time(b"\x1b[?2026l", 3.05);
+        assert!(!term.is_synchronized_output());
+        assert_eq!(term.render_snapshot_line_text(0).unwrap(), "frame2");
+    }
+
+    #[test]
+    fn osc_title_cwd_palette_and_52_security() {
+        let mut term = new_term(20, 3);
+        term.advance(b"\x1b]0;my;title\x07");
+        term.advance(b"\x1b]7;file://localhost/tmp/hello%20world\x1b\\");
+        term.advance(b"\x1b]4;1;rgb:ff/00/80;1;?\x07");
+        term.advance(b"\x1b]10;?\x1b\\");
+        // OSC 52 read blocked by default; write works.
+        term.advance(b"\x1b]52;c;?\x07\x1b]52;c;SGVsbG8=\x07");
+
+        assert_eq!(term.title(), "my;title");
+        assert_eq!(term.icon_name(), "my;title");
+        assert_eq!(term.cwd(), Some("/tmp/hello world"));
+
+        let out = String::from_utf8(term.drain_outgoing()).unwrap();
+        assert!(out.contains("\x1b]4;1;rgb:ffff/0000/8080\x07"));
+        assert!(out.contains("\x1b]10;rgb:"));
+
+        let events = term.drain_events();
+        assert!(events.contains(&TerminalEvent::TitleChanged("my;title".to_owned())));
+        assert!(events.contains(&TerminalEvent::CwdChanged("/tmp/hello world".to_owned())));
+        assert!(events.contains(&TerminalEvent::ClipboardWrite("Hello".to_owned())));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ClipboardReadRequested { .. }))
+        );
+
+        // Reset palette 104 / 110.
+        term.advance(b"\x1b]104\x07\x1b]110\x07");
+        assert_eq!(term.palette().ansi[1], ColorScheme::dark().ansi[1]);
+    }
+
+    #[test]
+    fn selection_stream_word_line_block_and_scrollback() {
+        let mut term = new_term(10, 5);
+        term.advance("hello world\r\nfoo中bar\r\n12345".as_bytes());
+        // Row 0: "hello worl" (soft_wrapped), Row 1: "d", Row 2: "foo中bar", Row 3: "12345".
+
+        // Word selection across soft-wrap ("world").
+        term.selection_word(0, 7);
+        assert_eq!(term.selection_text(), Some("world".to_owned()));
+
+        // Line selection joins soft-wrapped physical lines without '\n'.
+        term.selection_line(0, 2);
+        assert_eq!(term.selection_text(), Some("hello world".to_owned()));
+
+        // Wide-char normalization on Stream selection hitting WIDE_SPACER of '中' (row 2 col 4).
+        term.selection_start(2, 4, SelectionMode::Stream);
+        term.selection_update(2, 5);
+        term.selection_finish();
+        assert_eq!(term.selection_text(), Some("中b".to_owned()));
+
+        // Block selection.
+        term.selection_block(2, 0);
+        term.selection_update(3, 2);
+        term.selection_finish();
+        assert_eq!(term.selection_text(), Some("foo\n123".to_owned()));
+    }
+
+    #[test]
+    fn mouse_encodings_queries_tabs_rep_and_dec_special_graphics() {
+        let mut term = new_term(20, 4);
+        // SGR mouse encoding (?1002 + ?1006).
+        term.advance(b"\x1b[?1002h\x1b[?1006h");
+        let press = term
+            .encode_mouse_event(MouseInputEvent {
+                kind: MouseEventKind::Press,
+                button: Some(MouseButton::Left),
+                col: 4,
+                row: 9,
+                modifiers: MouseModifiers {
+                    shift: false,
+                    alt: false,
+                    ctrl: true,
+                },
+            })
+            .unwrap();
+        assert_eq!(press, b"\x1b[<16;5;10M");
+
+        let release = term
+            .encode_mouse_event(MouseInputEvent {
+                kind: MouseEventKind::Release,
+                button: Some(MouseButton::Left),
+                col: 4,
+                row: 9,
+                modifiers: MouseModifiers::default(),
+            })
+            .unwrap();
+        assert_eq!(release, b"\x1b[<0;5;10m");
+
+        // DEC Special Graphics + REP + Queries.
+        term.advance(b"\x1b(0lqk\x1b(B\r\n");
+        assert_eq!(term.visible_line_text(0).unwrap(), "┌─┐");
+
+        term.advance(b"a\x1b[3b\n\x1b[2b");
+        assert_eq!(term.visible_line_text(1).unwrap(), "aaaa");
+
+        term.advance(b"\x1b[c\x1b[>c\x1b[5n\x1b[6n\x1b[?6n\x1b[4$p");
+        let replies = String::from_utf8(term.drain_outgoing()).unwrap();
+        assert!(replies.contains("\x1b[?62;"));
+        assert!(replies.contains("\x1b[>0;100;0c"));
+        assert!(replies.contains("\x1b[0n"));
+        assert!(replies.contains("\x1b[4;2$y"));
+
+        // Bracketed paste sanitization.
+        term.advance(b"\x1b[?2004h");
+        assert_eq!(
+            term.format_paste("hi\x1b[201~evil"),
+            b"\x1b[200~hievil\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn scrollback_lookup_display_offset_pinning_and_ed3() {
+        let mut term = new_term(10, 3);
+        for i in 0..8 {
+            term.advance(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(term.scrollback_len() >= 5);
+        assert_eq!(term.scrollback_line_text(0), Some("line0".to_owned()));
+
+        term.scroll_display(3);
+        let pinned_top = term.visible_line_text(0);
+        // New output while scrolled up keeps viewport pinned to the same scrollback line.
+        term.advance(b"extra\r\n");
+        assert_eq!(term.visible_line_text(0), pinned_top);
+
+        // ED 3 clears scrollback only.
+        term.advance(b"\x1b[3J");
+        assert_eq!(term.scrollback_len(), 0);
+        assert_eq!(term.display_offset(), 0);
+    }
+
+    #[test]
+    fn dch_clears_wrap_spacer_invariants() {
+        let mut term = new_term(5, 3);
+        term.advance("abcd\u{4E2D}\x1b[1;1H\x1b[1P".as_bytes());
+        term.grid().debug_verify_wide_invariants();
+        term.grid().debug_verify_extra_invariants();
+        assert_eq!(term.visible_line_text(0), Some("bcd".to_owned()));
+        assert_eq!(term.visible_line_text(1), Some("中".to_owned()));
+    }
+
+    #[test]
+    fn reflow_trailing_space_cursor_preservation_and_randomized_seeds() {
+        // Repro: "abc " across 80 -> 3 -> 80 + "d" must yield "abc d", not "abd".
+        let mut term = new_term(80, 24);
+        term.advance(b"abc ");
+        term.resize(3, 24);
+        assert_eq!(term.cursor_pos(), (1, 1));
+        term.resize(80, 24);
+        assert_eq!(term.cursor_pos(), (4, 0));
+        term.advance(b"d");
+        assert_eq!(term.visible_line_text(0), Some("abc d".to_owned()));
+
+        // Through cols = 1 as well.
+        let mut t1 = new_term(80, 24);
+        t1.advance(b"abc ");
+        t1.resize(1, 24);
+        t1.resize(80, 24);
+        t1.advance(b"d");
+        assert_eq!(t1.visible_line_text(0), Some("abc d".to_owned()));
+
+        // Blank line with trailing spaces across 80 -> 3 -> 80.
+        let mut t_blank = new_term(80, 24);
+        t_blank.advance(b"    ");
+        t_blank.resize(3, 24);
+        t_blank.resize(80, 24);
+        t_blank.advance(b"d");
+        assert_eq!(t_blank.visible_line_text(0), Some("    d".to_owned()));
+
+        // Pending wrap with trailing spaces ("abc   " at 3 cols -> 80 cols).
+        let mut t_pw = new_term(3, 24);
+        t_pw.advance(b"abc   ");
+        assert!(t_pw.cursor().pending_wrap);
+        t_pw.resize(80, 24);
+        assert_eq!(t_pw.cursor_pos(), (6, 0));
+        assert!(!t_pw.cursor().pending_wrap);
+        t_pw.advance(b"d");
+        assert_eq!(t_pw.visible_line_text(0), Some("abc   d".to_owned()));
+
+        // Randomized multi-step reflow seeds (1..=32) preserving cursor_pos & full_text.
+        for seed in 1_u64..=32 {
+            let mut rng = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let mut next_u32 = || {
+                rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (rng >> 32) as u32
+            };
+            let mut t = Terminal::new(
+                80,
+                24,
+                CoreConfig {
+                    scrollback_limit: 500,
+                    ..CoreConfig::default()
+                },
+            );
+            let line_count = 3 + (next_u32() % 6);
+            for line_i in 0..line_count {
+                let len = 1 + (next_u32() % 25);
+                let mut line = String::new();
+                for _ in 0..len {
+                    match next_u32() % 8 {
+                        0 => line.push(' '),
+                        1 => line.push('中'),
+                        _ => {
+                            let ch = char::from(b'a' + u8::try_from(next_u32() % 26).unwrap_or(0));
+                            line.push(ch);
+                        }
+                    }
+                }
+                t.advance(line.as_bytes());
+                if line_i + 1 < line_count {
+                    t.advance(b"\r\n");
+                }
+            }
+            let expected_text = t.full_text();
+            let expected_cursor = t.cursor_pos();
+            for _ in 0..8 {
+                let w = u16::try_from(1 + (next_u32() % 80)).unwrap_or(10);
+                let h = u16::try_from(4 + (next_u32() % 24)).unwrap_or(10);
+                t.resize(w, h);
+                t.grid().debug_verify_wide_invariants();
+                t.grid().debug_verify_extra_invariants();
+            }
+            t.resize(80, 24);
+            assert_eq!(t.full_text(), expected_text, "seed={seed}: full_text");
+            assert_eq!(t.cursor_pos(), expected_cursor, "seed={seed}: cursor_pos");
+        }
+    }
+
+    #[test]
+    fn vs16_wide_promotion_on_1_row_terminal_and_below_scroll_bottom() {
+        let mut t2 = new_term(2, 1);
+        t2.advance("a\u{2764}\u{FE0F}".as_bytes());
+        t2.grid().debug_verify_wide_invariants();
+        t2.grid().debug_verify_extra_invariants();
+        assert_eq!(t2.visible_line_text(0), Some("\u{2764}\u{FE0F}".to_owned()));
+        assert_eq!(t2.full_text(), "a\u{2764}\u{FE0F}");
+        assert_eq!(t2.cursor_pos(), (1, 0));
+        assert!(t2.cursor().pending_wrap);
+
+        let mut t5 = new_term(5, 1);
+        t5.advance("abcd\u{2764}\u{FE0F}".as_bytes());
+        t5.grid().debug_verify_wide_invariants();
+        t5.grid().debug_verify_extra_invariants();
+        assert_eq!(t5.visible_line_text(0), Some("\u{2764}\u{FE0F}".to_owned()));
+        assert_eq!(t5.full_text(), "abcd\u{2764}\u{FE0F}");
+        assert_eq!(t5.cursor_pos(), (2, 0));
+
+        let mut t_zero_sb = Terminal::new(
+            2,
+            1,
+            CoreConfig {
+                scrollback_limit: 0,
+                ..CoreConfig::default()
+            },
+        );
+        t_zero_sb.advance("a\u{2764}\u{FE0F}".as_bytes());
+        t_zero_sb.grid().debug_verify_wide_invariants();
+        t_zero_sb.grid().debug_verify_extra_invariants();
+        assert_eq!(
+            t_zero_sb.visible_line_text(0),
+            Some("\u{2764}\u{FE0F}".to_owned())
+        );
+
+        // Below scroll_bottom on the bottom-most row cannot scroll or wrap down: do not store
+        // a 2-col grapheme inside a 1-col cell.
+        let mut t_below = new_term(5, 4);
+        t_below.advance("\x1b[1;2r\x1b[4;1Habcd\u{2764}\u{FE0F}".as_bytes());
+        t_below.grid().debug_verify_wide_invariants();
+        t_below.grid().debug_verify_extra_invariants();
+        let snap = t_below.cell_at(4, 3).unwrap();
+        assert_eq!(snap.width, 1);
+        assert_eq!(snap.grapheme, "\u{2764}");
+    }
+
+    #[test]
+    fn sgr_truncated_semicolon_color_does_not_leak_flags() {
+        let mut term = new_term(20, 2);
+        term.advance(b"\x1b[38;2;10;20mA\x1b[0m");
+        term.advance(b"\x1b[38;5mB\x1b[0m");
+        term.advance(b"\x1b[48;5mC\x1b[0m");
+        term.advance(b"\x1b[58;2;1mD\x1b[0m");
+        term.advance(b"\x1b[38;9;1mE\x1b[0m");
+        term.advance(b"\x1b[38;2;10;20;30;1mF");
+
+        for col in 0..5 {
+            let c = term.cell_at(col, 0).unwrap();
+            assert_eq!(c.flags, CellFlags::empty(), "col={col} leaked flags");
+            assert_eq!(c.fg, PackedColor::Default, "col={col} leaked fg");
+            assert_eq!(c.bg, PackedColor::Default, "col={col} leaked bg");
+            assert_eq!(c.underline_color, None, "col={col} leaked underline_color");
+        }
+
+        let valid = term.cell_at(5, 0).unwrap();
+        assert_eq!(valid.ch, 'F');
+        assert_eq!(valid.fg, PackedColor::rgb(10, 20, 30));
+        assert!(valid.flags.contains(CellFlags::BOLD));
+    }
+
+    #[test]
+    fn selection_word_and_line_backwards_drag_and_wide_spacer_extra() {
+        let mut term = new_term(20, 4);
+        term.advance(b"hello world foo");
+        term.selection_start(0, 8, SelectionMode::Word);
+        assert_eq!(term.selection_text(), Some("world".to_owned()));
+        term.selection_update(0, 2);
+        assert_eq!(term.selection_text(), Some("hello world".to_owned()));
+        term.selection_update(0, 13);
+        assert_eq!(term.selection_text(), Some("world foo".to_owned()));
+        term.selection_update(0, 7);
+        assert_eq!(term.selection_text(), Some("world".to_owned()));
+
+        // Wrapped logical line backwards drag.
+        let mut t_line = new_term(5, 4);
+        t_line.advance(b"top\r\n12345678");
+        t_line.selection_start(1, 1, SelectionMode::Line);
+        assert_eq!(t_line.selection_text(), Some("12345678".to_owned()));
+        t_line.selection_update(0, 0);
+        assert_eq!(t_line.selection_text(), Some("top\n12345678".to_owned()));
+        t_line.selection_update(2, 1);
+        assert_eq!(t_line.selection_text(), Some("12345678".to_owned()));
+
+        // Word selection hitting WIDE_SPACER whose WIDE_LEAD has CellExtra combining marks.
+        let mut t_wide = new_term(20, 2);
+        t_wide.advance("a \u{2764}\u{FE0F}b".as_bytes());
+        t_wide.selection_word(0, 3);
+        assert_eq!(
+            t_wide.selection_text(),
+            Some("\u{2764}\u{FE0F}b".to_owned())
+        );
+
+        // Word selection backwards drag preserved across resize reflow.
+        let mut t_reflow = new_term(20, 4);
+        t_reflow.advance(b"alpha beta");
+        t_reflow.selection_start(0, 7, SelectionMode::Word);
+        t_reflow.resize(6, 4);
+        t_reflow.selection_update(0, 1);
+        assert_eq!(t_reflow.selection_text(), Some("alpha beta".to_owned()));
+    }
+
+    #[test]
+    fn enter_alt_screen_duplicate_is_idempotent() {
+        let mut term = new_term(20, 5);
+        term.advance(b"PRI\x1b[?1049h\x1b[2;4rALT_DATA\x1b[?1049h");
+        assert!(term.is_alt_screen());
+        assert_eq!(term.visible_line_text(0), Some("ALT_DATA".to_owned()));
+        assert_eq!(term.scroll_top, 1);
+        assert_eq!(term.scroll_bottom, 3);
+        term.advance(b"\x1b[?1049l");
+        assert!(!term.is_alt_screen());
+        assert_eq!(term.visible_line_text(0), Some("PRI".to_owned()));
+
+        let mut t1047 = new_term(20, 4);
+        t1047.advance(b"\x1b[?1047hALT1047\x1b[?1047h");
+        assert_eq!(t1047.visible_line_text(0), Some("ALT1047".to_owned()));
+
+        let mut t47 = new_term(20, 4);
+        t47.advance(b"\x1b[?47hALT47\x1b[?47h");
+        assert_eq!(t47.visible_line_text(0), Some("ALT47".to_owned()));
+    }
+
+    #[test]
+    fn dec_2026_watchdog_nan_and_advance_before_time() {
+        // NaN must not wipe prior finite last_time_secs.
+        let mut t1 = new_term(20, 2);
+        t1.advance_with_time(b"a", 1.0);
+        t1.advance_with_time(b"\x1b[?2026h\rb", f64::NAN);
+        assert!(t1.is_synchronized_output());
+        assert_eq!(t1.render_snapshot_line_text(0), Some("a".to_owned()));
+        t1.advance_with_time(b"", 1.3);
+        assert!(!t1.is_synchronized_output());
+        assert_eq!(t1.render_snapshot_line_text(0), Some("b".to_owned()));
+
+        // NaN with no prior clock still arms on first subsequent finite tick.
+        let mut t2 = new_term(20, 2);
+        t2.advance_with_time(b"\x1b[?2026hb", f64::NAN);
+        assert!(t2.is_synchronized_output());
+        t2.advance_with_time(b"", 10.0);
+        assert!(t2.is_synchronized_output());
+        t2.advance_with_time(b"", 10.26);
+        assert!(!t2.is_synchronized_output());
+
+        // BSU delivered via advance() arms on first advance_with_time() / check_sync_timeout().
+        let mut t3 = new_term(20, 2);
+        t3.advance(b"old\x1b[?2026h\rnew");
+        assert!(t3.is_synchronized_output());
+        assert_eq!(t3.render_snapshot_line_text(0), Some("old".to_owned()));
+        t3.advance_with_time(b"", 100.0);
+        assert!(t3.is_synchronized_output());
+        t3.advance_with_time(b"", 100.25);
+        assert!(!t3.is_synchronized_output());
+        assert_eq!(t3.render_snapshot_line_text(0), Some("new".to_owned()));
+    }
+
+    #[test]
+    fn selection_eviction_bounds_and_scroll_clamping() {
+        let mut term = Terminal::new(
+            10,
+            2,
+            CoreConfig {
+                scrollback_limit: 1,
+                ..CoreConfig::default()
+            },
+        );
+        term.advance(b"l0\r\nl1\r\nl2");
+        // History has "l0", viewport has "l1", "l2". Select from oldest (row 0 in history) to l2.
+        term.scroll_display(1);
+        term.selection_start(0, 0, SelectionMode::Stream);
+        term.scroll_to_bottom();
+        term.selection_update(1, 1);
+        term.selection_finish();
+        assert_eq!(term.selection_text(), Some("l0\nl1\nl2".to_owned()));
+
+        // Scroll 1 line -> l0 is evicted; anchor clamps to oldest retained line (l1).
+        term.advance(b"\r\nl3");
+        assert_eq!(term.selection_text(), Some("l1\nl2".to_owned()));
+
+        // Direct extract_text on fully evicted Selection returns None.
+        let stale_sel = Selection::new(
+            SelectionMode::Stream,
+            GridPoint::new(AbsLine(0), 0),
+            GridPoint::new(AbsLine(0), 1),
+        );
+        assert_eq!(selection::extract_text(term.grid(), &stale_sel), None);
+
+        // Scroll 4 more lines -> entire selection evicted and cleared.
+        term.advance(b"\r\nl4\r\nl5\r\nl6\r\nl7");
+        assert_eq!(term.selection_text(), None);
+        assert!(term.selection().is_none());
+    }
+
+    #[test]
+    fn c1_vt500_eight_bit_execute_and_sequences() {
+        let cfg = CoreConfig {
+            c1_policy: C1Policy::Vt500EightBit,
+            ..CoreConfig::default()
+        };
+
+        // 0x84 (IND): move down one line at same column, clearing pending_wrap.
+        let mut t_ind = Terminal::new(10, 4, cfg.clone());
+        t_ind.advance(b"\x9B1;4HA\x84B");
+        assert_eq!(t_ind.cell_at(3, 0).unwrap().ch, 'A');
+        assert_eq!(t_ind.cell_at(4, 1).unwrap().ch, 'B');
+        // IND from pending_wrap at right margin moves to next row at last col (matching ESC D).
+        let mut t_ind_pw = Terminal::new(5, 3, cfg.clone());
+        t_ind_pw.advance(b"12345\x84X");
+        assert_eq!(t_ind_pw.visible_line_text(0), Some("12345".to_owned()));
+        assert_eq!(t_ind_pw.cell_at(4, 1).unwrap().ch, 'X');
+
+        // 0x85 (NEL): move to col 0 on next line, clearing pending_wrap.
+        let mut t_nel = Terminal::new(10, 4, cfg.clone());
+        t_nel.advance(b"\x9B1;5HA\x85B");
+        assert_eq!(t_nel.cell_at(4, 0).unwrap().ch, 'A');
+        assert_eq!(t_nel.cell_at(0, 1).unwrap().ch, 'B');
+        let mut t_nel_pw = Terminal::new(5, 3, cfg.clone());
+        t_nel_pw.advance(b"12345\x85X");
+        assert_eq!(t_nel_pw.visible_line_text(0), Some("12345".to_owned()));
+        assert_eq!(t_nel_pw.visible_line_text(1), Some("X".to_owned()));
+
+        // 0x88 (HTS): set horizontal tab stop at current column.
+        let mut t_hts = Terminal::new(10, 4, cfg.clone());
+        t_hts.advance(b"\x9B3g\x9B1;4H\x88\x9B1;1H\tZ");
+        assert_eq!(t_hts.cell_at(3, 0).unwrap().ch, 'Z');
+
+        // 0x8D (RI): move up one line at same column (scroll down at scroll_top), clearing pending_wrap.
+        let mut t_ri = Terminal::new(10, 4, cfg.clone());
+        t_ri.advance(b"\x9B2;4HA\x8DB");
+        assert_eq!(t_ri.cell_at(3, 1).unwrap().ch, 'A');
+        assert_eq!(t_ri.cell_at(4, 0).unwrap().ch, 'B');
+        t_ri.advance(b"\x9B1;2H\x8DC");
+        assert_eq!(t_ri.cell_at(1, 0).unwrap().ch, 'C');
+        assert_eq!(t_ri.cell_at(4, 1).unwrap().ch, 'B');
+
+        // 0x9B (CSI) & 0x9D/0x9C (OSC/ST).
+        let mut t_seq = Terminal::new(10, 4, cfg);
+        t_seq.advance(b"\x9D2;c1title\x9C\x9B2;3Hhi");
+        assert_eq!(t_seq.title(), "c1title");
+        assert_eq!(t_seq.visible_line_text(1), Some("  hi".to_owned()));
+    }
+
+    #[test]
+    fn block_selection_partial_eviction_preserves_columns() {
+        // 1. Scrollback eviction via Terminal::advance.
+        let mut term = Terminal::new(
+            20,
+            4,
+            CoreConfig {
+                scrollback_limit: 5,
+                ..CoreConfig::default()
+            },
+        );
+        for i in 0..9 {
+            term.advance(format!("0123456789_{i:04}\r\n").as_bytes());
+        }
+        term.scroll_display(5);
+        term.selection_block(0, 5);
+        term.selection_update(2, 8);
+        term.selection_finish();
+        assert_eq!(term.selection_text(), Some("5678\n5678\n5678".to_owned()));
+
+        // Scroll 1 line -> top selected line is evicted; columns 5..=8 must stay intact.
+        term.advance(b"0123456789_0009\r\n");
+        assert_eq!(term.selection_text(), Some("5678\n5678".to_owned()));
+
+        // Scroll until entire block selection is evicted -> selection cleared.
+        for i in 10..18 {
+            term.advance(format!("0123456789_{i:04}\r\n").as_bytes());
+        }
+        assert_eq!(term.selection_text(), None);
+        assert!(term.selection().is_none());
+
+        // 2. Partial eviction via vertical resize shrink (same width fast-path).
+        let mut t_same_w = Terminal::new(
+            20,
+            6,
+            CoreConfig {
+                scrollback_limit: 2,
+                ..CoreConfig::default()
+            },
+        );
+        for i in 0..6 {
+            t_same_w.advance(format!("0123456789_{i}").as_bytes());
+            if i < 5 {
+                t_same_w.advance(b"\r\n");
+            }
+        }
+        t_same_w.selection_block(0, 5);
+        t_same_w.selection_update(3, 8);
+        t_same_w.selection_finish();
+        assert_eq!(
+            t_same_w.selection_text(),
+            Some("5678\n5678\n5678\n5678".to_owned())
+        );
+        t_same_w.resize(20, 3);
+        assert_eq!(
+            t_same_w.selection_text(),
+            Some("5678\n5678\n5678".to_owned())
+        );
+
+        // 3. Partial eviction via full reflow resize (different width + vertical eviction).
+        let mut t_diff_w = Terminal::new(
+            20,
+            6,
+            CoreConfig {
+                scrollback_limit: 2,
+                ..CoreConfig::default()
+            },
+        );
+        for i in 0..6 {
+            t_diff_w.advance(format!("0123456789_{i}").as_bytes());
+            if i < 5 {
+                t_diff_w.advance(b"\r\n");
+            }
+        }
+        t_diff_w.selection_block(0, 5);
+        t_diff_w.selection_update(3, 8);
+        t_diff_w.selection_finish();
+        t_diff_w.resize(15, 3);
+        assert_eq!(
+            t_diff_w.selection_text(),
+            Some("5678\n5678\n5678".to_owned())
+        );
+    }
+
+    #[test]
+    fn reflow_selection_trailing_whitespace_and_past_eol() {
+        // Repro probe6: hard break after trailing blank start ("ab\r\nxyz", Stream (0,5)..(1,2)).
+        let mut t6 = new_term(80, 24);
+        t6.advance(b"ab\r\nxyz");
+        t6.selection_start(0, 5, SelectionMode::Stream);
+        t6.selection_update(1, 2);
+        t6.selection_finish();
+        assert_eq!(t6.selection_text(), Some("\nxyz".to_owned()));
+        t6.resize(2, 24);
+        assert_eq!(t6.selection_text(), Some("\nxyz".to_owned()));
+        assert!(!t6.is_cell_selected(0, 1));
+        assert!(t6.is_cell_selected(1, 0));
+        t6.resize(1, 24);
+        assert_eq!(t6.selection_text(), Some("\nxyz".to_owned()));
+        t6.resize(80, 24);
+        assert_eq!(t6.selection_text(), Some("\nxyz".to_owned()));
+
+        // Repro probe7: trailing blank selection on same line as Cursor ("abc       ").
+        let mut t7 = new_term(80, 24);
+        t7.advance(b"abc       ");
+        t7.selection_start(0, 7, SelectionMode::Stream);
+        t7.selection_update(0, 9);
+        t7.selection_finish();
+        assert_eq!(t7.selection_text(), Some(String::new()));
+        t7.resize(3, 24);
+        assert_eq!(t7.selection_text(), Some(String::new()));
+        t7.resize(1, 24);
+        assert_eq!(t7.selection_text(), Some(String::new()));
+        t7.resize(80, 24);
+        assert_eq!(t7.selection_text(), Some(String::new()));
+
+        // Repro probe8: Block selection with past-EOL right column across shrink/expand.
+        let mut t8 = new_term(20, 5);
+        t8.advance(b"0123456789\r\nxy");
+        t8.selection_block(0, 5);
+        t8.selection_update(1, 15);
+        t8.selection_finish();
+        assert_eq!(t8.selection_text(), Some("56789\n".to_owned()));
+        t8.resize(2, 10);
+        // Same-width vertical resize while col=15 is virtual (>2) must also preserve col=15.
+        t8.resize(2, 12);
+        t8.resize(20, 5);
+        assert_eq!(t8.selection_text(), Some("56789\n".to_owned()));
+
+        // Alternate screen resize must not clobber Block columns or panic on past-EOL cols.
+        let mut t_alt = new_term(20, 5);
+        t_alt.advance(b"\x1b[?1049h0123456789\r\nxy");
+        t_alt.selection_block(0, 12);
+        t_alt.selection_update(1, 15);
+        t_alt.selection_finish();
+        assert_eq!(t_alt.selection_text(), Some("\n".to_owned()));
+        t_alt.resize(2, 5);
+        assert!(!t_alt.is_cell_selected(0, 1));
+        assert_eq!(t_alt.selection_text(), Some("\n".to_owned()));
+        t_alt.resize(20, 5);
+        assert_eq!(t_alt.selection_text(), Some("\n".to_owned()));
+
+        // Randomized multi-step resize seeds (1..=80) verifying Stream & Block selection_text().
+        for seed in 1_u64..=80 {
+            let mut rng = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(17);
+            let mut next_u32 = || {
+                rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (rng >> 32) as u32
+            };
+            let mut t = Terminal::new(
+                80,
+                24,
+                CoreConfig {
+                    scrollback_limit: 500,
+                    ..CoreConfig::default()
+                },
+            );
+            let line_count = 3 + (next_u32() % 5);
+            for line_i in 0..line_count {
+                let len = 1 + (next_u32() % 20);
+                let mut line = String::new();
+                for _ in 0..len {
+                    match next_u32() % 7 {
+                        0 => line.push(' '),
+                        1 => line.push('中'),
+                        2 => line.push_str("\u{2764}\u{FE0F}"),
+                        _ => {
+                            let ch = char::from(b'a' + u8::try_from(next_u32() % 26).unwrap_or(0));
+                            line.push(ch);
+                        }
+                    }
+                }
+                t.advance(line.as_bytes());
+                if line_i + 1 < line_count {
+                    t.advance(b"\r\n");
+                }
+            }
+            let r1 = usize::try_from(next_u32() % line_count).unwrap_or(0);
+            let r2 = usize::try_from(next_u32() % line_count).unwrap_or(0);
+            let c1 = usize::try_from(next_u32() % 35).unwrap_or(0);
+            let c2 = usize::try_from(next_u32() % 35).unwrap_or(0);
+            let is_block = seed % 2 == 0;
+            if is_block {
+                t.selection_block(r1, c1);
+            } else {
+                t.selection_start(r1, c1, SelectionMode::Stream);
+            }
+            t.selection_update(r2, c2);
+            t.selection_finish();
+
+            let expected_sel = t.selection_text();
+            let expected_text = t.full_text();
+            let expected_cursor = t.cursor_pos();
+
+            for _ in 0..8 {
+                let w = u16::try_from(1 + (next_u32() % 80)).unwrap_or(10);
+                let h = u16::try_from(4 + (next_u32() % 24)).unwrap_or(10);
+                t.resize(w, h);
+                t.grid().debug_verify_wide_invariants();
+                t.grid().debug_verify_extra_invariants();
+                // Ensure inspection & extraction never panic at any intermediate size.
+                let _ = t.selection_text();
+                let _ = t.is_cell_selected(0, 0);
+            }
+            t.resize(80, 24);
+            assert_eq!(t.full_text(), expected_text, "seed={seed}: full_text");
+            assert_eq!(t.cursor_pos(), expected_cursor, "seed={seed}: cursor_pos");
+            assert_eq!(
+                t.selection_text(),
+                expected_sel,
+                "seed={seed}: selection_text (is_block={is_block})"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_rows_below_keep_until_row_selection_reflow() {
+        // probe11a_1: blank-row Stream selection must not jump onto occupied row 0 on full reflow.
+        let mut t1 = new_term(80, 24);
+        t1.advance(b"hello");
+        t1.selection_start(1, 1, SelectionMode::Stream);
+        t1.selection_update(2, 4);
+        t1.selection_finish();
+        assert_eq!(t1.selection_text(), Some("\n".to_owned()));
+        t1.resize(40, 24);
+        assert_eq!(t1.selection_text(), Some("\n".to_owned()));
+        assert!(!t1.is_cell_selected(0, 1));
+        assert!(t1.is_cell_selected(1, 1));
+        assert!(t1.is_cell_selected(2, 4));
+        // Content wraps to 2 rows (3 cols) -> blank selection shifts below wrapped content, then roundtrips.
+        t1.resize(3, 24);
+        assert_eq!(t1.selection_text(), Some("\n".to_owned()));
+        assert!(!t1.is_cell_selected(0, 1));
+        assert!(!t1.is_cell_selected(1, 0));
+        t1.resize(80, 24);
+        assert_eq!(t1.selection_text(), Some("\n".to_owned()));
+
+        // Shrinking height so blank rows crop down to 1 blank row keeps selection on blank row 1.
+        let mut t1_crop = new_term(80, 24);
+        t1_crop.advance(b"hello");
+        t1_crop.selection_start(1, 1, SelectionMode::Stream);
+        t1_crop.selection_update(2, 4);
+        t1_crop.selection_finish();
+        t1_crop.resize(80, 2);
+        assert_eq!(t1_crop.selection_text(), Some(String::new()));
+        assert!(!t1_crop.is_cell_selected(0, 1));
+        // Shrinking to 1 row leaves zero blank rows -> cropped blank selection clears instead of fabricating "ello".
+        t1_crop.resize(80, 1);
+        assert_eq!(t1_crop.selection_text(), None);
+        assert!(!t1_crop.is_cell_selected(0, 1));
+
+        // probe11a_2: same-width vertical resize must preserve multi-line selection ending on blank row.
+        let mut t2 = new_term(80, 24);
+        t2.advance(b"hello");
+        t2.selection_start(0, 2, SelectionMode::Stream);
+        t2.selection_update(2, 4);
+        t2.selection_finish();
+        assert_eq!(t2.selection_text(), Some("llo\n\n".to_owned()));
+        t2.resize(80, 20);
+        assert_eq!(t2.selection_text(), Some("llo\n\n".to_owned()));
+        assert!(t2.is_cell_selected(0, 2));
+        assert!(t2.is_cell_selected(2, 4));
+        // Roundtrip through narrower width (3 cols) preserves trailing blank-row count.
+        t2.resize(3, 20);
+        assert_eq!(t2.selection_text(), Some("llo\n\n".to_owned()));
+        t2.resize(80, 24);
+        assert_eq!(t2.selection_text(), Some("llo\n\n".to_owned()));
+
+        // Anchor on row 0 + head on blank row 2, shrunk to 1 row -> keeps full remainder of row 0.
+        let mut t2_crop = new_term(80, 24);
+        t2_crop.advance(b"hello world");
+        t2_crop.selection_start(0, 2, SelectionMode::Stream);
+        t2_crop.selection_update(2, 4);
+        t2_crop.selection_finish();
+        t2_crop.resize(80, 1);
+        assert_eq!(t2_crop.selection_text(), Some("llo world".to_owned()));
+
+        // probe11a_3: blank-row Block selection must not jump onto occupied row 0 on full reflow.
+        let mut t3 = new_term(80, 24);
+        t3.advance(b"hello");
+        t3.selection_block(1, 1);
+        t3.selection_update(2, 4);
+        t3.selection_finish();
+        assert_eq!(t3.selection_text(), Some("\n".to_owned()));
+        t3.resize(40, 24);
+        assert_eq!(t3.selection_text(), Some("\n".to_owned()));
+        assert!(!t3.is_cell_selected(0, 1));
+        assert!(t3.is_cell_selected(1, 1));
+        assert!(t3.is_cell_selected(2, 4));
+        // Shrinking to 1 row (zero blank rows) clears cropped-off blank Block selection.
+        t3.resize(40, 1);
+        assert_eq!(t3.selection_text(), None);
+        assert!(!t3.is_cell_selected(0, 1));
+    }
+
+    #[test]
+    fn evicted_word_and_line_origin_drag_preserves_bounds() {
+        // probe10b: Word drag across scrollback eviction boundary then back onto (oldest_abs_line, 0).
+        let mut term = Terminal::new(
+            20,
+            4,
+            CoreConfig {
+                scrollback_limit: 2,
+                ..CoreConfig::default()
+            },
+        );
+        for i in 0..5 {
+            term.advance(format!("alpha_{i:02} beta_{i:02}\r\n").as_bytes());
+        }
+        term.selection_start(0, 1, SelectionMode::Word);
+        term.selection_update(2, 10);
+        term.advance(b"alpha_05 beta_05\r\nalpha_06 beta_06\r\nalpha_07 beta_07\r\n");
+        assert_eq!(term.grid().oldest_abs_line(), AbsLine(3));
+        term.scroll_display(2);
+        term.selection_update(0, 0);
+        assert_eq!(term.selection_text(), Some("alpha_03".to_owned()));
+        term.selection_update(0, 10);
+        assert_eq!(term.selection_text(), Some("alpha_03 beta_03".to_owned()));
+        // Resizing after origin_evicted must preserve origin_evicted behavior.
+        term.resize(25, 4);
+        term.selection_update(0, 0);
+        assert_eq!(term.selection_text(), Some("alpha_03".to_owned()));
+
+        // Word drag across resize-induced eviction (6 -> 3 rows with scrollback_limit=1).
+        let mut t_resize = Terminal::new(
+            20,
+            6,
+            CoreConfig {
+                scrollback_limit: 1,
+                ..CoreConfig::default()
+            },
+        );
+        for i in 0..6 {
+            t_resize.advance(format!("word_{i:02} tail_{i:02}").as_bytes());
+            if i < 5 {
+                t_resize.advance(b"\r\n");
+            }
+        }
+        t_resize.selection_start(0, 1, SelectionMode::Word);
+        t_resize.selection_update(4, 10);
+        t_resize.resize(20, 3);
+        assert_eq!(t_resize.grid().oldest_abs_line(), AbsLine(2));
+        t_resize.scroll_display(1);
+        t_resize.selection_update(0, 0);
+        assert_eq!(t_resize.selection_text(), Some("word_02".to_owned()));
+
+        // Line drag across eviction when oldest surviving line is soft-wrapped across 2 physical rows.
+        let mut t_line = Terminal::new(
+            10,
+            4,
+            CoreConfig {
+                scrollback_limit: 2,
+                ..CoreConfig::default()
+            },
+        );
+        t_line.advance(b"l0\r\nl1\r\nl2\r\nwraps_here_row3\r\nl4");
+        // Lines 0..=5: l0(0), l1(1), l2(2), wraps_here(3), _row3(4), l4(5); oldest=0, history=2.
+        t_line.scroll_display(2);
+        t_line.selection_start(2, 0, SelectionMode::Line);
+        t_line.scroll_to_bottom();
+        t_line.selection_update(3, 0);
+        // Advance 3 lines -> oldest becomes 3 ("wraps_here" + "_row3"), origin line 2 is evicted.
+        t_line.advance(b"\r\nl5\r\nl6\r\nl7");
+        assert_eq!(t_line.grid().oldest_abs_line(), AbsLine(3));
+        t_line.scroll_display(2);
+        t_line.selection_update(0, 0);
+        assert_eq!(t_line.selection_text(), Some("wraps_here_row3".to_owned()));
+    }
+
+    #[test]
+    fn scrolled_up_selection_consistency_across_resize() {
+        for mode in [
+            SelectionMode::Stream,
+            SelectionMode::Word,
+            SelectionMode::Line,
+            SelectionMode::Block,
+        ] {
+            let mut term = Terminal::new(
+                20,
+                4,
+                CoreConfig {
+                    scrollback_limit: 20,
+                    ..CoreConfig::default()
+                },
+            );
+            for i in 0..10 {
+                term.advance(format!("row_{i:02} payload_{i:02}").as_bytes());
+                if i < 9 {
+                    term.advance(b"\r\n");
+                }
+            }
+            term.scroll_display(4);
+            let initial_offset = term.display_offset();
+            assert!(initial_offset > 0);
+
+            match mode {
+                SelectionMode::Block => term.selection_block(0, 2),
+                _ => term.selection_start(0, 2, mode),
+            }
+            term.selection_update(2, 11);
+            term.selection_finish();
+            let expected_text = term.selection_text();
+            assert!(expected_text.is_some());
+
+            // Shrink width -> reflows scrollback & viewport while preserving display_offset > 0 and selection.
+            term.resize(10, 4);
+            assert!(term.display_offset() > 0);
+            if mode != SelectionMode::Block {
+                assert_eq!(
+                    term.selection_text(),
+                    expected_text,
+                    "mode={mode:?} at 10x4"
+                );
+            }
+            let snap = term.active_snapshot();
+            for r in 0..4 {
+                for c in 0..10 {
+                    assert_eq!(
+                        term.is_cell_selected(r, c),
+                        snap.is_cell_selected(r, c),
+                        "mode={mode:?} r={r} c={c}"
+                    );
+                }
+            }
+
+            // Expand back to 20x4 -> exact selection text & scrolled-up highlight consistency.
+            term.resize(20, 4);
+            assert_eq!(term.display_offset(), initial_offset);
+            assert_eq!(
+                term.selection_text(),
+                expected_text,
+                "mode={mode:?} back at 20x4"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_row_crop_with_empty_cursor_row_and_empty_terminal() {
+        // probe14b & Probe2a: "hello\r\n" leaves empty cursor row 1; Stream on blank rows 2..=3 clears.
+        for (w, h) in [(80, 2), (40, 2)] {
+            let mut t = new_term(80, 24);
+            t.advance(b"hello\r\n");
+            t.selection_start(2, 1, SelectionMode::Stream);
+            t.selection_update(3, 4);
+            t.selection_finish();
+            t.resize(w, h);
+            assert_eq!(t.selection_text(), None, "Stream {w}x{h}");
+            assert!(!t.is_cell_selected(1, 2), "Stream {w}x{h} row 1 col 2");
+            t.advance(b"world");
+            assert_eq!(t.selection_text(), None, "Stream {w}x{h} after world");
+        }
+
+        // probe14c: "hello\r\n" Block on blank rows 2..=3 clears on vertical crop.
+        for (w, h) in [(80, 2), (40, 2)] {
+            let mut t = new_term(80, 24);
+            t.advance(b"hello\r\n");
+            t.selection_block(2, 1);
+            t.selection_update(3, 4);
+            t.selection_finish();
+            t.resize(w, h);
+            assert_eq!(t.selection_text(), None, "Block {w}x{h}");
+            assert!(!t.is_cell_selected(1, 2), "Block {w}x{h} row 1 col 2");
+            t.advance(b"world");
+            assert_eq!(t.selection_text(), None, "Block {w}x{h} after world");
+        }
+
+        // probe14d: "hello\r\n" crossing Stream (0,2)..=(2,4) & backwards (2,4)..=(0,2) keeps full row 1.
+        for reverse in [false, true] {
+            for (w, h) in [(80, 2), (40, 2)] {
+                let mut t = new_term(80, 24);
+                t.advance(b"hello\r\n");
+                if reverse {
+                    t.selection_start(2, 4, SelectionMode::Stream);
+                    t.selection_update(0, 2);
+                } else {
+                    t.selection_start(0, 2, SelectionMode::Stream);
+                    t.selection_update(2, 4);
+                }
+                t.selection_finish();
+                t.resize(w, h);
+                assert!(
+                    t.is_cell_selected(1, 10),
+                    "crossing reverse={reverse} {w}x{h}: row 1 col 10 must be selected"
+                );
+                assert_eq!(t.selection_text(), Some("llo\n".to_owned()));
+            }
+        }
+
+        // Probe2b: completely empty terminal 80x4 -> 80x1 / 40x1 clears blank-row Stream & Block.
+        for is_block in [false, true] {
+            for (w, h) in [(80, 1), (40, 1)] {
+                let mut t = new_term(80, 4);
+                if is_block {
+                    t.selection_block(1, 1);
+                } else {
+                    t.selection_start(1, 1, SelectionMode::Stream);
+                }
+                t.selection_update(2, 4);
+                t.selection_finish();
+                t.resize(w, h);
+                assert_eq!(
+                    t.selection_text(),
+                    None,
+                    "empty is_block={is_block} {w}x{h}"
+                );
+                assert!(!t.is_cell_selected(0, 2));
+            }
+        }
+    }
+
+    #[test]
+    fn cropped_blank_origin_word_and_wrapped_line_drag() {
+        // probe18a: Word started on blank row (2, 4), dragged UP to (0, 1), shrunk to 80x1, then updated.
+        let mut t = new_term(80, 24);
+        t.advance(b"hello world");
+        t.selection_start(2, 4, SelectionMode::Word);
+        t.selection_update(0, 1);
+        assert_eq!(t.selection_text(), Some("hello world\n\n".to_owned()));
+        t.resize(80, 1);
+        assert_eq!(t.selection_text(), Some("hello world".to_owned()));
+        t.selection_update(0, 1);
+        assert_eq!(t.selection_text(), Some("hello world".to_owned()));
+        t.selection_update(0, 7);
+        assert_eq!(t.selection_text(), Some("world".to_owned()));
+        // Subsequent vertical growth keeps origin_cropped_bottom & virtual boundary intact.
+        t.resize(80, 5);
+        t.selection_update(0, 1);
+        assert_eq!(t.selection_text(), Some("hello world".to_owned()));
+        t.selection_update(2, 3);
+        assert_eq!(t.selection_text(), Some("\n".to_owned()));
+
+        // Reviewer 2 Probe1a: "hello_w" across 80x1, 40x1, and wrapped 5x2.
+        let mut t1a = new_term(80, 24);
+        t1a.advance(b"hello_w");
+        t1a.selection_start(2, 3, SelectionMode::Word);
+        t1a.selection_update(0, 1);
+        assert_eq!(t1a.selection_text(), Some("hello_w\n\n".to_owned()));
+        t1a.resize(80, 1);
+        assert_eq!(t1a.selection_text(), Some("hello_w".to_owned()));
+        t1a.selection_update(0, 1);
+        assert_eq!(t1a.selection_text(), Some("hello_w".to_owned()));
+        t1a.selection_update(0, 5);
+        assert_eq!(t1a.selection_text(), Some("hello_w".to_owned()));
+        t1a.resize(5, 2);
+        t1a.selection_update(1, 0);
+        assert_eq!(t1a.selection_text(), Some("hello_w".to_owned()));
+
+        // Reviewer 2 Probe1b: "ab cd" -> update(0, 3) selects "cd", never expanding to "ab cd".
+        let mut t1b = new_term(80, 24);
+        t1b.advance(b"ab cd");
+        t1b.selection_start(2, 0, SelectionMode::Word);
+        t1b.selection_update(0, 1);
+        assert_eq!(t1b.selection_text(), Some("ab cd\n\n".to_owned()));
+        t1b.resize(80, 1);
+        assert_eq!(t1b.selection_text(), Some("ab cd".to_owned()));
+        t1b.selection_update(0, 3);
+        assert_eq!(t1b.selection_text(), Some("cd".to_owned()));
+
+        // Soft-wrapped Line selection started on blank row -> dragged onto wrapped line -> cropped -> updated.
+        let mut t_line = new_term(10, 24);
+        t_line.advance(b"hello_world_long");
+        t_line.selection_start(3, 2, SelectionMode::Line);
+        t_line.selection_update(1, 2);
+        assert_eq!(
+            t_line.selection_text(),
+            Some("hello_world_long\n\n".to_owned())
+        );
+        t_line.resize(10, 2);
+        assert_eq!(t_line.selection_text(), Some("hello_world_long".to_owned()));
+        t_line.selection_update(1, 2);
+        assert_eq!(t_line.selection_text(), Some("hello_world_long".to_owned()));
+        t_line.selection_update(0, 2);
+        assert_eq!(t_line.selection_text(), Some("hello_world_long".to_owned()));
+        // Grow taller and drag below last_kept -> does not falsely include wrapped line above origin.
+        t_line.resize(10, 5);
+        t_line.selection_update(1, 2);
+        assert_eq!(t_line.selection_text(), Some("hello_world_long".to_owned()));
+        t_line.selection_update(3, 2);
+        assert!(!t_line.is_cell_selected(1, 0));
+        assert!(t_line.is_cell_selected(2, 0));
+        assert!(t_line.is_cell_selected(3, 0));
+    }
+
+    #[test]
+    fn alt_screen_vertical_crop_selection_eviction_and_block() {
+        // probe18b: alt-screen top crop must clear destroyed top selection instead of hijacking L3.
+        let mut t_top = new_term(20, 5);
+        t_top.advance(b"\x1b[?1049hL0\r\nL1\r\nL2\r\nL3\r\nL4");
+        t_top.selection_start(0, 0, SelectionMode::Stream);
+        t_top.selection_update(0, 1);
+        t_top.selection_finish();
+        assert_eq!(t_top.selection_text(), Some("L0".to_owned()));
+        t_top.resize(20, 2);
+        assert_eq!(t_top.selection_text(), None);
+        assert!(t_top.selection().is_none());
+
+        // Partial top crop in Stream mode clamps top endpoint to (0, 0).
+        let mut t_partial = new_term(20, 5);
+        t_partial.advance(b"\x1b[?1049hL0\r\nL1\r\nL2\r\nL3\r\nL4");
+        t_partial.selection_start(1, 1, SelectionMode::Stream);
+        t_partial.selection_update(3, 1);
+        t_partial.selection_finish();
+        t_partial.resize(20, 2);
+        assert_eq!(t_partial.selection_text(), Some("L3".to_owned()));
+
+        // Partial top crop in Block mode preserves anchor column.
+        let mut t_block = new_term(20, 5);
+        t_block.advance(b"\x1b[?1049hL0\r\nL1\r\nL2\r\nL3\r\nL4");
+        t_block.selection_block(1, 1);
+        t_block.selection_update(4, 1);
+        t_block.selection_finish();
+        t_block.resize(20, 2);
+        assert_eq!(t_block.selection_text(), Some("3\n4".to_owned()));
+
+        // Alt-screen bottom blank-row crop clears blank selection & preserves crossing tail selection.
+        for is_block in [false, true] {
+            let mut t_bot = new_term(20, 5);
+            t_bot.advance(b"\x1b[?1049hL0\r\nL1");
+            if is_block {
+                t_bot.selection_block(2, 1);
+            } else {
+                t_bot.selection_start(2, 1, SelectionMode::Stream);
+            }
+            t_bot.selection_update(3, 4);
+            t_bot.selection_finish();
+            t_bot.resize(20, 2);
+            assert_eq!(t_bot.selection_text(), None);
+            assert!(!t_bot.is_cell_selected(1, 2));
+        }
+
+        let mut t_cross = new_term(20, 5);
+        t_cross.advance(b"\x1b[?1049hL0\r\nL1");
+        t_cross.selection_start(0, 1, SelectionMode::Stream);
+        t_cross.selection_update(3, 4);
+        t_cross.selection_finish();
+        t_cross.resize(20, 2);
+        assert!(t_cross.is_cell_selected(1, 10));
+        assert_eq!(t_cross.selection_text(), Some("0\nL1".to_owned()));
+
+        // Alt-screen Word started on cropped blank row -> drag UP -> crop -> selection_update.
+        let mut t_alt_word = new_term(20, 5);
+        t_alt_word.advance(b"\x1b[?1049haa bb");
+        t_alt_word.selection_start(3, 4, SelectionMode::Word);
+        t_alt_word.selection_update(0, 1);
+        t_alt_word.resize(20, 2);
+        t_alt_word.selection_update(0, 1);
+        assert_eq!(t_alt_word.selection_text(), Some("aa bb\n".to_owned()));
+        t_alt_word.selection_update(0, 3);
+        assert_eq!(t_alt_word.selection_text(), Some("bb\n".to_owned()));
+
+        // Alt-screen Word top eviction sets origin_evicted and preserves (0, 0) drag anchor.
+        let mut t_alt_evict = new_term(20, 5);
+        t_alt_evict.advance(b"\x1b[?1049haa bb\r\ncc dd\r\nee ff\r\ngg hh\r\nii jj");
+        t_alt_evict.selection_start(0, 0, SelectionMode::Word);
+        t_alt_evict.selection_update(4, 1);
+        t_alt_evict.resize(20, 2);
+        t_alt_evict.selection_update(0, 1);
+        assert_eq!(t_alt_evict.selection_text(), Some("gg".to_owned()));
+        t_alt_evict.selection_update(1, 4);
+        assert_eq!(
+            t_alt_evict.selection_text(),
+            Some("gg hh\nii jj".to_owned())
+        );
+    }
+
+    #[test]
+    fn cropped_blank_forward_drag_and_re_shrink_probes() {
+        // probe19: Line cropped blank drag onto wrapped text -> shrink -> grow -> forward drag.
+        let mut t19 = new_term(10, 6);
+        t19.advance(b"0123456789abcd");
+        t19.selection_start(2, 4, SelectionMode::Line);
+        t19.selection_update(0, 1);
+        t19.resize(10, 2);
+        assert_eq!(t19.selection_text(), Some("0123456789abcd".to_owned()));
+        t19.selection_update(1, 0);
+        assert_eq!(t19.selection_text(), Some("0123456789abcd".to_owned()));
+        t19.selection_update(0, 1);
+        assert_eq!(t19.selection_text(), Some("0123456789abcd".to_owned()));
+        t19.resize(10, 6);
+        t19.selection_update(3, 2);
+        assert!(!t19.is_cell_selected(0, 0));
+        assert!(!t19.is_cell_selected(1, 0));
+        assert_eq!(t19.selection_text(), Some("\n".to_owned()));
+        t19.advance(b"\r\nnextline");
+        t19.selection_update(2, 2);
+        assert_eq!(t19.selection_text(), Some("nextline".to_owned()));
+
+        // probe20: Word cropped blank -> shrink -> grow -> "\r\nalpha beta" -> forward drag.
+        let mut t20 = new_term(80, 24);
+        t20.advance(b"hello world");
+        t20.selection_start(2, 4, SelectionMode::Word);
+        t20.selection_update(0, 1);
+        t20.resize(80, 1);
+        t20.resize(80, 5);
+        t20.advance(b"\r\nalpha beta");
+        t20.selection_update(1, 1);
+        assert!(!t20.is_cell_selected(0, 0));
+        assert_eq!(t20.selection_text(), Some("alpha".to_owned()));
+        // Dragging back up onto row 0 restores cropped-bottom origin behavior.
+        t20.selection_update(0, 1);
+        assert_eq!(t20.selection_text(), Some("hello world".to_owned()));
+
+        // probe21: Alt-screen Line cropped blank -> shrink -> grow -> forward drag.
+        let mut t21 = new_term(20, 5);
+        t21.advance(b"\x1b[?1049hL0\r\nL1");
+        t21.selection_start(3, 4, SelectionMode::Line);
+        t21.selection_update(0, 1);
+        t21.resize(20, 2);
+        assert_eq!(t21.selection_text(), Some("L0\nL1".to_owned()));
+        t21.resize(20, 5);
+        t21.selection_update(3, 4);
+        assert!(!t21.is_cell_selected(1, 0));
+        assert_eq!(t21.selection_text(), Some("\n".to_owned()));
+
+        // probe24: Word cropped blank -> shrink -> grow -> forward drag -> re-shrink clears to None.
+        let mut t24 = new_term(80, 24);
+        t24.advance(b"hello world");
+        t24.selection_start(2, 4, SelectionMode::Word);
+        t24.selection_update(0, 1);
+        t24.resize(80, 1);
+        t24.resize(80, 5);
+        t24.selection_update(2, 3);
+        assert!(!t24.is_cell_selected(0, 0));
+        assert_eq!(t24.selection_text(), Some("\n".to_owned()));
+        t24.resize(80, 1);
+        assert_eq!(t24.selection_text(), None);
+        assert!(t24.selection().is_none());
+
+        // Reviewer 2: Line crop -> grow -> drag-down -> re-crop clears without false row 0 highlight.
+        let mut t_r2 = new_term(20, 5);
+        t_r2.advance(b"hello");
+        t_r2.selection_start(2, 0, SelectionMode::Line);
+        t_r2.selection_update(0, 0);
+        t_r2.resize(20, 1);
+        t_r2.resize(20, 5);
+        t_r2.selection_update(2, 0);
+        assert!(!t_r2.is_cell_selected(0, 0));
+        assert_eq!(t_r2.selection_text(), Some("\n".to_owned()));
+        t_r2.resize(20, 1);
+        assert!(!t_r2.is_cell_selected(0, 0));
+        assert_eq!(t_r2.selection_text(), None);
+        assert!(t_r2.selection().is_none());
+
+        // Direct Selection::row_col_range check when start.line == end.line and start_past_eol == true.
+        let mut past_eol_line = Selection::new(
+            SelectionMode::Line,
+            GridPoint::new(AbsLine(0), 20),
+            GridPoint::new(AbsLine(0), 20),
+        );
+        past_eol_line.anchor_past_eol = true;
+        past_eol_line.head_past_eol = true;
+        assert_eq!(
+            past_eol_line.row_col_range(AbsLine(0), t_r2.grid().visible_row(0).unwrap()),
+            None
+        );
+        assert_eq!(selection::extract_text(t_r2.grid(), &past_eol_line), None);
+    }
+
+    #[test]
+    fn widen_and_narrow_wrap_after_bottom_crop_matrix() {
+        // Primary Line widen matrix: 80x24->80x1->120x5 / 200x3, and 80x24->40x1->80x24.
+        for (mid_w, end_w, end_h) in [(80, 120, 5), (80, 200, 3), (40, 80, 24)] {
+            let mut t = new_term(80, 24);
+            t.advance(b"hello_world");
+            t.selection_start(2, 4, SelectionMode::Line);
+            t.selection_update(0, 1);
+            t.resize(mid_w, 1);
+            t.resize(end_w, end_h);
+            t.selection_update(2, 3);
+            assert!(!t.is_cell_selected(0, 0), "{mid_w}->{end_w}x{end_h}");
+            assert_eq!(t.selection_text(), Some("\n".to_owned()));
+        }
+
+        // Primary Word widen: 80x24 -> 80x1 -> 200x3 (drag down AND drag to (0, 90)).
+        let mut tw_down = new_term(80, 24);
+        tw_down.advance(b"hello world");
+        tw_down.selection_start(2, 4, SelectionMode::Word);
+        tw_down.selection_update(0, 1);
+        tw_down.resize(80, 1);
+        tw_down.resize(200, 3);
+        tw_down.selection_update(2, 3);
+        assert!(!tw_down.is_cell_selected(0, 100));
+        assert_eq!(tw_down.selection_text(), Some("\n".to_owned()));
+
+        let mut tw_row0 = new_term(80, 24);
+        tw_row0.advance(b"hello world");
+        tw_row0.selection_start(2, 4, SelectionMode::Word);
+        tw_row0.selection_update(0, 1);
+        tw_row0.resize(80, 1);
+        tw_row0.resize(200, 3);
+        tw_row0.selection_update(0, 90);
+        assert!(tw_row0.is_cell_selected(0, 150));
+        assert!(!tw_row0.is_cell_selected(0, 89));
+
+        // Primary Stream crossing tail widened: 80x24 -> 80x2 -> 200x2 (probe14d widened).
+        let mut ts = new_term(80, 24);
+        ts.advance(b"hello\r\n");
+        ts.selection_start(0, 2, SelectionMode::Stream);
+        ts.selection_update(2, 4);
+        ts.selection_finish();
+        ts.resize(80, 2);
+        ts.resize(200, 2);
+        assert!(ts.is_cell_selected(1, 150));
+        assert_eq!(ts.selection_text(), Some("llo\n".to_owned()));
+
+        // Alt-screen Line & Word widen after bottom crop.
+        let mut ta_line = new_term(80, 5);
+        ta_line.advance(b"\x1b[?1049hL0\r\nL1");
+        ta_line.selection_start(3, 4, SelectionMode::Line);
+        ta_line.selection_update(0, 1);
+        ta_line.resize(80, 2);
+        ta_line.resize(120, 5);
+        ta_line.selection_update(3, 2);
+        assert!(!ta_line.is_cell_selected(1, 0));
+        assert_eq!(ta_line.selection_text(), Some("\n".to_owned()));
+
+        let mut ta_word = new_term(20, 5);
+        ta_word.advance(b"\x1b[?1049haa bb");
+        ta_word.selection_start(3, 4, SelectionMode::Word);
+        ta_word.selection_update(0, 1);
+        ta_word.resize(20, 2);
+        ta_word.resize(50, 4);
+        ta_word.selection_update(3, 1);
+        assert!(!ta_word.is_cell_selected(1, 30));
+        ta_word.selection_update(1, 30);
+        assert!(ta_word.is_cell_selected(1, 45));
+        assert!(!ta_word.is_cell_selected(1, 29));
+
+        // Reviewer 1: Narrow with content wrap (50 * 'a') across 80x24 -> 80x1 -> 45x2 -> 45x5.
+        let payload_50a = "a".repeat(50);
+        let mut t50_line = new_term(80, 24);
+        t50_line.advance(payload_50a.as_bytes());
+        t50_line.selection_start(2, 4, SelectionMode::Line);
+        t50_line.selection_update(0, 1);
+        t50_line.resize(80, 1);
+        t50_line.resize(45, 2);
+        assert_eq!(t50_line.selection_text(), Some(payload_50a.clone()));
+        t50_line.resize(45, 5);
+        t50_line.selection_update(3, 0);
+        assert!(!t50_line.is_cell_selected(0, 0));
+        assert!(!t50_line.is_cell_selected(1, 0));
+        assert_eq!(t50_line.selection_text(), Some("\n".to_owned()));
+
+        let mut t50_stream = new_term(80, 24);
+        t50_stream.advance(payload_50a.as_bytes());
+        t50_stream.selection_start(0, 2, SelectionMode::Stream);
+        t50_stream.selection_update(2, 4);
+        t50_stream.resize(80, 1);
+        t50_stream.resize(45, 2);
+        assert!(t50_stream.is_cell_selected(1, 44));
+        assert_eq!(t50_stream.selection_text(), Some("a".repeat(48)));
+
+        // Reviewer 1: Narrow with cursor wrap ("hello\x1b[1;51H") across 80x24 -> 80x1 -> 45x2 -> 45x5.
+        let mut t_cur = new_term(80, 24);
+        t_cur.advance(b"hello\x1b[1;51H");
+        t_cur.selection_start(2, 4, SelectionMode::Line);
+        t_cur.selection_update(0, 1);
+        t_cur.resize(80, 1);
+        t_cur.resize(45, 2);
+        t_cur.resize(45, 5);
+        t_cur.selection_update(3, 0);
+        assert!(!t_cur.is_cell_selected(0, 0));
+        assert!(!t_cur.is_cell_selected(1, 0));
+        assert_eq!(t_cur.selection_text(), Some("\n".to_owned()));
+        t_cur.selection_update(0, 1);
+        assert!(t_cur.is_cell_selected(0, 0));
+        assert!(t_cur.is_cell_selected(1, 44));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_bounds_term() {
+        use serde::Deserialize as _;
+        use serde::de::{
+            Deserializer, Error as _, IntoDeserializer, Visitor,
+            value::{Error as DeError, MapDeserializer},
+        };
+
+        const fn assert_serde<T: serde::Serialize + for<'de> serde::Deserialize<'de>>() {}
+        assert_serde::<CoreConfig>();
+        assert_serde::<TerminalEvent>();
+        assert_serde::<ClipboardSelection>();
+        assert_serde::<CursorShape>();
+        assert_serde::<CursorStyle>();
+        assert_serde::<Modes>();
+        assert_serde::<MouseProtocol>();
+        assert_serde::<MouseEncoding>();
+        assert_serde::<Selection>();
+        assert_serde::<CellSnapshot>();
+
+        #[derive(Clone, Copy)]
+        enum LegacyVal {
+            Str(&'static str),
+            Bool(bool),
+            U64(u64),
+            Point(u64, usize),
+        }
+
+        impl<'de> Deserializer<'de> for LegacyVal {
+            type Error = DeError;
+
+            fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+                match self {
+                    Self::Str(s) => visitor.visit_str(s),
+                    Self::Bool(b) => visitor.visit_bool(b),
+                    Self::U64(n) => visitor.visit_u64(n),
+                    Self::Point(line, col) => {
+                        let map = MapDeserializer::new(
+                            [("line", Self::U64(line)), ("col", Self::U64(col as u64))].into_iter(),
+                        );
+                        visitor.visit_map(map)
+                    }
+                }
+            }
+
+            fn deserialize_newtype_struct<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                visitor.visit_newtype_struct(self)
+            }
+
+            fn deserialize_enum<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                _variants: &'static [&'static str],
+                visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                match self {
+                    Self::Str(s) => visitor.visit_enum(s.into_deserializer()),
+                    _ => Err(DeError::custom("expected enum variant string")),
+                }
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct seq tuple
+                tuple_struct map struct identifier ignored_any
+            }
+        }
+
+        impl<'de> IntoDeserializer<'de, DeError> for LegacyVal {
+            type Deserializer = Self;
+            fn into_deserializer(self) -> Self::Deserializer {
+                self
+            }
+        }
+
+        // Legacy payload omitting `origin_evicted`, `origin_cropped_bottom`, and `*_past_eol` fields.
+        let legacy_de = MapDeserializer::<_, DeError>::new(
+            [
+                ("mode", LegacyVal::Str("Line")),
+                ("anchor", LegacyVal::Point(1, 0)),
+                ("head", LegacyVal::Point(2, 19)),
+                ("finished", LegacyVal::Bool(false)),
+                ("origin_start", LegacyVal::Point(1, 0)),
+                ("origin_end", LegacyVal::Point(1, 19)),
+            ]
+            .into_iter(),
+        );
+        let legacy_sel = Selection::deserialize(legacy_de).expect("legacy selection deserializes");
+        assert_eq!(legacy_sel.mode, SelectionMode::Line);
+        assert_eq!(legacy_sel.anchor, GridPoint::new(AbsLine(1), 0));
+        assert_eq!(legacy_sel.head, GridPoint::new(AbsLine(2), 19));
+        assert!(!legacy_sel.origin_evicted);
+        assert!(!legacy_sel.origin_cropped_bottom);
+        assert!(!legacy_sel.anchor_past_eol);
+        assert!(!legacy_sel.head_past_eol);
+        assert!(!legacy_sel.origin_start_past_eol);
+        assert!(!legacy_sel.origin_end_past_eol);
+
+        // Full payload with `origin_cropped_bottom` and `*_past_eol` flags preserves all flags.
+        let full_de = MapDeserializer::<_, DeError>::new(
+            [
+                ("mode", LegacyVal::Str("Word")),
+                ("anchor", LegacyVal::Point(0, 80)),
+                ("head", LegacyVal::Point(0, 0)),
+                ("finished", LegacyVal::Bool(false)),
+                ("origin_start", LegacyVal::Point(0, 80)),
+                ("origin_end", LegacyVal::Point(0, 80)),
+                ("origin_evicted", LegacyVal::Bool(false)),
+                ("origin_cropped_bottom", LegacyVal::Bool(true)),
+                ("anchor_past_eol", LegacyVal::Bool(true)),
+                ("head_past_eol", LegacyVal::Bool(false)),
+                ("origin_start_past_eol", LegacyVal::Bool(true)),
+                ("origin_end_past_eol", LegacyVal::Bool(true)),
+            ]
+            .into_iter(),
+        );
+        let full_sel = Selection::deserialize(full_de).expect("full selection deserializes");
+        assert!(full_sel.origin_cropped_bottom);
+        assert!(full_sel.anchor_past_eol);
+        assert!(!full_sel.head_past_eol);
+        assert!(full_sel.origin_start_past_eol);
+        assert!(full_sel.origin_end_past_eol);
+    }
+
+    #[test]
+    fn has_blank_tail_crop_on_partial_shrink_and_past_cols_bottom_crop() {
+        // probe_has_blank_tail_crop_on_partial_shrink Cases A, B, C, D across 80x5 & 40x5.
+        for (new_w, new_h) in [(80, 5), (40, 5)] {
+            // Case A: cropped blank Stream (10,2)..=(12,4) clears to None.
+            let mut ta = new_term(80, 24);
+            ta.advance(b"hello");
+            ta.selection_start(10, 2, SelectionMode::Stream);
+            ta.selection_update(12, 4);
+            ta.selection_finish();
+            ta.resize(new_w, new_h);
+            assert_eq!(ta.selection_text(), None, "Case A {new_w}x{new_h}");
+            assert!(ta.selection().is_none(), "Case A sel {new_w}x{new_h}");
+            assert!(!ta.is_cell_selected(4, 3), "Case A cell {new_w}x{new_h}");
+
+            // Case B: crossing Stream (0,2)..=(10,4) preserves past_eol tail on row 4.
+            let mut tb = new_term(80, 24);
+            tb.advance(b"hello");
+            tb.selection_start(0, 2, SelectionMode::Stream);
+            tb.selection_update(10, 4);
+            tb.selection_finish();
+            tb.resize(new_w, new_h);
+            assert!(
+                tb.is_cell_selected(4, 10),
+                "Case B cell(4,10) {new_w}x{new_h}"
+            );
+            assert!(
+                tb.is_cell_selected(4, usize::from(new_w) - 1),
+                "Case B last col {new_w}x{new_h}"
+            );
+            assert_eq!(tb.selection_text(), Some("llo\n\n\n\n".to_owned()));
+
+            // Case C: cropped blank Block (10,2)..=(12,4) clears to None.
+            let mut tc = new_term(80, 24);
+            tc.advance(b"hello");
+            tc.selection_block(10, 2);
+            tc.selection_update(12, 4);
+            tc.selection_finish();
+            tc.resize(new_w, new_h);
+            assert_eq!(tc.selection_text(), None, "Case C {new_w}x{new_h}");
+            assert!(tc.selection().is_none(), "Case C sel {new_w}x{new_h}");
+            assert!(!tc.is_cell_selected(4, 3), "Case C cell {new_w}x{new_h}");
+
+            // Case D: Word & Line started on off-bottom blank row 10, dragged to (0,1),
+            // shrunk to (new_w, 5), grown back to 80x24, then forward-dragged to (10, 4).
+            for mode in [SelectionMode::Word, SelectionMode::Line] {
+                let mut td = new_term(80, 24);
+                td.advance(b"hello world");
+                td.selection_start(10, 4, mode);
+                td.selection_update(0, 1);
+                td.resize(new_w, new_h);
+                assert!(
+                    td.is_cell_selected(4, 10),
+                    "Case D {mode:?} {new_w}x{new_h}: row 4 col 10 must be selected"
+                );
+                assert!(
+                    td.is_cell_selected(4, usize::from(new_w) - 1),
+                    "Case D {mode:?} {new_w}x{new_h}: row 4 last col must be selected"
+                );
+                assert_eq!(td.selection_text(), Some("hello world\n\n\n\n".to_owned()));
+
+                td.resize(80, 24);
+                td.selection_update(10, 4);
+                assert!(
+                    !td.is_cell_selected(4, 0),
+                    "Case D {mode:?} {new_w}x{new_h}: forward drag after grow must not select row 4"
+                );
+                assert!(
+                    td.is_cell_selected(5, 0),
+                    "Case D {mode:?} {new_w}x{new_h}: forward drag starts at row 5"
+                );
+                assert_eq!(td.selection_text(), Some("\n\n\n\n\n".to_owned()));
+            }
+        }
+
+        // probe25a: 80x24 -> 80x5 / 40x5, Stream/Word/Line/Block strictly on off-bottom rows 10..=15 -> None.
+        for (new_w, new_h) in [(80, 5), (40, 5)] {
+            for mode in [
+                SelectionMode::Stream,
+                SelectionMode::Word,
+                SelectionMode::Line,
+                SelectionMode::Block,
+            ] {
+                let mut t = new_term(80, 24);
+                t.advance(b"hello");
+                t.selection_start(10, 2, mode);
+                t.selection_update(15, 8);
+                t.selection_finish();
+                t.resize(new_w, new_h);
+                assert_eq!(
+                    t.selection_text(),
+                    None,
+                    "probe25a {mode:?} {new_w}x{new_h}"
+                );
+                assert!(t.selection().is_none(), "probe25a {mode:?} {new_w}x{new_h}");
+                assert!(
+                    !t.is_cell_selected(4, 2),
+                    "probe25a {mode:?} {new_w}x{new_h}"
+                );
+            }
+        }
+
+        // probe25b: 80x24 -> 80x5 / 40x5, Word/Line (10, 5) -> (2, 1) -> row 4 last col selected.
+        for (new_w, new_h) in [(80, 5), (40, 5)] {
+            for mode in [SelectionMode::Word, SelectionMode::Line] {
+                let mut t = new_term(80, 24);
+                t.advance(b"hello");
+                t.selection_start(10, 5, mode);
+                t.selection_update(2, 1);
+                t.resize(new_w, new_h);
+                assert!(
+                    t.is_cell_selected(4, usize::from(new_w) - 1),
+                    "probe25b {mode:?} {new_w}x{new_h}: row 4 last col must be selected"
+                );
+                assert!(
+                    t.is_cell_selected(3, 0),
+                    "probe25b {mode:?} {new_w}x{new_h}: row 3 must be selected"
+                );
+                assert_eq!(t.selection_text(), Some("\n\n".to_owned()));
+            }
+        }
+
+        // probe26a: primary 80x24 -> 20x1, "hello\x1b[1;51H", Stream (0, 60)..(2, 10) -> None.
+        let mut t26a = new_term(80, 24);
+        t26a.advance(b"hello\x1b[1;51H");
+        t26a.selection_start(0, 60, SelectionMode::Stream);
+        t26a.selection_update(2, 10);
+        t26a.selection_finish();
+        t26a.resize(20, 1);
+        assert_eq!(t26a.selection_text(), None);
+        assert!(t26a.selection().is_none());
+        assert!(!t26a.is_cell_selected(0, 0));
+
+        // probe26b: alt-screen 20x5 -> 10x1, "hello", Stream (0, 15)..(3, 5) -> None
+        // and reverse Word/Line (3, 5) -> (0, 15) -> None.
+        let mut t26b = new_term(20, 5);
+        t26b.advance(b"\x1b[?1049hhello");
+        t26b.selection_start(0, 15, SelectionMode::Stream);
+        t26b.selection_update(3, 5);
+        t26b.selection_finish();
+        t26b.resize(10, 1);
+        assert_eq!(t26b.selection_text(), None);
+        assert!(t26b.selection().is_none());
+        assert!(!t26b.is_cell_selected(0, 0));
+
+        let mut t26b_rev_word = new_term(20, 5);
+        t26b_rev_word.advance(b"\x1b[?1049hhello");
+        t26b_rev_word.selection_start(3, 5, SelectionMode::Word);
+        t26b_rev_word.selection_update(0, 15);
+        t26b_rev_word.resize(10, 1);
+        assert_eq!(t26b_rev_word.selection_text(), None, "probe26b rev Word");
+        assert!(t26b_rev_word.selection().is_none(), "probe26b rev Word");
+
+        let mut t26b_rev_line = new_term(20, 5);
+        t26b_rev_line.advance(b"\x1b[?1049hhello");
+        t26b_rev_line.selection_start(3, 5, SelectionMode::Line);
+        t26b_rev_line.selection_update(0, 15);
+        t26b_rev_line.resize(10, 1);
+        // Line mode snaps `head` to column 0, so the entire row 0 remains selected.
+        assert_eq!(
+            t26b_rev_line.selection_text(),
+            Some("hello".to_owned()),
+            "probe26b rev Line"
+        );
+    }
+
+    #[test]
+    fn grid_content_epoch_scroll_invariant_vs_mutations() {
+        let mut term = new_term(20, 3);
+        for i in 0..8 {
+            term.advance(format!("line{i}\r\n").as_bytes());
+        }
+        let epoch_before_scroll = term.grid().content_epoch();
+        let dmg_before_scroll = term.grid().damage_epoch();
+
+        term.scroll_display(3);
+        assert_eq!(term.grid().content_epoch(), epoch_before_scroll);
+        assert!(term.grid().damage_epoch() > dmg_before_scroll);
+
+        term.scroll_to_bottom();
+        assert_eq!(term.grid().content_epoch(), epoch_before_scroll);
+
+        term.advance(b"edit");
+        assert!(term.grid().content_epoch() > epoch_before_scroll);
+
+        let epoch_before_resize = term.grid().content_epoch();
+        term.resize(15, 3);
+        assert!(term.grid().content_epoch() > epoch_before_resize);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_export_restore_and_defensive_sanitization() {
+        const fn assert_serde<T: serde::Serialize + for<'de> serde::Deserialize<'de>>() {}
+        assert_serde::<TerminalSnapshot>();
+        assert_serde::<CoreConfig>();
+
+        let mut term = new_term(20, 4);
+        term.advance(
+            "👨‍👩‍👧‍👦 e\u{0301} \x1b[4:3;58:2::255:0:0merr\x1b[0m \x1b]4;200;rgb:10/20/30\x07".as_bytes(),
+        );
+        let mut snap = term.export_snapshot();
+        assert_eq!(snap.cols, 20);
+        assert_eq!(snap.rows, 4);
+        assert!(snap.extended_palette.contains(&(200, [0x10, 0x20, 0x30])));
+
+        // Round-trip restores exact cells, extras, cursor, and extended palette.
+        let restored = Terminal::from_snapshot(snap.clone(), CoreConfig::default());
+        assert_eq!(restored.size(), (20, 4));
+        assert_eq!(restored.cell_at(0, 0).unwrap().grapheme, "👨‍👩‍👧‍👦");
+        assert_eq!(restored.cell_at(3, 0).unwrap().grapheme, "e\u{0301}");
+        let err = restored.cell_at(5, 0).unwrap();
+        assert_eq!(err.underline_style, UnderlineStyle::Curly);
+        assert_eq!(err.underline_color, Some(PackedColor::rgb(255, 0, 0)));
+        restored.grid().debug_verify_extra_invariants();
+        restored.grid().debug_verify_wide_invariants();
+
+        // Tampered snapshot (out-of-bounds cursor/margins, orphan WIDE_SPACER/WRAP_SPACER,
+        // dangling extra_id, excess scrollback) sanitizes cleanly without panics.
+        snap.cursor.row = 999;
+        snap.cursor.col = 999;
+        snap.scroll_top = 10;
+        snap.scroll_bottom = 2;
+        snap.modes.sync_output = true;
+        let mut bad_row = Row::new(5, 0);
+        bad_row.cells_mut()[0] = Cell::new(
+            ' ',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::WIDE_SPACER,
+        );
+        bad_row.cells_mut()[0].extra_id = 999_999;
+        bad_row.cells_mut()[4] = Cell::new(
+            '中',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::WIDE_LEAD,
+        );
+        snap.primary = GridSnapshot {
+            cols: 5,
+            viewport_rows: 2,
+            rows: vec![bad_row],
+            extras: CellExtraTable::new(),
+            display_offset: 99,
+            total_evicted: 0,
+            damage_epoch: 0,
+            content_epoch: 0,
+        };
+
+        let sanitized = Terminal::from_snapshot(
+            snap,
+            CoreConfig {
+                scrollback_limit: 2,
+                ..CoreConfig::default()
+            },
+        );
+        assert_eq!(sanitized.size(), (5, 2));
+        assert_eq!(sanitized.cursor_pos(), (4, 1));
+        assert!(!sanitized.is_synchronized_output());
+        sanitized.grid().debug_verify_extra_invariants();
+        sanitized.grid().debug_verify_wide_invariants();
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn tampered_snapshot_reconciles_alt_size_wide_flags_and_hyperlink_pool() {
+        // 1. Mismatched primary (40x20) vs alternate (2x2) with alt_screen=true and cursor=(39,19).
+        let big = new_term(40, 20);
+        let small = new_term(2, 2);
+        let mut snap = big.export_snapshot();
+        snap.alternate = small.export_snapshot().alternate;
+        snap.modes.alt_screen = true;
+        snap.cursor.row = 19;
+        snap.cursor.col = 39;
+        snap.scroll_top = 0;
+        snap.scroll_bottom = 19;
+
+        let mut restored = Terminal::from_snapshot(snap, CoreConfig::default());
+        assert_eq!(restored.size(), (40, 20));
+        assert_eq!(restored.cursor_pos(), (39, 19));
+        restored.advance(b"X\r\n\x1b[J\x1b[2J\x1b[S\x1b[L\x1b[M");
+        restored.grid().debug_verify_wide_invariants();
+
+        // 2. Mutually-exclusive WIDE_LEAD | WIDE_SPACER flags on row 0 are sanitized.
+        let mut snap2 = new_term(5, 2).export_snapshot();
+        let mut bad_row = Row::new(5, 1);
+        bad_row.cells_mut()[0] = Cell::new(
+            '中',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::WIDE_LEAD,
+        );
+        bad_row.cells_mut()[1] = Cell::new(
+            ' ',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::WIDE_LEAD | CellFlags::WIDE_SPACER,
+        );
+        bad_row.cells_mut()[2] = Cell::new(
+            ' ',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::WIDE_SPACER,
+        );
+        snap2.primary.rows[0] = bad_row;
+        let restored2 = Terminal::from_snapshot(snap2, CoreConfig::default());
+        let c1 = restored2.cell_at(1, 0).unwrap();
+        assert!(!(c1.is_wide && c1.is_wide_spacer));
+        restored2.grid().debug_verify_wide_invariants();
+
+        // 3. Tampered HyperlinkPool (OOB free_slots, wrong live_count, invalid control-char URI,
+        //    dangling hyperlink_id in CellExtra & Cursor) sanitizes cleanly without panicking on OSC 8.
+        let mut t3 = new_term(20, 4);
+        t3.advance(b"\x1b]8;;https://valid.example\x07hi\x1b]8;;\x07");
+        let mut snap3 = t3.export_snapshot();
+        snap3.hyperlink_pool.corrupt_for_test();
+        let dangling_hid = crate::cell::HyperlinkId::from_raw_for_test(9999);
+        snap3.cursor.attrs.hyperlink_id = Some(dangling_hid);
+        let mut bad_cell = Cell::new(
+            'z',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::empty(),
+        );
+        bad_cell.extra_id = snap3.primary.extras.insert(CellExtra {
+            combining: Vec::new(),
+            underline_color: None,
+            hyperlink_id: Some(dangling_hid),
+        });
+        snap3.primary.rows[0].cells_mut()[3] = bad_cell;
+
+        let mut restored3 = Terminal::from_snapshot(snap3, CoreConfig::default());
+        assert!(restored3.cursor.attrs.hyperlink_id.is_none());
+        restored3.grid().debug_verify_extra_invariants();
+        restored3.advance(b"\r\n\x1b]8;;https://new.example\x07go\x1b]8;;\x07");
+        assert_eq!(restored3.visible_line_text(1).as_deref(), Some("go"));
+        #[cfg(feature = "hyperlinks")]
+        assert_eq!(
+            restored3.hyperlink_at(0, 1).map(|h| h.uri.as_str()),
+            Some("https://new.example")
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_roundtrip_preserves_soft_wrap_wrap_spacer_and_all_features() {
+        let cfg = CoreConfig {
+            scrollback_limit: 16,
+            ..CoreConfig::default()
+        };
+        let mut orig = Terminal::new(16, 4, cfg.clone());
+        // Populate scrollback, wrapped ASCII, WRAP_SPACER wide char, wrapped implicit URL,
+        // wrapped OSC 8 + SGR 58 + ZWJ emoji, OSC 133 zones, and Kitty keyboard flags.
+        orig.advance(
+            "sb0\r\nsb1\r\nabcdefghijklmnopqrst\r\n123456789012345中\r\nsee ftp://gamma.net/file.tar.gz\r\n\x1b]8;id=l1;https://osc8.example/long\x07\x1b[4:3;58:2::10:20:30m👨\u{200d}👩\u{200d}👧\u{200d}👦click_wrapped_link\x1b[0m\x1b]8;;\x07\r\n\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi_output\r\n\x1b]133;D;0\x07\x1b[>15u"
+                .as_bytes(),
+        );
+
+        // Scroll up to select across a soft-wrapped line in scrollback.
+        orig.scroll_display(4);
+        orig.selection_start(0, 0, SelectionKind::Line);
+        orig.selection_finish();
+        assert!(orig.display_offset() > 0);
+        assert!(orig.selection_text().is_some());
+
+        // Round-trip while on primary screen.
+        let snap_pri = orig.export_snapshot();
+        let restored_pri = Terminal::from_snapshot(snap_pri, cfg.clone());
+        assert_eq!(restored_pri.full_text(), orig.full_text());
+        assert_eq!(restored_pri.display_offset(), orig.display_offset());
+        assert_eq!(restored_pri.selection_text(), orig.selection_text());
+        assert!(
+            (0..restored_pri.primary.total_len()).any(|i| {
+                let r = restored_pri.primary.row_by_buf(i).unwrap();
+                r.soft_wrapped() && r.cells().last().is_some_and(Cell::is_wrap_spacer)
+            }),
+            "WRAP_SPACER and soft_wrapped must survive snapshot round-trip"
+        );
+        #[cfg(feature = "shell-integration")]
+        {
+            use crate::features::shell_integration::ZoneKind;
+            let orig_out = orig
+                .shell_zones()
+                .iter()
+                .find(|z| z.kind == ZoneKind::Output)
+                .and_then(|z| orig.command_output_at(z.start_line));
+            let rest_out = restored_pri
+                .shell_zones()
+                .iter()
+                .find(|z| z.kind == ZoneKind::Output)
+                .and_then(|z| restored_pri.command_output_at(z.start_line));
+            assert_eq!(rest_out, orig_out);
+            assert_eq!(rest_out.as_deref(), Some("hi_output"));
+        }
+        #[cfg(feature = "kitty-keyboard")]
+        assert_eq!(
+            restored_pri.kitty_keyboard_flags(),
+            orig.kitty_keyboard_flags()
+        );
+        restored_pri.grid().debug_verify_extra_invariants();
+        restored_pri.grid().debug_verify_wide_invariants();
+        #[cfg(feature = "hyperlinks")]
+        {
+            let mut restored_pri = restored_pri;
+            let mut found_ftp = false;
+            let mut found_osc8 = false;
+            for offset in 0..=restored_pri.scrollback_len() {
+                restored_pri.scroll_to_bottom();
+                if offset > 0 {
+                    restored_pri.scroll_display(offset as i32);
+                }
+                for y in 0..4u16 {
+                    for x in 0..16u16 {
+                        if let Some(h) = restored_pri.hyperlink_at(x, y) {
+                            if h.uri == "ftp://gamma.net/file.tar.gz" {
+                                found_ftp = true;
+                            } else if h.uri == "https://osc8.example/long" {
+                                found_osc8 = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(found_ftp, "wrapped implicit ftp URL must survive restore");
+            assert!(found_osc8, "wrapped OSC 8 link must survive restore");
+            restored_pri.scroll_to_bottom();
+            restored_pri.scroll_display(orig.display_offset() as i32);
+        }
+
+        // Resizing wider after restore must unwrap lines identically to the original.
+        let mut orig_wide = Terminal::from_snapshot(orig.export_snapshot(), cfg.clone());
+        orig.resize(40, 4);
+        orig_wide.resize(40, 4);
+        assert_eq!(orig_wide.full_text(), orig.full_text());
+        assert!(orig_wide.full_text().contains("abcdefghijklmnopqrst"));
+        assert!(orig_wide.full_text().contains("123456789012345中"));
+        assert!(
+            orig_wide
+                .full_text()
+                .contains("see ftp://gamma.net/file.tar.gz")
+        );
+
+        // Round-trip while on alternate screen with alt soft-wrap, WRAP_SPACER, URL, and Kitty stack.
+        let mut orig_alt = Terminal::new(16, 4, cfg.clone());
+        orig_alt.advance(
+            "abcdefghijklmnopqrst\r\n\x1b[>15u\x1b[?1049h123456789012345中\r\nftp://alt.test/long_path\x1b[>3u"
+                .as_bytes(),
+        );
+        let restored_alt = Terminal::from_snapshot(orig_alt.export_snapshot(), cfg);
+        assert!(restored_alt.is_alt_screen());
+        assert!(restored_alt.grid().row_by_buf(0).unwrap().soft_wrapped());
+        assert!(
+            restored_alt
+                .cell_at(15, 0)
+                .unwrap()
+                .flags
+                .contains(CellFlags::WRAP_SPACER)
+        );
+        #[cfg(feature = "hyperlinks")]
+        assert_eq!(
+            restored_alt.hyperlink_at(0, 2).map(|h| h.uri.as_str()),
+            Some("ftp://alt.test/long_path")
+        );
+        #[cfg(feature = "kitty-keyboard")]
+        assert_eq!(
+            restored_alt.kitty_keyboard_flags(),
+            KittyKeyboardFlags::from_bits_truncate(3)
+        );
+        restored_alt.grid().debug_verify_extra_invariants();
+        restored_alt.grid().debug_verify_wide_invariants();
+
+        // Exiting alt screen preserves restored primary soft-wrapped lines and Kitty stack.
+        let mut exited = restored_alt;
+        exited.advance(b"\x1b[?1049l");
+        assert!(!exited.is_alt_screen());
+        assert!(exited.full_text().contains("abcdefghijklmnopqrst"));
+        #[cfg(feature = "kitty-keyboard")]
+        assert_eq!(
+            exited.kitty_keyboard_flags(),
+            KittyKeyboardFlags::from_bits_truncate(15)
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn tampered_snapshot_exhaustive_sanitization_guards() {
+        // 1. Tampered soft_wrapped row with WRAP_SPACER|WIDE_LEAD|WIDE_SPACER + extra_id at last col,
+        //    plus mismatched row widths (shorter and longer than cols) with soft_wrapped=true,
+        //    plus duplicate extra_id across two cells, plus row.generation() > damage_epoch.
+        let mut base = new_term(6, 3);
+        base.advance(b"hello");
+        let mut snap = base.export_snapshot();
+        let mut row0 = Row::new(6, 999_999);
+        row0.set_soft_wrapped(true);
+        let ext_id = snap.primary.extras.insert(CellExtra {
+            combining: vec!['\u{0301}'],
+            underline_color: None,
+            hyperlink_id: None,
+        });
+        row0.cells_mut()[0] = Cell::new(
+            'e',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::empty(),
+        );
+        row0.cells_mut()[0].extra_id = ext_id;
+        row0.cells_mut()[1] = Cell::new(
+            'a',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::empty(),
+        );
+        row0.cells_mut()[1].extra_id = ext_id; // duplicate extra_id
+        row0.cells_mut()[2] = Cell::new(
+            'x',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::from_bits_retain(0xFFFF_FFFF),
+        );
+        row0.cells_mut()[5] = Cell::new(
+            ' ',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::WIDE_LEAD | CellFlags::WIDE_SPACER | CellFlags::WRAP_SPACER,
+        );
+        row0.cells_mut()[5].extra_id = ext_id;
+
+        let mut short_row = Row::new(3, 50);
+        short_row.set_soft_wrapped(true);
+        let mut long_row = Row::new(10, 50);
+        long_row.set_soft_wrapped(true);
+
+        snap.primary.rows = vec![row0, short_row, long_row];
+        snap.primary.damage_epoch = 5;
+        snap.primary.content_epoch = 5;
+
+        let restored = Terminal::from_snapshot(snap, CoreConfig::default());
+        let r0 = restored.primary.row_by_buf(0).unwrap();
+        assert!(r0.soft_wrapped());
+        assert_eq!(r0.cells()[2].flags.bits() & !CellFlags::all().bits(), 0);
+        assert_eq!(r0.cells()[2].flags, CellFlags::SGR_MASK);
+        assert_eq!(r0.cells()[5].flags, CellFlags::WRAP_SPACER);
+        assert_eq!(r0.cells()[5].extra_id, 0);
+        assert!(!restored.primary.row_by_buf(1).unwrap().soft_wrapped());
+        assert!(!restored.primary.row_by_buf(2).unwrap().soft_wrapped());
+        for i in 0..restored.primary.total_len() {
+            let r = restored.primary.row_by_buf(i).unwrap();
+            assert!(r.generation() <= restored.primary.damage_epoch());
+        }
+        restored.grid().debug_verify_extra_invariants();
+        restored.grid().debug_verify_wide_invariants();
+
+        // 2. u64::MAX epochs / total_evicted + dirty cursor attrs flags + saved cursor flags.
+        let mut snap_max = new_term(8, 3).export_snapshot();
+        snap_max.primary.damage_epoch = u64::MAX;
+        snap_max.primary.content_epoch = u64::MAX;
+        snap_max.primary.total_evicted = u64::MAX;
+        snap_max.alternate.total_evicted = 42;
+        snap_max.cursor.attrs.flags = CellFlags::all();
+        snap_max.primary_saved_cursor = Some(SavedCursor {
+            attrs: CursorAttrs {
+                flags: CellFlags::all(),
+                ..CursorAttrs::default()
+            },
+            ..SavedCursor::default()
+        });
+        let mut restored_max = Terminal::from_snapshot(snap_max, CoreConfig::default());
+        assert_eq!(restored_max.alternate.total_evicted(), 0);
+        assert_eq!(
+            restored_max.cursor.attrs.flags & !CellFlags::SGR_MASK,
+            CellFlags::empty()
+        );
+        assert_eq!(
+            restored_max
+                .primary_saved_cursor
+                .as_ref()
+                .unwrap()
+                .attrs
+                .flags
+                & !CellFlags::SGR_MASK,
+            CellFlags::empty()
+        );
+        restored_max.advance(b"hi\r\n");
+        restored_max.resize(12, 4);
+
+        // 3. Dimension clamping: cols = 70_000 -> u16::MAX, and cols = 0 / rows = 0 -> (1, 1).
+        let mut snap_wide = new_term(4, 1).export_snapshot();
+        snap_wide.primary.cols = 70_000;
+        snap_wide.primary.viewport_rows = 1;
+        snap_wide.alternate.cols = 70_000;
+        snap_wide.alternate.viewport_rows = 1;
+        let restored_wide = Terminal::from_snapshot(snap_wide, CoreConfig::default());
+        assert_eq!(restored_wide.size(), (u16::MAX, 1));
+
+        let mut snap_zero = new_term(4, 2).export_snapshot();
+        snap_zero.primary.cols = 0;
+        snap_zero.primary.viewport_rows = 0;
+        snap_zero.alternate.cols = 0;
+        snap_zero.alternate.viewport_rows = 0;
+        let restored_zero = Terminal::from_snapshot(snap_zero, CoreConfig::default());
+        assert_eq!(restored_zero.size(), (1, 1));
+
+        // 4. Selection with valid anchor/head but OOB origin_start/origin_end must be cleared.
+        let mut t_sel = new_term(10, 4);
+        t_sel.advance(b"hello world");
+        let mut snap_sel = t_sel.export_snapshot();
+        let mut bad_sel = Selection::new(
+            SelectionMode::Word,
+            GridPoint::new(AbsLine(0), 0),
+            GridPoint::new(AbsLine(0), 4),
+        );
+        bad_sel.origin_start = GridPoint::new(AbsLine(999), 0);
+        bad_sel.origin_end = GridPoint::new(AbsLine(999), 4);
+        snap_sel.selection = Some(bad_sel);
+        let restored_sel = Terminal::from_snapshot(snap_sel, CoreConfig::default());
+        assert!(restored_sel.selection_text().is_none());
+
+        // 5. Tampered ShellIntegrationState (inverted/OOB zones and OOB ActivePhase).
+        #[cfg(feature = "shell-integration")]
+        {
+            let mut t_si = new_term(10, 4);
+            t_si.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;C\x07");
+            let mut snap_si = t_si.export_snapshot();
+            if let Some(ref mut si) = snap_si.shell_integration {
+                si.tamper_for_test();
+            }
+            let mut restored_si = Terminal::from_snapshot(snap_si, CoreConfig::default());
+            for z in restored_si.shell_zones() {
+                assert!(z.start_line <= z.end_line);
+                assert!(z.end_line < restored_si.total_lines());
+                assert!(z.start_col <= 10);
+                assert!(z.end_col <= 10);
+            }
+            restored_si.advance(b"more\r\n\x1b]133;D;0\x07");
+            restored_si.resize(5, 4);
+        }
+
+        // 6. Tampered KittyKeyboardFlags with unknown high bits (0xFF) truncated to <= 0x1F.
+        #[cfg(feature = "kitty-keyboard")]
+        {
+            let mut snap_k = new_term(10, 4).export_snapshot();
+            snap_k.kitty_primary_stack = vec![KittyKeyboardFlags::from_bits_retain(0xFF)];
+            snap_k.kitty_alt_stack = vec![KittyKeyboardFlags::from_bits_retain(0xE1)];
+            let mut restored_k = Terminal::from_snapshot(snap_k, CoreConfig::default());
+            assert_eq!(
+                restored_k.kitty_keyboard_flags(),
+                KittyKeyboardFlags::from_bits_truncate(0xFF)
+            );
+            assert!(restored_k.kitty_keyboard_flags().bits() <= 0x1F);
+            restored_k.modes.alt_screen = true;
+            assert_eq!(
+                restored_k.kitty_keyboard_flags(),
+                KittyKeyboardFlags::from_bits_truncate(0xE1)
+            );
+            assert!(restored_k.kitty_keyboard_flags().bits() <= 0x1F);
+        }
+    }
+
+    #[test]
+    fn resize_clamps_primary_and_alt_saved_cursor_for_decrc() {
+        // 1. Primary screen DECSC -> shrink -> grow -> DECRC clamps to shrunk bounds.
+        let mut t = new_term(20, 4);
+        t.advance(b"\x1b[3;6H\x1b7");
+        t.resize(10, 2);
+        t.resize(20, 6);
+        t.advance(b"\x1b8");
+        assert_eq!(t.cursor_pos(), (5, 1));
+
+        // 2. Primary screen DECSC at col 15 -> shrink cols -> grow cols -> DECRC clamps col.
+        let mut t_col = new_term(20, 4);
+        t_col.advance(b"\x1b[2;16H\x1b7");
+        t_col.resize(8, 4);
+        t_col.resize(20, 4);
+        t_col.advance(b"\x1b8");
+        assert_eq!(t_col.cursor_pos(), (7, 1));
+
+        // 3. Alt screen DECSC -> shrink -> grow -> DECRC clamps alt_saved_cursor.
+        let mut t_alt = new_term(20, 4);
+        t_alt.advance(b"\x1b[?47h\x1b[4;15H\x1b7");
+        t_alt.resize(10, 2);
+        t_alt.resize(20, 6);
+        t_alt.advance(b"\x1b8");
+        assert_eq!(t_alt.cursor_pos(), (9, 1));
+
+        // 4. Primary DECSC with pending_wrap -> widen -> shrink -> DECRC clears pending_wrap.
+        let mut t_pw = new_term(10, 4);
+        t_pw.advance(b"1234567890\x1b7\x1b[1;1H");
+        t_pw.resize(20, 4);
+        t_pw.resize(10, 4);
+        t_pw.advance(b"\x1b8");
+        assert_eq!(t_pw.cursor_pos(), (9, 0));
+        assert!(!t_pw.cursor().pending_wrap);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn resize_saved_cursor_snapshot_roundtrip_and_decrc_parity() {
+        let cfg = CoreConfig::default();
+
+        // Primary screen (Challenger Bug 2 minimal reproducer)
+        let mut live = Terminal::new(20, 4, cfg.clone());
+        live.advance(b"\x1b[3;6H\x1b7");
+        live.resize(10, 2);
+        let snap = live.export_snapshot();
+        let mut rest = Terminal::from_snapshot(snap.clone(), cfg.clone());
+        assert_eq!(rest.export_snapshot(), snap);
+        live.resize(20, 6);
+        rest.resize(20, 6);
+        live.advance(b"\x1b8");
+        rest.advance(b"\x1b8");
+        assert_eq!(live.cursor_pos(), (5, 1));
+        assert_eq!(live.cursor_pos(), rest.cursor_pos());
+
+        // Alt screen DECSC parity
+        let mut live_alt = Terminal::new(20, 4, cfg.clone());
+        live_alt.advance(b"\x1b[?47h\x1b[3;15H\x1b7");
+        live_alt.resize(10, 2);
+        let snap_alt = live_alt.export_snapshot();
+        let mut rest_alt = Terminal::from_snapshot(snap_alt.clone(), cfg.clone());
+        assert_eq!(rest_alt.export_snapshot(), snap_alt);
+        live_alt.resize(20, 6);
+        rest_alt.resize(20, 6);
+        live_alt.advance(b"\x1b8");
+        rest_alt.advance(b"\x1b8");
+        assert_eq!(live_alt.cursor_pos(), (9, 1));
+        assert_eq!(live_alt.cursor_pos(), rest_alt.cursor_pos());
+
+        // ?1049h saves primary_saved_cursor; resize on alt screen clamps both primary & alt saved cursors.
+        let mut live_1049 = Terminal::new(20, 4, cfg.clone());
+        live_1049.advance(b"\x1b[4;16H\x1b[?1049h\x1b[3;14H\x1b7");
+        live_1049.resize(8, 2);
+        let snap_1049 = live_1049.export_snapshot();
+        let mut rest_1049 = Terminal::from_snapshot(snap_1049.clone(), cfg.clone());
+        assert_eq!(rest_1049.export_snapshot(), snap_1049);
+        live_1049.resize(20, 6);
+        rest_1049.resize(20, 6);
+        live_1049.advance(b"\x1b8\x1b[?1049l");
+        rest_1049.advance(b"\x1b8\x1b[?1049l");
+        assert_eq!(live_1049.cursor_pos(), (7, 1));
+        assert_eq!(live_1049.cursor_pos(), rest_1049.cursor_pos());
+
+        // pending_wrap saved cursor widen parity
+        let mut live_pw = Terminal::new(10, 4, cfg.clone());
+        live_pw.advance(b"1234567890\x1b7\x1b[1;1H");
+        live_pw.resize(20, 4);
+        let snap_pw = live_pw.export_snapshot();
+        let mut rest_pw = Terminal::from_snapshot(snap_pw.clone(), cfg);
+        assert_eq!(rest_pw.export_snapshot(), snap_pw);
+        live_pw.resize(10, 4);
+        rest_pw.resize(10, 4);
+        live_pw.advance(b"\x1b8");
+        rest_pw.advance(b"\x1b8");
+        assert_eq!(live_pw.cursor_pos(), rest_pw.cursor_pos());
+        assert_eq!(live_pw.cursor().pending_wrap, rest_pw.cursor().pending_wrap);
+    }
+}

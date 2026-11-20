@@ -1,0 +1,36 @@
+[package]
+name = "egui_xterm_e2e"
+version.workspace = true
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = [
+    "search",
+    "hyperlinks",
+    "shell-integration",
+    "kitty-keyboard",
+    "vector-glyphs",
+]
+search = ["egui_xterm_core/search", "egui_xterm/search"]
+hyperlinks = ["egui_xterm_core/hyperlinks", "egui_xterm/hyperlinks"]
+shell-integration = ["egui_xterm_core/shell-integration", "egui_xterm/shell-integration"]
+kitty-keyboard = ["egui_xterm_core/kitty-keyboard", "egui_xterm/kitty-keyboard"]
+vector-glyphs = ["egui_xterm/vector-glyphs"]
+serde = ["egui_xterm_core/serde", "egui_xterm/serde", "dep:serde_json"]
+metrics = ["egui_xterm_core/metrics", "egui_xterm/metrics"]
+pty = ["egui_xterm/pty", "dep:egui_xterm_pty"]
+native-clipboard = ["egui_xterm/native-clipboard"]
+
+[dependencies]
+egui_xterm_core = { workspace = true, default-features = false }
+egui_xterm = { workspace = true, default-features = false }
+egui = { workspace = true, features = ["default_fonts"] }
+epaint = "0.37"
+egui_xterm_pty = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }

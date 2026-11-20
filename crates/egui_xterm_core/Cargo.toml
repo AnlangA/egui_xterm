@@ -1,0 +1,37 @@
+[package]
+name = "egui_xterm_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust, WASM-safe VT500 terminal emulator engine, grid, reflow, and input abstraction"
+keywords = ["terminal", "vt100", "xterm", "ansi", "emulator"]
+categories = ["emulators", "parsing"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["search", "hyperlinks", "shell-integration", "kitty-keyboard"]
+search = ["dep:regex"]
+hyperlinks = []
+shell-integration = []
+kitty-keyboard = []
+serde = ["dep:serde", "bitflags/serde"]
+metrics = []
+
+[dependencies]
+bitflags = { workspace = true }
+memchr = { workspace = true }
+unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+regex = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "vt_throughput"
+harness = false

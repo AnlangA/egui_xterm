@@ -1,0 +1,36 @@
+[package]
+name = "egui_xterm_demo"
+version.workspace = true
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = [
+    "search",
+    "hyperlinks",
+    "shell-integration",
+    "kitty-keyboard",
+    "vector-glyphs",
+    "metrics",
+]
+search = ["egui_xterm/search"]
+hyperlinks = ["egui_xterm/hyperlinks"]
+shell-integration = ["egui_xterm/shell-integration"]
+kitty-keyboard = ["egui_xterm/kitty-keyboard"]
+vector-glyphs = ["egui_xterm/vector-glyphs"]
+metrics = ["egui_xterm/metrics"]
+serde = ["egui_xterm/serde"]
+inspection = ["eframe/inspection"]
+
+[dependencies]
+egui_xterm = { workspace = true, default-features = false }
+egui = { workspace = true, features = ["default_fonts"] }
+eframe = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui_xterm = { workspace = true, default-features = false, features = ["pty", "native-clipboard"] }
