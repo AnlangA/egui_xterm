@@ -1,5 +1,40 @@
 //! Explicit (`OSC 8`) and implicit (`http://`, `https://`, `ftp://`) hyperlink tracking
 //! (`hyperlinks` feature).
+//!
+//! # Examples
+//!
+//! ```
+//! use egui_xterm_core::{CoreConfig, HyperlinkSpan, Terminal, TerminalEvent};
+//!
+//! let mut term = Terminal::new(40, 4, CoreConfig::default());
+//! term.advance(b"\x1b]8;id=doc;https://docs.rs\x1b\\docs\x1b]8;;\x1b\\\r\nSee https://example.org/guide.");
+//!
+//! let (info, spans) = term
+//!     .hyperlink_visible_spans_at(0, 0)
+//!     .ok_or("expected OSC 8 hyperlink at (0, 0)")?;
+//! assert_eq!(info.id.as_deref(), Some("doc"));
+//! assert_eq!(info.uri, "https://docs.rs");
+//! assert_eq!(
+//!     spans,
+//!     vec![HyperlinkSpan {
+//!         row: 0,
+//!         start_col: 0,
+//!         end_col: 4,
+//!     }]
+//! );
+//!
+//! assert!(term.activate_hyperlink_at(0, 0));
+//! assert!(term.drain_events().contains(&TerminalEvent::HyperlinkActivated {
+//!     uri: "https://docs.rs".to_owned(),
+//!     id: Some("doc".to_owned()),
+//! }));
+//!
+//! assert_eq!(
+//!     term.hyperlink_at(6, 1).map(|link| link.uri.as_str()),
+//!     Some("https://example.org/guide")
+//! );
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::collections::VecDeque;
 

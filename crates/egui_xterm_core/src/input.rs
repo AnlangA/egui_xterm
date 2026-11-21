@@ -10,6 +10,16 @@ use std::io;
 use std::sync::mpsc::{self, TryRecvError};
 
 /// Terminal grid and optional pixel dimensions passed during resize notifications.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::TerminalSize;
+///
+/// let size = TerminalSize::with_pixels(120, 40, 960, 640);
+/// assert_eq!((size.cols, size.rows), (120, 40));
+/// assert_eq!((size.pixel_width, size.pixel_height), (960, 640));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TerminalSize {
@@ -111,6 +121,44 @@ impl From<io::Error> for TerminalIoError {
 ///
 /// This trait intentionally has no `Send` or `Sync` bound so UI-thread-affine and
 /// `wasm32-unknown-unknown` sources can implement it directly.
+///
+/// # Examples
+///
+/// Implement only [`TerminalInput::poll_read`] for a read-only source:
+///
+/// ```
+/// use egui_xterm_core::{TerminalInput, TerminalIoError, TerminalSize};
+///
+/// struct StaticBanner {
+///     bytes: &'static [u8],
+///     offset: usize,
+/// }
+///
+/// impl TerminalInput for StaticBanner {
+///     fn poll_read(&mut self, buf: &mut [u8]) -> Result<usize, TerminalIoError> {
+///         let remaining = &self.bytes[self.offset..];
+///         if remaining.is_empty() {
+///             return Err(TerminalIoError::Closed);
+///         }
+///         let n = remaining.len().min(buf.len());
+///         buf[..n].copy_from_slice(&remaining[..n]);
+///         self.offset += n;
+///         Ok(n)
+///     }
+/// }
+///
+/// let mut src = StaticBanner {
+///     bytes: b"hi",
+///     offset: 0,
+/// };
+/// let mut buf = [0u8; 4];
+/// assert_eq!(src.poll_read(&mut buf), Ok(2));
+/// assert_eq!(&buf[..2], b"hi");
+/// assert_eq!(src.write_bytes(b"ignored"), Ok(()));
+/// assert_eq!(src.resize(TerminalSize::new(80, 24)), Ok(()));
+/// assert!(!src.is_closed());
+/// assert_eq!(src.poll_read(&mut buf), Err(TerminalIoError::Closed));
+/// ```
 pub trait TerminalInput {
     /// Reads available incoming VT/ANSI bytes into `buf` without blocking.
     ///
@@ -191,6 +239,28 @@ impl<T: TerminalInput + ?Sized> TerminalInput for &mut T {
 }
 
 /// Adapts any `FnMut(&mut [u8]) -> Result<usize, TerminalIoError>` closure as a [`TerminalInput`].
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{FnInput, TerminalInput, TerminalIoError};
+///
+/// let mut sent = false;
+/// let mut io = FnInput::new(|buf: &mut [u8]| {
+///     if sent {
+///         return Err(TerminalIoError::Closed);
+///     }
+///     sent = true;
+///     let n = buf.len().min(2);
+///     buf[..n].copy_from_slice(&b"ok"[..n]);
+///     Ok(n)
+/// });
+///
+/// let mut buf = [0u8; 4];
+/// assert_eq!(io.poll_read(&mut buf), Ok(2));
+/// assert_eq!(&buf[..2], b"ok");
+/// assert_eq!(io.poll_read(&mut buf), Err(TerminalIoError::Closed));
+/// ```
 pub struct FnInput<F> {
     func: F,
 }
@@ -228,6 +298,23 @@ where
 ///
 /// Coalesces partial chunk reads across calls and guarantees all buffered chunks
 /// are drained before reporting [`TerminalIoError::Closed`].
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{ChannelInput, TerminalInput};
+///
+/// let (to_term, from_term, mut io) = ChannelInput::duplex_pair();
+/// to_term.send(b"pong".to_vec())?;
+///
+/// let mut buf = [0u8; 8];
+/// assert_eq!(io.poll_read(&mut buf)?, 4);
+/// assert_eq!(&buf[..4], b"pong");
+///
+/// io.write_bytes(b"ping\r")?;
+/// assert_eq!(from_term.recv()?, b"ping\r");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub struct ChannelInput {
     rx: mpsc::Receiver<Vec<u8>>,
     tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -383,6 +470,25 @@ type ResizeHook = Box<dyn FnMut(TerminalSize) -> Result<(), TerminalIoError>>;
 /// In-memory FIFO ring buffer implementing [`TerminalInput`].
 ///
 /// Useful for `WebSockets`, in-process virtual shells, FFI bridges, and deterministic tests.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{RingBufferInput, TerminalInput, TerminalIoError};
+///
+/// let mut io = RingBufferInput::from_bytes(b"hello");
+/// let mut buf = [0u8; 8];
+/// assert_eq!(io.poll_read(&mut buf)?, 5);
+/// assert_eq!(&buf[..5], b"hello");
+///
+/// io.write_bytes(b"ls\r")?;
+/// assert_eq!(io.drain_written(), b"ls\r");
+///
+/// io.close();
+/// assert!(io.is_closed());
+/// assert_eq!(io.poll_read(&mut buf), Err(TerminalIoError::Closed));
+/// # Ok::<(), TerminalIoError>(())
+/// ```
 pub struct RingBufferInput {
     rx_buf: VecDeque<u8>,
     tx_buf: Vec<u8>,

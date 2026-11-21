@@ -19,6 +19,24 @@ pub enum ZoneKind {
 }
 
 /// Semantic region tracked from `OSC 133` shell integration markers.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{CoreConfig, Terminal, ZoneKind};
+///
+/// let mut term = Terminal::new(80, 10, CoreConfig::default());
+/// term.advance(
+///     b"\x1b]133;A\x07$ \x1b]133;B\x07echo ok\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07",
+/// );
+///
+/// let zones = term.shell_zones();
+/// assert_eq!(zones.len(), 3);
+/// let kinds: Vec<ZoneKind> = zones.iter().map(|z| z.kind).collect();
+/// assert_eq!(kinds, vec![ZoneKind::Prompt, ZoneKind::Input, ZoneKind::Output]);
+/// assert_eq!(zones.last().and_then(|z| z.exit_code), Some(0));
+/// assert_eq!(term.command_output_at(1).as_deref(), Some("ok"));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShellZone {
@@ -94,6 +112,28 @@ fn adjust_zone_unbounded(mut z: ShellZone, oldest: AbsLine) -> ShellZone {
 }
 
 /// Read-only view of retained `OSC 133` [`ShellZone`]s with `O(1)` length and `O(log Z)` range queries.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{CoreConfig, Terminal, ZoneKind};
+///
+/// let mut term = Terminal::new(40, 2, CoreConfig::default());
+/// for i in 0..4 {
+///     term.advance(
+///         format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd{i}\r\n\x1b]133;C\x07out{i}\r\n\x1b]133;D;0\x07")
+///             .as_bytes(),
+///     );
+/// }
+///
+/// let on_line_zero: Vec<ZoneKind> = term
+///     .shell_zones()
+///     .in_line_range(0, 1)
+///     .map(|z| z.kind)
+///     .collect();
+/// assert_eq!(on_line_zero, vec![ZoneKind::Prompt, ZoneKind::Input]);
+/// assert!(term.jump_to_prompt(-1));
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct ShellZonesView<'a> {
     front: &'a [ShellZone],

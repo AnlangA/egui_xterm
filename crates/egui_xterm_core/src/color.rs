@@ -1,6 +1,23 @@
 //! Terminal color representation and xterm 16/256/`TrueColor` palette resolution.
 
 /// Compact 4-byte terminal color value with niche optimization for `Option<PackedColor>`.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{ColorScheme, PackedColor};
+///
+/// let scheme = ColorScheme::dark();
+/// assert_eq!(PackedColor::Default.resolve_fg(&scheme), scheme.foreground);
+/// assert_eq!(
+///     PackedColor::indexed(1).to_bright_ansi().resolve_fg(&scheme),
+///     scheme.ansi[9]
+/// );
+/// assert_eq!(
+///     PackedColor::rgb(10, 20, 30).resolve_bg(&scheme),
+///     [10, 20, 30]
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PackedColor {
@@ -228,6 +245,22 @@ impl ColorScheme {
 }
 
 /// Terminal visual theme combining a [`ColorScheme`] with presentation options.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{ColorScheme, PackedColor, Theme};
+///
+/// let theme = Theme::dark();
+/// assert!(theme.bold_is_bright);
+/// assert_eq!(
+///     theme.resolve_fg(PackedColor::indexed(1), true),
+///     theme.scheme.ansi[9]
+/// );
+///
+/// let light = Theme::from_scheme(ColorScheme::light());
+/// assert_eq!(light.scheme.color(196), [255, 0, 0]);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Theme {
@@ -241,6 +274,19 @@ pub struct Theme {
 ///
 /// Register indices follow xterm `OSC 5`: `0` = bold, `1` = underline, `2` = blink,
 /// `3` = reverse, `4` = italic.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::SpecialColors;
+///
+/// let mut special = SpecialColors::default();
+/// assert!(special.set(0, Some([255, 200, 0])));
+/// assert_eq!(special.get(0), Some([255, 200, 0]));
+/// assert_eq!(special.as_array()[0], Some([255, 200, 0]));
+/// assert!(special.clear());
+/// assert_eq!(special.get(0), None);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SpecialColors {

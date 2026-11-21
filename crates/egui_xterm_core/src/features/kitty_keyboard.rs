@@ -6,6 +6,34 @@ pub const KITTY_STACK_CAP: usize = 256;
 
 bitflags::bitflags! {
     /// Progressive enhancement flags for the Kitty Keyboard Protocol (`CSI > flags u`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use egui_xterm_core::{
+    ///     CoreConfig, KittyEventType, KittyKey, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers,
+    ///     Terminal,
+    /// };
+    ///
+    /// let mut term = Terminal::new(80, 24, CoreConfig::default());
+    /// term.advance(b"\x1b[>1u");
+    /// assert_eq!(
+    ///     term.kitty_keyboard_flags(),
+    ///     KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+    /// );
+    ///
+    /// let ev = KittyKeyEvent {
+    ///     key: KittyKey::Escape,
+    ///     event_type: KittyEventType::Press,
+    ///     modifiers: KittyModifiers::default(),
+    ///     shifted_key: None,
+    ///     base_layout_key: None,
+    ///     associated_text: None,
+    /// };
+    /// let mut out = Vec::new();
+    /// assert!(term.encode_key_event_into(&ev, &mut out));
+    /// assert_eq!(out, b"\x1b[27u");
+    /// ```
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct KittyKeyboardFlags: u8 {
@@ -617,6 +645,39 @@ pub fn encode_kitty_key_into(
 
 /// Encodes `ev` into VT/Kitty byte sequences according to `flags`, or returns `None` if no bytes
 /// should be transmitted (e.g., key release when [`KittyKeyboardFlags::REPORT_EVENT_TYPES`] is off).
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{
+///     KittyEventType, KittyKey, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers, encode_kitty_key,
+/// };
+///
+/// let ctrl_a = KittyKeyEvent {
+///     key: KittyKey::Char('a'),
+///     event_type: KittyEventType::Press,
+///     modifiers: KittyModifiers {
+///         ctrl: true,
+///         ..KittyModifiers::default()
+///     },
+///     shifted_key: None,
+///     base_layout_key: None,
+///     associated_text: None,
+/// };
+/// assert_eq!(
+///     encode_kitty_key(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES, &ctrl_a).as_deref(),
+///     Some(b"\x1b[97;5u".as_slice())
+/// );
+///
+/// let release = KittyKeyEvent {
+///     event_type: KittyEventType::Release,
+///     ..ctrl_a
+/// };
+/// assert_eq!(
+///     encode_kitty_key(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES, &release),
+///     None
+/// );
+/// ```
 #[must_use]
 pub fn encode_kitty_key(flags: KittyKeyboardFlags, ev: &KittyKeyEvent<'_>) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(24);
@@ -632,6 +693,34 @@ pub fn encode_kitty_key(flags: KittyKeyboardFlags, ev: &KittyKeyEvent<'_>) -> Op
 ///
 /// Callers implementing terminal key routing must check [`KittyKeyboardFlags`] first: when Kitty
 /// keyboard flags are non-empty, Kitty encoding takes strict precedence over `modifyOtherKeys`.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{
+///     KittyEventType, KittyKey, KittyKeyEvent, KittyModifiers, ModifyOtherKeys,
+///     encode_modify_other_keys_into,
+/// };
+///
+/// let ctrl_one = KittyKeyEvent {
+///     key: KittyKey::Char('1'),
+///     event_type: KittyEventType::Press,
+///     modifiers: KittyModifiers {
+///         ctrl: true,
+///         ..KittyModifiers::default()
+///     },
+///     shifted_key: None,
+///     base_layout_key: None,
+///     associated_text: None,
+/// };
+/// let mut out = Vec::new();
+/// assert!(encode_modify_other_keys_into(
+///     ModifyOtherKeys::Enabled,
+///     &ctrl_one,
+///     &mut out
+/// ));
+/// assert_eq!(out, b"\x1b[27;5;49~");
+/// ```
 pub fn encode_modify_other_keys_into(
     level: ModifyOtherKeys,
     ev: &KittyKeyEvent<'_>,

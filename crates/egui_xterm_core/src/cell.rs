@@ -146,6 +146,22 @@ impl CellFlags {
 }
 
 /// Compact 20-byte terminal grid cell.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{Cell, CellFlags, PackedColor, UnderlineStyle};
+///
+/// let flags = CellFlags::BOLD.with_underline_style(UnderlineStyle::Curly);
+/// let mut cell = Cell::new('x', PackedColor::indexed(2), PackedColor::Default, flags);
+/// assert!(!cell.is_empty());
+/// assert_eq!(cell.underline_style(), UnderlineStyle::Curly);
+///
+/// cell.reset(PackedColor::indexed(4));
+/// assert_eq!(cell.codepoint, ' ');
+/// assert_eq!(cell.bg, PackedColor::indexed(4));
+/// assert_eq!(cell.underline_style(), UnderlineStyle::None);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cell {
@@ -292,6 +308,19 @@ impl Default for TextSizing {
 }
 
 /// Sparse per-cell extension data for combining marks, underline colors, hyperlinks, and text sizing.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::CellExtra;
+///
+/// let mut extra = CellExtra::default();
+/// extra.push_combining('\u{0301}');
+///
+/// let mut grapheme = String::new();
+/// extra.write_grapheme('e', &mut grapheme);
+/// assert_eq!(grapheme, "e\u{0301}");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CellExtra {
@@ -376,6 +405,24 @@ pub struct Hyperlink {
 }
 
 /// Deduplicating pool of [`Hyperlink`] entries keyed by `(id, uri)` with slot-based reclamation.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::HyperlinkPool;
+///
+/// let mut pool = HyperlinkPool::new();
+/// let id = pool
+///     .try_intern(Some("docs"), "https://docs.rs")
+///     .ok_or("valid hyperlink should intern")?;
+/// let same = pool
+///     .try_intern(Some("docs"), "https://docs.rs")
+///     .ok_or("identical hyperlink should deduplicate")?;
+/// assert_eq!(id, same);
+/// assert_eq!(pool.len(), 1);
+/// assert_eq!(pool.uri(id), Some("https://docs.rs"));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HyperlinkPool {

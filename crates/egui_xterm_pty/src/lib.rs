@@ -4,6 +4,25 @@
 //! [`PtyConfig`], and [`RepaintCallback`] are exported alongside the core input
 //! contract types ([`TerminalInput`], [`TerminalIoError`], [`TerminalSize`]) so
 //! dependents remain `wasm32-unknown-unknown` compatible.
+//!
+//! # Examples
+//!
+//! Spawning a shell inside a native PTY (`no_run` because CI may lack a TTY):
+//!
+//! ```no_run
+//! use egui_xterm_pty::{PtyBackend, PtyConfig, TerminalInput, TerminalIoError, TerminalSize};
+//!
+//! let config = PtyConfig {
+//!     initial_size: TerminalSize::new(100, 30),
+//!     ..PtyConfig::default()
+//! };
+//! let mut pty = PtyBackend::spawn(config)?;
+//! pty.write_bytes(b"echo hello\r")?;
+//!
+//! let mut buf = [0u8; 1024];
+//! let _read = pty.poll_read(&mut buf)?;
+//! # Ok::<(), TerminalIoError>(())
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -206,6 +225,22 @@ mod native {
     pub type RepaintCallback = Box<dyn Fn() + Send + Sync>;
 
     /// Configuration for spawning a child process attached to a native PTY via [`PtyBackend`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use egui_xterm_pty::{PtyConfig, TerminalSize, shell};
+    ///
+    /// let cfg = PtyConfig {
+    ///     shell: Some(shell::default_shell()),
+    ///     args: vec!["-l".to_owned()],
+    ///     env: vec![("MY_VAR".to_owned(), "1".to_owned())],
+    ///     initial_size: TerminalSize::with_pixels(120, 40, 960, 640),
+    ///     ..PtyConfig::default()
+    /// };
+    /// assert_eq!(cfg.initial_size.cols, 120);
+    /// assert!(cfg.shell.as_deref().is_some_and(|s| !s.is_empty()));
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq, Default)]
     pub struct PtyConfig {
         /// Executable or shell command to launch; `None` uses the platform default shell.
@@ -417,6 +452,24 @@ mod native {
         ///
         /// Returns [`TerminalIoError::Message`] if `config.cwd` is not a directory, the PTY
         /// fails to open, or the child process cannot be spawned.
+        ///
+        /// # Examples
+        ///
+        /// Missing working directories are rejected before allocating an OS PTY:
+        ///
+        /// ```
+        /// use egui_xterm_pty::{PtyBackend, PtyConfig, TerminalIoError};
+        ///
+        /// let missing = std::env::temp_dir().join("egui_xterm_pty_missing_doctest_dir");
+        /// let cfg = PtyConfig {
+        ///     cwd: Some(missing),
+        ///     ..PtyConfig::default()
+        /// };
+        /// assert!(matches!(
+        ///     PtyBackend::spawn(cfg),
+        ///     Err(TerminalIoError::Message(_))
+        /// ));
+        /// ```
         pub fn spawn(config: PtyConfig) -> Result<Self, TerminalIoError> {
             Self::spawn_inner(config, None)
         }

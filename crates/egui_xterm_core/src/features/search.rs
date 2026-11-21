@@ -9,6 +9,24 @@ use crate::features::{CellSpan, extract_logical_line_with_spans};
 use crate::grid::{AbsLine, Grid, Row, ScreenKind};
 
 /// Query parameters for [`Terminal::search`](crate::Terminal::search).
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{CoreConfig, SearchQuery, Terminal};
+///
+/// let mut term = Terminal::new(40, 4, CoreConfig::default());
+/// term.advance(b"foo foobar foo\r\n");
+///
+/// let query = SearchQuery::literal("foo").with_whole_word(true);
+/// let matches = term.search(&query)?;
+/// assert_eq!(matches.len(), 2);
+/// assert_eq!((matches[0].start_col, matches[0].end_col), (0, 3));
+/// assert_eq!((matches[1].start_col, matches[1].end_col), (11, 14));
+/// assert_eq!(term.next_search_match().map(|m| m.start_col), Some(0));
+/// assert_eq!(term.next_search_match().map(|m| m.start_col), Some(11));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SearchQuery {
@@ -115,6 +133,23 @@ pub struct SearchMatch {
 }
 
 /// Progress snapshot returned by incremental search operations.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{CoreConfig, SearchQuery, Terminal};
+///
+/// let mut term = Terminal::new(40, 4, CoreConfig::default());
+/// term.advance(b"err-1 ok\r\nerr-2 ok\r\nerr-3 ok");
+///
+/// let mut progress = term.begin_incremental_search(&SearchQuery::regex(r"err-\d+"))?;
+/// while !progress.complete {
+///     progress = term.step_incremental_search(1);
+/// }
+/// assert_eq!(progress.matches_found, 3);
+/// assert_eq!(term.search_matches_on_line(1).len(), 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchStepProgress {
     /// Number of physical buffer lines scanned so far.

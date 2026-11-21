@@ -61,6 +61,21 @@ pub struct ViewportPos {
 }
 
 /// Per-viewport-row damage tracker used by incremental renderers.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::DirtyTracker;
+///
+/// let mut dirty = DirtyTracker::new(4);
+/// assert!(dirty.is_full_damage());
+/// dirty.clear();
+/// assert!(!dirty.is_row_dirty(2));
+///
+/// dirty.mark_row(2);
+/// assert!(dirty.is_row_dirty(2));
+/// assert!(!dirty.is_row_dirty(1));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirtyTracker {
     full_damage: bool,
@@ -141,6 +156,27 @@ pub(crate) struct GridSnapshot {
 }
 
 /// Terminal screen buffer holding scrollback history, visible rows, row pool, and sparse extras.
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{Grid, ReflowAnchors, ScreenKind};
+///
+/// let mut grid = Grid::new(ScreenKind::Primary, 80, 24, 1000);
+/// assert_eq!((grid.cols(), grid.viewport_rows()), (80, 24));
+/// assert!(grid.dirty().is_row_dirty(0));
+/// grid.clear_dirty();
+/// assert!(!grid.dirty().is_row_dirty(0));
+///
+/// let anchors = ReflowAnchors {
+///     cursor_row: 5,
+///     cursor_col: 10,
+///     ..ReflowAnchors::default()
+/// };
+/// let remapped = grid.resize(40, 12, anchors);
+/// assert_eq!((grid.cols(), grid.viewport_rows()), (40, 12));
+/// assert!(remapped.cursor_row < 12);
+/// ```
 #[derive(Debug, Clone)]
 pub struct Grid {
     kind: ScreenKind,
