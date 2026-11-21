@@ -12,6 +12,9 @@ use egui_xterm::{TerminalInput, TerminalIoError, TerminalSize};
 /// Maximum number of entered commands retained in [`DemoShellInput`] history.
 const MAX_HISTORY_ENTRIES: usize = 64;
 
+/// Maximum incoming OSC payload bytes buffered by [`DemoShellInput`].
+const MAX_OSC_BYTES: usize = 4096;
+
 /// Built-in showcase command descriptors `(name, summary)` exposed for the demo sidebar.
 pub const SHOWCASE_COMMANDS: &[(&str, &str)] = &[
     ("help", "List commands & terminal shortcuts"),
@@ -19,9 +22,14 @@ pub const SHOWCASE_COMMANDS: &[(&str, &str)] = &[
     ("unicode", "CJK, ZWJ emoji & vector box/braille glyphs"),
     ("links", "OSC 8 hyperlinks & implicit URLs"),
     ("prompts", "OSC 133 semantic prompt zones & exit codes"),
+    ("graphics", "Kitty APC & Sixel DCS inline raster graphics"),
     (
         "modern",
-        "OSC 9;4 progress, OSC 6 doc URI, OSC 22 cursor & OSC 99 notice",
+        "OSC 9;4 progress, OSC 6 URI, OSC 22 cursor, OSC 66 sizing & OSC 99 notice",
+    ),
+    (
+        "osc52",
+        "OSC 52 clipboard write & read query (Prompt/Allow)",
     ),
     ("sync", "DEC Mode 2026 synchronized frame update"),
     ("size", "Show latest debounced TerminalSize"),
@@ -35,12 +43,15 @@ pub struct DemoShellInput {
     rx_buf: VecDeque<u8>,
     utf8_pending: Vec<u8>,
     esc_state: EscapeParseState,
+    osc_buf: Vec<u8>,
     line_buf: String,
     history: Vec<String>,
     history_cursor: Option<usize>,
     command_seq: u64,
     last_size: TerminalSize,
     closed: bool,
+    #[cfg(test)]
+    injected_io_error: Option<TerminalIoError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +60,10 @@ enum EscapeParseState {
     Esc,
     Csi,
     Ss3,
+    Osc,
+    OscEsc,
+    StringSeq,
+    StringEsc,
 }
 
 impl Default for DemoShellInput {
@@ -65,15 +80,24 @@ impl DemoShellInput {
             rx_buf: VecDeque::new(),
             utf8_pending: Vec::new(),
             esc_state: EscapeParseState::Ground,
+            osc_buf: Vec::new(),
             line_buf: String::new(),
             history: Vec::new(),
             history_cursor: None,
             command_seq: 0,
             last_size: TerminalSize::default(),
             closed: false,
+            #[cfg(test)]
+            injected_io_error: None,
         };
         shell.push_welcome(title);
         shell
+    }
+
+    /// Injects a one-shot [`TerminalIoError`] returned by the next [`TerminalInput::poll_read`].
+    #[cfg(test)]
+    pub(crate) fn inject_io_error(&mut self, err: TerminalIoError) {
+        self.injected_io_error = Some(err);
     }
 
     /// Programmatically submits a showcase command as if the user typed and executed it.
@@ -179,6 +203,11 @@ impl DemoShellInput {
                 self.esc_state = match byte {
                     b'[' => EscapeParseState::Csi,
                     b'O' => EscapeParseState::Ss3,
+                    b']' => {
+                        self.osc_buf.clear();
+                        EscapeParseState::Osc
+                    }
+                    b'_' | b'P' | b'X' | b'^' => EscapeParseState::StringSeq,
                     _ => EscapeParseState::Ground,
                 };
             }
@@ -206,7 +235,77 @@ impl DemoShellInput {
                     self.esc_state = EscapeParseState::Ground;
                 }
             }
+            EscapeParseState::Osc => match byte {
+                0x07 => {
+                    self.handle_incoming_osc();
+                    self.esc_state = EscapeParseState::Ground;
+                }
+                0x1b => {
+                    self.esc_state = EscapeParseState::OscEsc;
+                }
+                b => {
+                    if self.osc_buf.len() < MAX_OSC_BYTES {
+                        self.osc_buf.push(b);
+                    }
+                }
+            },
+            EscapeParseState::OscEsc => match byte {
+                b'\\' | 0x07 => {
+                    self.handle_incoming_osc();
+                    self.esc_state = EscapeParseState::Ground;
+                }
+                0x1b => {}
+                b => {
+                    if self.osc_buf.len() < MAX_OSC_BYTES {
+                        self.osc_buf.push(b);
+                    }
+                    self.esc_state = EscapeParseState::Osc;
+                }
+            },
+            EscapeParseState::StringSeq => {
+                if byte == 0x1b {
+                    self.esc_state = EscapeParseState::StringEsc;
+                }
+            }
+            EscapeParseState::StringEsc => {
+                self.esc_state = match byte {
+                    b'\\' => EscapeParseState::Ground,
+                    0x1b => EscapeParseState::StringEsc,
+                    _ => EscapeParseState::StringSeq,
+                };
+            }
         }
+    }
+
+    fn handle_incoming_osc(&mut self) {
+        if let Some(rest) = self.osc_buf.strip_prefix(b"52;")
+            && let Some(sep) = rest.iter().position(|&b| b == b';')
+        {
+            let sel = String::from_utf8_lossy(&rest[..sep]);
+            let payload = &rest[sep + 1..];
+            if payload != b"?"
+                && let Some(decoded) = decode_base64(payload)
+                && let Ok(text) = String::from_utf8(decoded)
+                && self.line_buf.is_empty()
+            {
+                let sanitized: String = text
+                    .chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .collect();
+                let mut msg = String::new();
+                if write!(
+                    msg,
+                    "\r\n\x1b[32m[OSC 52 reply ({sel})]\x1b[0m {sanitized}\r\n\
+                     \x1b]133;A\x07\x1b[1;32mdemo\x1b[0m \x1b[34m~/egui_xterm\x1b[0m \x1b[1;35m>\x1b[0m \x1b]133;B\x07"
+                )
+                .is_err()
+                {
+                    // `String`'s `fmt::Write` impl is infallible.
+                }
+                self.push_str(&msg);
+            }
+        }
+        self.osc_buf.clear();
     }
 
     fn flush_utf8_pending(&mut self) {
@@ -316,8 +415,16 @@ impl DemoShellInput {
                 self.emit_prompts();
                 0
             }
+            "graphics" => {
+                self.emit_graphics();
+                0
+            }
             "modern" => {
                 self.emit_modern();
+                0
+            }
+            "osc52" => {
+                self.emit_osc52();
                 0
             }
             "sync" => {
@@ -440,21 +547,84 @@ impl DemoShellInput {
         self.push_str(&out);
     }
 
+    fn emit_graphics(&mut self) {
+        // 4x4 RGBA8 diagonal color gradient for Kitty APC (`a=T,f=32,s=4,v=4,c=6,r=2,q=2`).
+        const PALETTE: [[u8; 4]; 4] = [
+            [0xFF, 0x55, 0x55, 0xFF],
+            [0x50, 0xFA, 0x7B, 0xFF],
+            [0x8B, 0xE9, 0xFD, 0xFF],
+            [0xBD, 0x93, 0xF9, 0xFF],
+        ];
+        let mut rgba = [0u8; 4 * 4 * 4];
+        for y in 0..4 {
+            for x in 0..4 {
+                let offset = (y * 4 + x) * 4;
+                rgba[offset..offset + 4].copy_from_slice(&PALETTE[(x + y) % PALETTE.len()]);
+            }
+        }
+        let kitty_b64 = encode_base64(&rgba);
+        let mut out = String::from(
+            "\x1b[1;36mInline Graphics Showcase:\x1b[0m\r\n  Kitty APC (4x4 RGBA -> 6x2 cells):\r\n  ",
+        );
+        if write!(
+            out,
+            "\x1b_Ga=T,f=32,s=4,v=4,c=6,r=2,q=2;{kitty_b64}\x1b\\\r\n"
+        )
+        .is_err()
+        {
+            // `String`'s `fmt::Write` impl is infallible.
+        }
+        #[cfg(not(feature = "kitty-graphics"))]
+        out.push_str("  (kitty-graphics feature disabled)\r\n");
+
+        out.push_str(
+            "  Sixel DCS (48x18 px color bands):\r\n  \
+             \x1bPq\"1;1;48;18\
+             #1;2;100;33;33#2;2;31;98;48#3;2;54;91;99#4;2;74;58;98\
+             #1!12~#2!12~#3!12~#4!12~-\
+             #2!12~#3!12~#4!12~#1!12~-\
+             #3!12~#4!12~#1!12~#2!12~\
+             \x1b\\",
+        );
+        #[cfg(not(feature = "sixel"))]
+        out.push_str("\r\n  (sixel feature disabled)\r\n");
+        self.push_str(&out);
+    }
+
     fn emit_modern(&mut self) {
         let out = concat!(
             "\x1b]6;file://localhost/workspace/demo/README.md\x07",
             "\x1b]9;4;1;65\x07",
             "\x1b]22;pointer\x07",
             "\x1b]99;i=demo1:p=title:d=0;egui_xterm Demo\x1b\\",
-            "\x1b]99;i=demo1:p=body:d=1;OSC 9;4 / 6 / 22 / 99 showcase active\x1b\\",
+            "\x1b]99;i=demo1:p=body:d=1;OSC 9;4 / 6 / 22 / 66 / 99 showcase active\x1b\\",
             "\x07",
             "\x1b[1;36mModern OSC Showcase:\x1b[0m\r\n",
+            "  \x1b]66;s=2;OSC 66 2x\x1b\\\r\n\r\n",
             "  OSC 9;4 : progress bar set to 65% (run \x1b[33mclear\x1b[0m to reset)\r\n",
             "  OSC 6   : document URI updated\r\n",
             "  OSC 22  : pointer cursor set to pointer\r\n",
+            "  OSC 66  : Kitty text sizing (s=2) rendered above\r\n",
             "  OSC 99  : notification emitted + BEL visual flash\r\n",
         );
         self.push_str(out);
+    }
+
+    fn emit_osc52(&mut self) {
+        let payload = encode_base64(b"egui_xterm OSC 52");
+        let mut out = String::new();
+        if write!(
+            out,
+            "\x1b]52;c;{payload}\x07\x1b]52;c;?\x07\
+             \x1b[1;36mOSC 52 Clipboard Showcase:\x1b[0m\r\n\
+             \x20\x20Write: OSC 52;c;... (\"egui_xterm OSC 52\")\r\n\
+             \x20\x20Read : OSC 52;c;? queried (set toolbar OSC 52 Read to Prompt/Allow)\r\n"
+        )
+        .is_err()
+        {
+            // `String`'s `fmt::Write` impl is infallible.
+        }
+        self.push_str(&out);
     }
 
     fn emit_size(&mut self) {
@@ -612,8 +782,84 @@ fn unicode_width_approx(ch: char) -> usize {
     }
 }
 
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map_or(0, u32::from);
+        let b2 = chunk.get(2).copied().map_or(0, u32::from);
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(char::from(TABLE[((triple >> 18) & 0x3F) as usize]));
+        out.push(char::from(TABLE[((triple >> 12) & 0x3F) as usize]));
+        out.push(if chunk.len() > 1 {
+            char::from(TABLE[((triple >> 6) & 0x3F) as usize])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(TABLE[(triple & 0x3F) as usize])
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn decode_base64_sextet(byte: u8) -> Option<u32> {
+    match byte {
+        b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+        b'a'..=b'z' => Some(u32::from(byte - b'a' + 26)),
+        b'0'..=b'9' => Some(u32::from(byte - b'0' + 52)),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    let (quads, rem) = input.as_chunks::<4>();
+    if !rem.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(quads.len() * 3);
+    for (idx, quad) in quads.iter().enumerate() {
+        let is_last = idx + 1 == quads.len();
+        let v0 = decode_base64_sextet(quad[0])?;
+        let v1 = decode_base64_sextet(quad[1])?;
+        if quad[2] == b'=' {
+            if !is_last || quad[3] != b'=' {
+                return None;
+            }
+            let triple = (v0 << 18) | (v1 << 12);
+            out.push(((triple >> 16) & 0xFF) as u8);
+            break;
+        }
+        let v2 = decode_base64_sextet(quad[2])?;
+        if quad[3] == b'=' {
+            if !is_last {
+                return None;
+            }
+            let triple = (v0 << 18) | (v1 << 12) | (v2 << 6);
+            out.push(((triple >> 16) & 0xFF) as u8);
+            out.push(((triple >> 8) & 0xFF) as u8);
+            break;
+        }
+        let v3 = decode_base64_sextet(quad[3])?;
+        let triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+        out.push(((triple >> 16) & 0xFF) as u8);
+        out.push(((triple >> 8) & 0xFF) as u8);
+        out.push((triple & 0xFF) as u8);
+    }
+    Some(out)
+}
+
 impl TerminalInput for DemoShellInput {
     fn poll_read(&mut self, buf: &mut [u8]) -> Result<usize, TerminalIoError> {
+        #[cfg(test)]
+        if let Some(err) = self.injected_io_error.take() {
+            return Err(err);
+        }
         if buf.is_empty() {
             return if self.is_closed() {
                 Err(TerminalIoError::Closed)
@@ -860,7 +1106,9 @@ mod tests {
     }
 
     #[test]
-    fn modern_showcase_emits_osc_6_9_4_22_and_99() {
+    fn modern_showcase_emits_osc_6_9_4_22_66_and_99() {
+        use egui_xterm::CellFlags;
+
         assert!(SHOWCASE_COMMANDS.iter().any(|(cmd, _)| *cmd == "modern"));
         let mut shell = DemoShellInput::new("Modern Showcase");
         let _ = drain_all(&mut shell);
@@ -888,7 +1136,108 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             egui_xterm::TerminalEvent::Notification { title, body }
-                if title == "egui_xterm Demo" && body.contains("OSC 9;4")
+                if title == "egui_xterm Demo" && body.contains("OSC 9;4") && body.contains("66")
         )));
+
+        let snap = term.active_snapshot();
+        let osc66_row = snap
+            .visible_rows
+            .iter()
+            .position(|row| {
+                row.cells().iter().any(|cell| {
+                    cell.extra_id != 0
+                        && snap
+                            .cell_extra(cell.extra_id)
+                            .and_then(|e| e.text_sizing)
+                            .is_some_and(|ts| ts.scale == 2)
+                })
+            })
+            .expect("OSC 66 s=2 origin row");
+        assert!(
+            snap.visible_rows[osc66_row + 1]
+                .cells()
+                .iter()
+                .any(|c| c.flags.contains(CellFlags::SIZED_SPACER)),
+            "expected OSC 66 SIZED_SPACER cells on second row of 2x text"
+        );
+    }
+
+    #[test]
+    fn graphics_showcase_emits_kitty_and_sixel_sequences() {
+        assert!(SHOWCASE_COMMANDS.iter().any(|(cmd, _)| *cmd == "graphics"));
+        let mut shell = DemoShellInput::new("Graphics Showcase");
+        let _ = drain_all(&mut shell);
+
+        shell.run_showcase("graphics");
+        let out = drain_all(&mut shell);
+        assert!(out.contains("\x1b_Ga=T,f=32,s=4,v=4,c=6,r=2,q=2;"));
+        assert!(out.contains("\x1bPq\"1;1;48;18"));
+    }
+
+    #[cfg(all(feature = "kitty-graphics", feature = "sixel"))]
+    #[test]
+    fn graphics_showcase_populates_kitty_and_sixel_placements() {
+        let mut shell = DemoShellInput::new("Graphics Placements");
+        let _ = drain_all(&mut shell);
+
+        shell.run_showcase("graphics");
+        let mut term = Terminal::new(80, 24, CoreConfig::default());
+        term.advance(&drain_bytes(&mut shell));
+
+        let placements = term.image_placements();
+        assert_eq!(placements.len(), 2, "expected Kitty + Sixel placements");
+        let kitty_img = term.image_data(placements[0].image_id).expect("kitty img");
+        assert_eq!((kitty_img.width, kitty_img.height), (4, 4));
+        assert_eq!((placements[0].cols, placements[0].rows), (6, 2));
+
+        let sixel_img = term.image_data(placements[1].image_id).expect("sixel img");
+        assert_eq!((sixel_img.width, sixel_img.height), (48, 18));
+    }
+
+    #[test]
+    fn osc52_showcase_and_incoming_reply_handling() {
+        use egui_xterm::{ClipboardSelection, Osc52ReadPolicy, TerminalEvent};
+
+        assert!(SHOWCASE_COMMANDS.iter().any(|(cmd, _)| *cmd == "osc52"));
+        let mut shell = DemoShellInput::new("OSC 52 Showcase");
+        let _ = drain_all(&mut shell);
+
+        shell.run_showcase("osc52");
+        let bytes = drain_bytes(&mut shell);
+        let cfg = CoreConfig {
+            osc52_read_policy: Osc52ReadPolicy::Prompt,
+            ..CoreConfig::default()
+        };
+        let mut term = Terminal::new(80, 24, cfg);
+        term.advance(&bytes);
+        let events = term.drain_events();
+        assert!(events.contains(&TerminalEvent::ClipboardWrite(
+            "egui_xterm OSC 52".to_owned()
+        )));
+        assert!(events.contains(&TerminalEvent::ClipboardReadPrompt {
+            selection: ClipboardSelection::Clipboard
+        }));
+
+        // Approving a prompt sends an OSC 52 reply back via write_bytes; shell must decode cleanly
+        // without leaking raw `52;c;...` bytes into the typed line buffer.
+        shell
+            .write_bytes(b"\x1b]52;c;c2VjcmV0\x1b\\")
+            .expect("incoming OSC 52 reply");
+        let reply_bytes = drain_bytes(&mut shell);
+        let reply_out = String::from_utf8_lossy(&reply_bytes);
+        assert!(reply_out.contains("[OSC 52 reply (c)]\x1b[0m secret"));
+        term.advance(&reply_bytes);
+        assert!(term.full_text().contains("[OSC 52 reply (c)] secret"));
+        assert!(
+            !term
+                .drain_events()
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::CommandFinished { .. }))
+        );
+
+        shell.write_bytes(b"size\r").expect("size after reply");
+        let after = drain_all(&mut shell);
+        assert!(after.contains("Latest TerminalSize:"));
+        assert!(!after.contains("echo:"));
     }
 }

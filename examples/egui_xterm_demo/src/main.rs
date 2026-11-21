@@ -9,13 +9,15 @@
 
 mod demo_shell;
 
+use std::borrow::Cow;
+
 use demo_shell::{DemoShellInput, SHOWCASE_COMMANDS};
 use eframe::egui;
 #[cfg(not(target_arch = "wasm32"))]
 use egui_xterm::pty::{PtyBackend, PtyConfig};
 use egui_xterm::{
-    CursorShape, ProgressIndicator, ScaleMode, TerminalConfig, TerminalEvent, TerminalInput,
-    TerminalResponse, TerminalRuntime, Theme,
+    ClipboardSelection, CursorShape, Osc52ReadPolicy, ProgressIndicator, ScaleMode, TerminalConfig,
+    TerminalEvent, TerminalInput, TerminalIoError, TerminalResponse, TerminalRuntime, Theme,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,6 +42,99 @@ fn main() {
     let _creator: fn(&eframe::CreationContext<'_>) -> EguiXtermDemoApp = EguiXtermDemoApp::new;
     let _ui_fn: fn(&mut EguiXtermDemoApp, &mut egui::Ui, &mut eframe::Frame) =
         <EguiXtermDemoApp as eframe::App>::ui;
+}
+
+trait AnyRuntime {
+    fn show_with_config(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &mut TerminalConfig,
+    ) -> TerminalResponse;
+    fn snapshot(&self, resp: &TerminalResponse) -> PaneMetricsSnapshot;
+    fn last_io_error_string(&self) -> Option<String>;
+    fn take_io_error(&mut self) -> Option<TerminalIoError>;
+    fn pending_osc52_read(&self) -> Option<ClipboardSelection>;
+    fn approve_osc52_read(&mut self, text: &str) -> bool;
+    fn deny_osc52_read(&mut self) -> bool;
+    fn provide_clipboard_read(&mut self, selection: ClipboardSelection, text: &str);
+    #[cfg(feature = "search")]
+    fn toggle_search(&mut self);
+    #[cfg(feature = "shell-integration")]
+    fn jump_to_prompt(&mut self, delta: i32);
+}
+
+impl<I: TerminalInput> AnyRuntime for TerminalRuntime<I> {
+    fn show_with_config(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &mut TerminalConfig,
+    ) -> TerminalResponse {
+        TerminalRuntime::show_with_config(self, ui, config)
+    }
+
+    fn snapshot(&self, resp: &TerminalResponse) -> PaneMetricsSnapshot {
+        let term = self.terminal();
+        PaneMetricsSnapshot {
+            cols: resp.cols,
+            rows: resp.rows,
+            cell_size: resp.cell_size,
+            effective_font_size: resp.effective_font_size,
+            title: term.title().to_owned(),
+            cwd: term.cwd().map(str::to_owned),
+            document_uri: term.document_uri().map(str::to_owned),
+            display_offset: term.display_offset(),
+            scrollback_len: term.scrollback_len(),
+            alt_screen: term.is_alt_screen(),
+            sync_output: term.is_synchronized_output(),
+            progress: self.progress(),
+            last_io_error: self.last_io_error().map(ToString::to_string),
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            image_count: term.image_placements().len(),
+            #[cfg(feature = "shell-integration")]
+            zone_count: term.shell_zones().len(),
+            #[cfg(feature = "metrics")]
+            metrics: *term.metrics(),
+            closed: self.input().is_closed(),
+        }
+    }
+
+    fn last_io_error_string(&self) -> Option<String> {
+        self.last_io_error().map(ToString::to_string)
+    }
+
+    fn take_io_error(&mut self) -> Option<TerminalIoError> {
+        TerminalRuntime::take_io_error(self)
+    }
+
+    fn pending_osc52_read(&self) -> Option<ClipboardSelection> {
+        TerminalRuntime::pending_osc52_read(self)
+    }
+
+    fn approve_osc52_read(&mut self, text: &str) -> bool {
+        TerminalRuntime::approve_osc52_read(self, text)
+    }
+
+    fn deny_osc52_read(&mut self) -> bool {
+        TerminalRuntime::deny_osc52_read(self)
+    }
+
+    fn provide_clipboard_read(&mut self, selection: ClipboardSelection, text: &str) {
+        self.terminal_mut().provide_clipboard_read(selection, text);
+    }
+
+    #[cfg(feature = "search")]
+    fn toggle_search(&mut self) {
+        if self.search_bar_mut().open {
+            self.close_search();
+        } else {
+            self.open_search();
+        }
+    }
+
+    #[cfg(feature = "shell-integration")]
+    fn jump_to_prompt(&mut self, delta: i32) {
+        self.terminal_mut().jump_to_prompt(delta);
+    }
 }
 
 enum PaneBackend {
@@ -76,6 +171,8 @@ struct PaneMetricsSnapshot {
     sync_output: bool,
     progress: Option<ProgressIndicator>,
     last_io_error: Option<String>,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    image_count: usize,
     #[cfg(feature = "shell-integration")]
     zone_count: usize,
     #[cfg(feature = "metrics")]
@@ -83,8 +180,42 @@ struct PaneMetricsSnapshot {
     closed: bool,
 }
 
+const fn clipboard_selection_label(selection: ClipboardSelection) -> &'static str {
+    match selection {
+        ClipboardSelection::Clipboard => "Clipboard",
+        ClipboardSelection::Primary => "Primary",
+        ClipboardSelection::Secondary => "Secondary",
+        ClipboardSelection::Select => "Select",
+    }
+}
+
 impl TerminalTab {
-    fn show_in_frame(&mut self, ui: &mut egui::Ui, is_active: bool) -> bool {
+    fn runtime(&self) -> Option<&dyn AnyRuntime> {
+        match &self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            PaneBackend::Pty(rt) => Some(rt),
+            PaneBackend::Trait(rt) => Some(rt),
+            #[cfg(not(target_arch = "wasm32"))]
+            PaneBackend::Error(_) => None,
+        }
+    }
+
+    fn runtime_mut(&mut self) -> Option<&mut dyn AnyRuntime> {
+        match &mut self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            PaneBackend::Pty(rt) => Some(rt),
+            PaneBackend::Trait(rt) => Some(rt),
+            #[cfg(not(target_arch = "wasm32"))]
+            PaneBackend::Error(_) => None,
+        }
+    }
+
+    fn show_in_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_active: bool,
+        osc52_reply_draft: &mut String,
+    ) -> bool {
         let scheme = &self.config.theme.scheme;
         let bg = egui::Color32::from_rgb(
             scheme.background[0],
@@ -111,88 +242,115 @@ impl TerminalTab {
             let avail = ui.available_size();
             ui.set_min_size(avail);
 
-            match &mut self.backend {
-                #[cfg(not(target_arch = "wasm32"))]
-                PaneBackend::Pty(rt) => {
-                    let resp = rt.show_with_config(ui, &mut self.config);
-                    clicked = resp.response.clicked()
-                        || resp.response.drag_started()
-                        || resp.response.gained_focus();
-                    let snapshot = Self::capture_snapshot(rt, &resp);
-                    self.apply_events(&resp.events);
-                    self.last_response = Some(snapshot);
+            let had_io_error = self
+                .last_response
+                .as_ref()
+                .is_some_and(|s| s.last_io_error.is_some());
+            let had_osc52 = self.pending_osc52_read().is_some();
+
+            let rendered = {
+                let rt: Option<&mut dyn AnyRuntime> = match &mut self.backend {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    PaneBackend::Pty(rt) => Some(rt),
+                    PaneBackend::Trait(rt) => Some(rt),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    PaneBackend::Error(err_msg) => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(24.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 100, 100),
+                                "Failed to launch native PTY session",
+                            );
+                            ui.add_space(6.0);
+                            ui.monospace(err_msg.as_str());
+                        });
+                        None
+                    }
+                };
+                rt.map(|runtime| {
+                    let resp = runtime.show_with_config(ui, &mut self.config);
+                    let snapshot = runtime.snapshot(&resp);
+                    (resp, snapshot)
+                })
+            };
+
+            if let Some((resp, snapshot)) = rendered {
+                clicked = resp.response.clicked()
+                    || resp.response.drag_started()
+                    || resp.response.gained_focus();
+                let allow_reads = self.apply_events(&resp.events, osc52_reply_draft);
+                if !allow_reads.is_empty()
+                    && let Some(rt) = self.runtime_mut()
+                {
+                    for selection in allow_reads {
+                        rt.provide_clipboard_read(selection, osc52_reply_draft);
+                    }
+                    ui.ctx().request_repaint();
                 }
-                PaneBackend::Trait(rt) => {
-                    let resp = rt.show_with_config(ui, &mut self.config);
-                    clicked = resp.response.clicked()
-                        || resp.response.drag_started()
-                        || resp.response.gained_focus();
-                    let snapshot = Self::capture_snapshot(rt, &resp);
-                    self.apply_events(&resp.events);
-                    self.last_response = Some(snapshot);
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                PaneBackend::Error(err_msg) => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(24.0);
-                        ui.colored_label(
-                            egui::Color32::from_rgb(240, 100, 100),
-                            "Failed to launch native PTY session",
-                        );
-                        ui.add_space(6.0);
-                        ui.monospace(err_msg.as_str());
-                    });
+                let has_io_error = snapshot.last_io_error.is_some();
+                self.last_response = Some(snapshot);
+                let has_osc52 = self.pending_osc52_read().is_some();
+                if (!had_io_error && has_io_error) || (!had_osc52 && has_osc52) {
+                    ui.ctx().request_repaint();
                 }
             }
         });
         clicked
     }
 
-    fn capture_snapshot<I: TerminalInput>(
-        rt: &TerminalRuntime<I>,
-        resp: &TerminalResponse,
-    ) -> PaneMetricsSnapshot {
-        let term = rt.terminal();
-        PaneMetricsSnapshot {
-            cols: resp.cols,
-            rows: resp.rows,
-            cell_size: resp.cell_size,
-            effective_font_size: resp.effective_font_size,
-            title: term.title().to_owned(),
-            cwd: term.cwd().map(str::to_owned),
-            document_uri: term.document_uri().map(str::to_owned),
-            display_offset: term.display_offset(),
-            scrollback_len: term.scrollback_len(),
-            alt_screen: term.is_alt_screen(),
-            sync_output: term.is_synchronized_output(),
-            progress: rt.progress(),
-            last_io_error: rt.last_io_error().map(ToString::to_string),
-            #[cfg(feature = "shell-integration")]
-            zone_count: term.shell_zones().len(),
-            #[cfg(feature = "metrics")]
-            metrics: *term.metrics(),
-            closed: rt.input().is_closed(),
+    fn pending_io_error(&self) -> Option<Cow<'_, str>> {
+        if let Some(msg) = self
+            .last_response
+            .as_ref()
+            .and_then(|s| s.last_io_error.as_deref())
+        {
+            return Some(Cow::Borrowed(msg));
+        }
+        self.runtime()
+            .and_then(AnyRuntime::last_io_error_string)
+            .map(Cow::Owned)
+    }
+
+    fn sync_io_error_from_runtime(&mut self) {
+        let err = self.runtime().and_then(AnyRuntime::last_io_error_string);
+        if let Some(snap) = &mut self.last_response {
+            snap.last_io_error = err;
         }
     }
 
     fn dismiss_io_error(&mut self) {
-        match &mut self.backend {
-            #[cfg(not(target_arch = "wasm32"))]
-            PaneBackend::Pty(rt) => {
-                drop(rt.take_io_error());
-            }
-            PaneBackend::Trait(rt) => {
-                drop(rt.take_io_error());
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            PaneBackend::Error(_) => {}
+        if let Some(rt) = self.runtime_mut() {
+            drop(rt.take_io_error());
         }
         if let Some(snap) = &mut self.last_response {
             snap.last_io_error = None;
         }
     }
 
-    fn apply_events(&mut self, events: &[TerminalEvent]) {
+    fn pending_osc52_read(&self) -> Option<ClipboardSelection> {
+        self.runtime().and_then(AnyRuntime::pending_osc52_read)
+    }
+
+    fn approve_osc52_read(&mut self, text: &str) -> bool {
+        let approved = self
+            .runtime_mut()
+            .is_some_and(|rt| rt.approve_osc52_read(text));
+        if approved {
+            self.sync_io_error_from_runtime();
+        }
+        approved
+    }
+
+    fn deny_osc52_read(&mut self) -> bool {
+        self.runtime_mut().is_some_and(AnyRuntime::deny_osc52_read)
+    }
+
+    fn apply_events(
+        &mut self,
+        events: &[TerminalEvent],
+        osc52_reply_draft: &mut String,
+    ) -> Vec<ClipboardSelection> {
+        let mut allow_reads = Vec::new();
         for event in events {
             match event {
                 TerminalEvent::TitleChanged(title) if !title.trim().is_empty() => {
@@ -206,6 +364,25 @@ impl TerminalTab {
                         Some(code) => format!("Exit {code}"),
                         None => "Command finished".to_owned(),
                     });
+                }
+                TerminalEvent::ClipboardWrite(text) if self.config.osc52_write_enabled => {
+                    if !text.is_empty() {
+                        osc52_reply_draft.clone_from(text);
+                    }
+                    self.last_notice = Some("OSC 52 write".to_owned());
+                }
+                TerminalEvent::ClipboardReadRequested { selection } => {
+                    allow_reads.push(*selection);
+                    self.last_notice = Some(format!(
+                        "OSC 52 read ({})",
+                        clipboard_selection_label(*selection)
+                    ));
+                }
+                TerminalEvent::ClipboardReadPrompt { selection } => {
+                    self.last_notice = Some(format!(
+                        "OSC 52 prompt ({})",
+                        clipboard_selection_label(*selection)
+                    ));
                 }
                 TerminalEvent::Notification { title, body } => {
                     let msg = if title.is_empty() {
@@ -222,46 +399,26 @@ impl TerminalTab {
                 TerminalEvent::NotificationClosed { id } => {
                     self.last_notification = Some(format!("Closed ({id})"));
                 }
+                TerminalEvent::IoError(err) => {
+                    self.last_notice = Some(format!("I/O error: {err}"));
+                }
                 _ => {}
             }
         }
+        allow_reads
     }
 
     #[cfg(feature = "search")]
     fn toggle_search(&mut self) {
-        match &mut self.backend {
-            #[cfg(not(target_arch = "wasm32"))]
-            PaneBackend::Pty(rt) => {
-                if rt.search_bar_mut().open {
-                    rt.close_search();
-                } else {
-                    rt.open_search();
-                }
-            }
-            PaneBackend::Trait(rt) => {
-                if rt.search_bar_mut().open {
-                    rt.close_search();
-                } else {
-                    rt.open_search();
-                }
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            PaneBackend::Error(_) => {}
+        if let Some(rt) = self.runtime_mut() {
+            rt.toggle_search();
         }
     }
 
     #[cfg(feature = "shell-integration")]
     fn jump_to_prompt(&mut self, delta: i32) {
-        match &mut self.backend {
-            #[cfg(not(target_arch = "wasm32"))]
-            PaneBackend::Pty(rt) => {
-                rt.terminal_mut().jump_to_prompt(delta);
-            }
-            PaneBackend::Trait(rt) => {
-                rt.terminal_mut().jump_to_prompt(delta);
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            PaneBackend::Error(_) => {}
+        if let Some(rt) = self.runtime_mut() {
+            rt.jump_to_prompt(delta);
         }
     }
 }
@@ -275,6 +432,7 @@ struct EguiXtermDemoApp {
     next_tab_id: u64,
     auto_cols_draft: u16,
     auto_rows_draft: u16,
+    osc52_reply_draft: String,
 }
 
 impl EguiXtermDemoApp {
@@ -288,6 +446,7 @@ impl EguiXtermDemoApp {
             next_tab_id: 1,
             auto_cols_draft: 80,
             auto_rows_draft: 24,
+            osc52_reply_draft: "egui_xterm clipboard".to_owned(),
         };
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -603,6 +762,27 @@ impl EguiXtermDemoApp {
             }
         }
 
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+            let policy_label = match tab.config.osc52_read_policy {
+                Osc52ReadPolicy::Deny => "Deny",
+                Osc52ReadPolicy::Prompt => "Prompt",
+                Osc52ReadPolicy::Allow => "Allow",
+            };
+            if ui
+                .button(format!("OSC 52 Read: {policy_label}"))
+                .on_hover_text("Cycle OSC 52 clipboard read policy (Deny -> Prompt -> Allow)")
+                .clicked()
+            {
+                tab.config.osc52_read_policy = match tab.config.osc52_read_policy {
+                    Osc52ReadPolicy::Deny => Osc52ReadPolicy::Prompt,
+                    Osc52ReadPolicy::Prompt => Osc52ReadPolicy::Allow,
+                    Osc52ReadPolicy::Allow => Osc52ReadPolicy::Deny,
+                };
+            }
+            ui.checkbox(&mut tab.config.osc52_write_enabled, "OSC 52 Write")
+                .on_hover_text("Allow OSC 52 sequences to write to the host clipboard");
+        }
+
         ui.toggle_value(&mut self.show_showcase_panel, "Showcase");
     }
 
@@ -704,6 +884,11 @@ impl EguiXtermDemoApp {
                     let status = if snap.closed { "Exited" } else { "Running" };
                     ui.label(format!("PTY: {status}"));
                 }
+                #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+                if snap.image_count > 0 {
+                    ui.separator();
+                    ui.label(format!("Images: {}", snap.image_count));
+                }
                 #[cfg(feature = "shell-integration")]
                 {
                     ui.separator();
@@ -721,6 +906,13 @@ impl EguiXtermDemoApp {
                     ));
                 }
             }
+            if let Some(selection) = tab.pending_osc52_read() {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 193, 7),
+                    format!("OSC 52 Pending ({})", clipboard_selection_label(selection)),
+                );
+            }
             if let Some(notification) = &tab.last_notification {
                 ui.separator();
                 ui.label(format!("Notify: {notification}"));
@@ -734,37 +926,93 @@ impl EguiXtermDemoApp {
 }
 
 impl EguiXtermDemoApp {
+    fn find_pending_io_error(&self) -> Option<(usize, String)> {
+        if let Some(tab) = self.tabs.get(self.active_tab_idx)
+            && let Some(msg) = tab.pending_io_error()
+        {
+            return Some((self.active_tab_idx, msg.into_owned()));
+        }
+        self.tabs
+            .iter()
+            .enumerate()
+            .find_map(|(idx, tab)| tab.pending_io_error().map(|msg| (idx, msg.into_owned())))
+    }
+
+    fn find_pending_osc52_read(&self) -> Option<(usize, ClipboardSelection)> {
+        if let Some(tab) = self.tabs.get(self.active_tab_idx)
+            && let Some(sel) = tab.pending_osc52_read()
+        {
+            return Some((self.active_tab_idx, sel));
+        }
+        self.tabs
+            .iter()
+            .enumerate()
+            .find_map(|(idx, tab)| tab.pending_osc52_read().map(|sel| (idx, sel)))
+    }
+
+    fn draw_io_error_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((err_idx, err_msg)) = self.find_pending_io_error() else {
+            return;
+        };
+        let tab_label = self
+            .tabs
+            .get(err_idx)
+            .map_or("Terminal", |t| t.label.as_str());
+        let banner_text = format!("I/O error ({tab_label}): {err_msg}");
+        egui::Panel::top("demo_io_error_banner").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(ui.visuals().error_fg_color, banner_text);
+                if ui.button("Dismiss").clicked()
+                    && let Some(tab) = self.tabs.get_mut(err_idx)
+                {
+                    tab.dismiss_io_error();
+                }
+            });
+        });
+    }
+
+    fn draw_osc52_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((tab_idx, selection)) = self.find_pending_osc52_read() else {
+            return;
+        };
+        let selection_label = clipboard_selection_label(selection);
+        let tab_label = self
+            .tabs
+            .get(tab_idx)
+            .map_or("Terminal", |t| t.label.as_str());
+        let prompt_text = format!("OSC 52 clipboard read ({tab_label} · {selection_label}):");
+
+        egui::Panel::top("demo_osc52_banner").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(255, 193, 7), prompt_text);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.osc52_reply_draft)
+                        .desired_width(180.0)
+                        .hint_text("Clipboard reply text"),
+                );
+                if ui.button("Approve").clicked()
+                    && let Some(tab) = self.tabs.get_mut(tab_idx)
+                    && tab.approve_osc52_read(&self.osc52_reply_draft)
+                {
+                    tab.last_notice = Some(format!("OSC 52 read approved ({selection_label})"));
+                }
+                if ui.button("Deny").clicked()
+                    && let Some(tab) = self.tabs.get_mut(tab_idx)
+                    && tab.deny_osc52_read()
+                {
+                    tab.last_notice = Some(format!("OSC 52 read denied ({selection_label})"));
+                }
+            });
+        });
+    }
+
     fn show_ui(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("demo_toolbar").show(ui, |ui| {
             self.draw_toolbar(ui);
         });
 
-        let banner_error = self
-            .tabs
-            .get(self.active_tab_idx)
-            .and_then(|t| t.last_response.as_ref()?.last_io_error.as_deref())
-            .map(|msg| (self.active_tab_idx, msg.to_owned()))
-            .or_else(|| {
-                self.tabs.iter().enumerate().find_map(|(idx, tab)| {
-                    tab.last_response
-                        .as_ref()?
-                        .last_io_error
-                        .as_ref()
-                        .map(|msg| (idx, msg.clone()))
-                })
-            });
-        if let Some((err_idx, err_msg)) = banner_error {
-            egui::Panel::top("demo_io_error_banner").show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("I/O error: {err_msg}"));
-                    if ui.button("Dismiss").clicked()
-                        && let Some(tab) = self.tabs.get_mut(err_idx)
-                    {
-                        tab.dismiss_io_error();
-                    }
-                });
-            });
-        }
+        self.draw_io_error_banner(ui);
+        self.draw_osc52_banner(ui);
 
         egui::Panel::bottom("demo_status_bar").show(ui, |ui| {
             self.draw_status_bar(ui);
@@ -792,7 +1040,11 @@ impl EguiXtermDemoApp {
                 .min_size(180.0)
                 .show(ui, |ui| {
                     if let Some(tab) = self.tabs.get_mut(left_idx) {
-                        activate_left = tab.show_in_frame(ui, self.active_tab_idx == left_idx);
+                        activate_left = tab.show_in_frame(
+                            ui,
+                            self.active_tab_idx == left_idx,
+                            &mut self.osc52_reply_draft,
+                        );
                     }
                 });
 
@@ -800,7 +1052,11 @@ impl EguiXtermDemoApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     if let Some(tab) = self.tabs.get_mut(right_idx) {
-                        activate_right = tab.show_in_frame(ui, self.active_tab_idx == right_idx);
+                        activate_right = tab.show_in_frame(
+                            ui,
+                            self.active_tab_idx == right_idx,
+                            &mut self.osc52_reply_draft,
+                        );
                     }
                 });
 
@@ -815,7 +1071,7 @@ impl EguiXtermDemoApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     if let Some(tab) = self.tabs.get_mut(active) {
-                        tab.show_in_frame(ui, true);
+                        tab.show_in_frame(ui, true, &mut self.osc52_reply_draft);
                     }
                 });
         }
@@ -842,11 +1098,67 @@ mod tests {
             next_tab_id: 1,
             auto_cols_draft: 80,
             auto_rows_draft: 24,
+            osc52_reply_draft: "egui_xterm clipboard".to_owned(),
         };
         for idx in 0..count {
             app.add_trait_tab(&format!("Tab #{idx}"), TerminalConfig::default());
         }
         app
+    }
+
+    fn make_raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1240.0, 780.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn find_text_rect_in_shapes(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<egui::Rect> {
+        fn visit(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(ts) if ts.galley.job.text.contains(needle) => {
+                    Some(ts.galley.rect.translate(ts.pos.to_vec2()))
+                }
+                egui::Shape::Vec(children) => {
+                    children.iter().find_map(|child| visit(child, needle))
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| visit(&cs.shape, needle))
+    }
+
+    fn click_at(
+        ctx: &egui::Context,
+        app: &mut EguiXtermDemoApp,
+        pos: egui::Pos2,
+    ) -> egui::FullOutput {
+        ctx.run_ui(
+            make_raw_input(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ui| app.show_ui(ui),
+        )
     }
 
     #[test]
@@ -1016,6 +1328,145 @@ mod tests {
                 .as_ref()
                 .and_then(|s| s.last_io_error.as_ref())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn osc52_pending_read_banner_approve_and_deny_controls_roundtrip() {
+        let mut app = test_app_with_tabs(1);
+        app.tabs[0].config.osc52_read_policy = Osc52ReadPolicy::Prompt;
+        app.run_showcase_on_trait_pane("osc52");
+
+        let ctx = egui::Context::default();
+        // Frame 1 processes `osc52` output -> sets pending_osc52_read() and copies write payload.
+        let mut out1 = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        out1.textures_delta.clear();
+        assert_eq!(
+            app.tabs[0].pending_osc52_read(),
+            Some(ClipboardSelection::Clipboard)
+        );
+        assert_eq!(app.osc52_reply_draft, "egui_xterm OSC 52");
+
+        // Frame 2 draws `demo_osc52_banner` with Approve / Deny buttons.
+        app.osc52_reply_draft = "approved-secret".to_owned();
+        let mut out2 = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        let approve_rect = find_text_rect_in_shapes(&out2.shapes, "Approve")
+            .expect("Approve button must render in OSC 52 banner");
+        assert!(
+            find_text_rect_in_shapes(&out2.shapes, "OSC 52 clipboard read").is_some(),
+            "expected OSC 52 prompt label in banner"
+        );
+        out2.textures_delta.clear();
+
+        // Click Approve button -> clears pending read and delivers reply to DemoShellInput.
+        let mut out3 = click_at(&ctx, &mut app, approve_rect.center());
+        out3.textures_delta.clear();
+        assert_eq!(app.tabs[0].pending_osc52_read(), None);
+        assert_eq!(
+            app.tabs[0].last_notice.as_deref(),
+            Some("OSC 52 read approved (Clipboard)")
+        );
+        let PaneBackend::Trait(rt) = &app.tabs[0].backend else {
+            panic!("expected Trait backend");
+        };
+        assert!(
+            rt.terminal()
+                .full_text()
+                .contains("[OSC 52 reply (c)] approved-secret"),
+            "expected approved OSC 52 reply in terminal text: {:?}",
+            rt.terminal().full_text()
+        );
+
+        // Trigger a second OSC 52 Primary read prompt and click Deny.
+        let PaneBackend::Trait(rt) = &mut app.tabs[0].backend else {
+            panic!("expected Trait backend");
+        };
+        rt.terminal_mut().advance(b"\x1b]52;p;?\x07");
+        let mut out4 = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        out4.textures_delta.clear();
+        assert_eq!(
+            app.tabs[0].pending_osc52_read(),
+            Some(ClipboardSelection::Primary)
+        );
+
+        let mut out5 = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        let deny_rect = find_text_rect_in_shapes(&out5.shapes, "Deny")
+            .expect("Deny button must render in OSC 52 banner");
+        out5.textures_delta.clear();
+
+        let mut out6 = click_at(&ctx, &mut app, deny_rect.center());
+        out6.textures_delta.clear();
+        assert_eq!(app.tabs[0].pending_osc52_read(), None);
+        assert_eq!(
+            app.tabs[0].last_notice.as_deref(),
+            Some("OSC 52 read denied (Primary)")
+        );
+        let PaneBackend::Trait(rt) = &app.tabs[0].backend else {
+            panic!("expected Trait backend");
+        };
+        assert!(!rt.terminal().full_text().contains("[OSC 52 reply (p)]"));
+    }
+
+    #[test]
+    fn real_io_error_surfaces_in_banner_and_dismiss_button_clears_runtime() {
+        let mut app = test_app_with_tabs(1);
+        let PaneBackend::Trait(rt) = &mut app.tabs[0].backend else {
+            panic!("expected Trait backend");
+        };
+        rt.input_mut()
+            .inject_io_error(TerminalIoError::message("simulated pipe fault"));
+
+        let ctx = egui::Context::default();
+        // Frame 1 polls DemoShellInput -> runtime records `last_io_error`.
+        let mut out1 = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        out1.textures_delta.clear();
+        assert!(
+            app.tabs[0]
+                .pending_io_error()
+                .is_some_and(|e| e.contains("simulated pipe fault"))
+        );
+
+        // Frame 2 displays `demo_io_error_banner` with Dismiss button.
+        let mut out2 = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        assert!(
+            find_text_rect_in_shapes(&out2.shapes, "simulated pipe fault").is_some(),
+            "expected real I/O error text in banner"
+        );
+        let dismiss_rect = find_text_rect_in_shapes(&out2.shapes, "Dismiss")
+            .expect("Dismiss button must render in I/O error banner");
+        out2.textures_delta.clear();
+
+        // Clicking Dismiss clears both runtime `last_io_error()` and cached snapshot error.
+        let mut out3 = click_at(&ctx, &mut app, dismiss_rect.center());
+        out3.textures_delta.clear();
+        assert!(app.tabs[0].pending_io_error().is_none());
+        let PaneBackend::Trait(rt) = &app.tabs[0].backend else {
+            panic!("expected Trait backend");
+        };
+        assert!(rt.last_io_error().is_none());
+    }
+
+    #[cfg(all(feature = "kitty-graphics", feature = "sixel"))]
+    #[test]
+    fn graphics_showcase_updates_image_count_and_renders_textured_meshes() {
+        let mut app = test_app_with_tabs(1);
+        app.run_showcase_on_trait_pane("graphics");
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        let snap = app.tabs[0].last_response.as_ref().expect("snapshot");
+        assert_eq!(snap.image_count, 2);
+
+        let has_textured_mesh = out.shapes.iter().any(|cs| {
+            matches!(
+                &cs.shape,
+                egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default()
+            )
+        });
+        out.textures_delta.clear();
+        assert!(
+            has_textured_mesh,
+            "expected textured meshes for Kitty & Sixel graphics"
         );
     }
 }
