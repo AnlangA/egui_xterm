@@ -10,7 +10,9 @@
 
 #![forbid(unsafe_code)]
 
-use egui::{Event, ImeEvent, Modifiers, PointerButton, pos2};
+#[cfg(feature = "hyperlinks")]
+use egui::pos2;
+use egui::{Event, ImeEvent, Modifiers, PointerButton};
 use egui_xterm::{TerminalConfig, TerminalEvent, Theme};
 use egui_xterm_core::{
     CoreConfig, MouseButton, MouseEncoding, MouseEventKind, MouseInputEvent, MouseModifiers,
@@ -64,6 +66,10 @@ mod kitty_graphics_e2e {
             let end = (pos + 65535).min(data.len());
             let is_final = end == data.len();
             out.push(u8::from(is_final));
+            #[expect(
+                clippy::expect_used,
+                reason = "test helper: bounded by min(..., 65535)"
+            )]
             let len = u16::try_from(end - pos).expect("chunk fits in u16");
             let nlen = !len;
             out.extend_from_slice(&len.to_le_bytes());
@@ -87,6 +93,7 @@ mod kitty_graphics_e2e {
 
     fn build_minimal_rgba_png(width: u32, height: u32, rgba_pixels: &[u8]) -> Vec<u8> {
         fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            #[expect(clippy::expect_used, reason = "test helper: small test PNG chunks")]
             let len = u32::try_from(data.len()).expect("png chunk fits in u32");
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(kind);
@@ -105,6 +112,7 @@ mod kitty_graphics_e2e {
         ihdr.push(0); // interlace
         push_chunk(&mut out, b"IHDR", &ihdr);
 
+        #[expect(clippy::expect_used, reason = "test helper: small test PNG width")]
         let stride = usize::try_from(width).expect("width fits") * 4;
         let mut scanlines = Vec::new();
         for row in rgba_pixels.chunks_exact(stride) {

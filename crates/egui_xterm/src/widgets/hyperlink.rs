@@ -81,7 +81,7 @@ pub(crate) fn update_hyperlink_interaction(
     });
 
     if allow_click_activation && activation_allowed && clicked_primary {
-        let _ = terminal.activate_hyperlink_at(col, row);
+        terminal.activate_hyperlink_at(col, row);
         ui.ctx().open_url(OpenUrl::new_tab(uri));
     }
 

@@ -1,5 +1,7 @@
 //! Opaque-box end-to-end test harness for `egui_xterm` (Tiers 1–5).
 
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
@@ -15,7 +17,10 @@ use egui::{
 use egui_xterm::{
     TerminalConfig, TerminalInput, TerminalIoError, TerminalResponse, TerminalRuntime, TerminalSize,
 };
-use epaint::{ClippedPrimitive, ClippedShape, Color32, Galley, PaintStats, Primitive, Shape};
+use epaint::{
+    ClippedPrimitive, ClippedShape, Color32, Galley, ImageData, PaintStats, Primitive, Shape,
+    TextureId, textures::TexturesDelta,
+};
 
 // ---------------------------------------------------------------------------
 // Ungated M1 Input Test Doubles & Decorators
@@ -430,6 +435,10 @@ pub struct ShapeInspection {
     pub rect_fills: Vec<(Rect, Color32)>,
     /// Sum of `mesh.vertices.len()` across `Shape::Mesh` entries.
     pub mesh_vertices_total: usize,
+    /// Texture identifiers referenced by `Shape::Mesh` entries in emission order.
+    pub mesh_texture_ids: Vec<TextureId>,
+    /// Clip rectangles associated with captured `ClippedShape` entries in scope.
+    pub clip_rects: Vec<Rect>,
     /// Count of non-transparent/stroked `Shape::Rect` edges not aligned to physical pixels.
     pub non_snapped_rect_count: usize,
     text_fg_colors: Vec<Color32>,
@@ -443,6 +452,7 @@ impl ShapeInspection {
     pub fn from_shapes(shapes: &[ClippedShape], pixels_per_point: f32) -> Self {
         let mut out = Self::default();
         for clipped in shapes {
+            out.clip_rects.push(clipped.clip_rect);
             visit_shape(&clipped.shape, None, pixels_per_point, &mut out);
         }
         out
@@ -457,12 +467,28 @@ impl ShapeInspection {
     ) -> Self {
         let mut out = Self::default();
         for clipped in shapes {
-            visit_shape(
-                &clipped.shape,
-                Some(terminal_rect),
-                pixels_per_point,
-                &mut out,
+            let eff_clip = clipped.clip_rect.intersect(terminal_rect);
+            if !eff_clip.is_positive() {
+                continue;
+            }
+            let before = (
+                out.text_entries.len(),
+                out.rect_count,
+                out.line_count,
+                out.path_count,
+                out.mesh_shape_count,
             );
+            visit_shape(&clipped.shape, Some(eff_clip), pixels_per_point, &mut out);
+            let after = (
+                out.text_entries.len(),
+                out.rect_count,
+                out.line_count,
+                out.path_count,
+                out.mesh_shape_count,
+            );
+            if after != before {
+                out.clip_rects.push(clipped.clip_rect);
+            }
         }
         out
     }
@@ -515,7 +541,17 @@ fn is_pixel_snapped(coord: f32, pixels_per_point: f32) -> bool {
 fn in_scope(bound: Option<Rect>, rect: Rect) -> bool {
     match bound {
         None => true,
-        Some(b) => !rect.is_negative() && b.expand(1e-2).intersects(rect),
+        Some(b) => {
+            if rect.is_negative() {
+                return false;
+            }
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                let inter = b.intersect(rect);
+                inter.width() > 1e-4 && inter.height() > 1e-4
+            } else {
+                b.expand(1e-2).intersects(rect)
+            }
+        }
     }
 }
 
@@ -534,7 +570,12 @@ fn visit_shape(
         Shape::Text(text_shape) => {
             let bounds = text_shape.visual_bounding_rect();
             let pos_rect = Rect::from_min_size(text_shape.pos, egui::Vec2::ZERO);
-            if !in_scope(bound, bounds) && !in_scope(bound, pos_rect) {
+            let scoped = if !bounds.is_negative() && bounds.width() > 0.0 && bounds.height() > 0.0 {
+                in_scope(bound, bounds)
+            } else {
+                in_scope(bound, bounds) || in_scope(bound, pos_rect)
+            };
+            if !scoped {
                 return;
             }
             if let Some(over) = text_shape.override_text_color {
@@ -596,6 +637,7 @@ fn visit_shape(
                 return;
             }
             out.mesh_shape_count += 1;
+            out.mesh_texture_ids.push(mesh.texture_id);
             out.mesh_vertices_total += mesh.vertices.len();
             for v in &mesh.vertices {
                 out.mesh_colors.push(v.color);
@@ -653,6 +695,72 @@ fn accesskit_roles_from(platform_output: &PlatformOutput) -> Vec<Role> {
         .unwrap_or_default()
 }
 
+/// Summary of a single texture upload/update in `egui::FullOutput::textures_delta`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureSetEntry {
+    /// Target `epaint::TextureId`.
+    pub texture_id: TextureId,
+    /// Texture dimensions `[width, height]` in texels.
+    pub size: [usize; 2],
+    /// Deterministic 64-bit FNV-1a hash of the RGBA pixel bytes.
+    pub pixel_hash: u64,
+}
+
+/// Summary of `egui::FullOutput::textures_delta` captured before `drop_without_applying_deltas()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextureDeltaSummary {
+    /// Uploaded or updated texture entries sorted deterministically by texture id.
+    pub set_entries: Vec<TextureSetEntry>,
+    /// Number of texture identifiers queued in `textures_delta.free`.
+    pub freed_count: usize,
+}
+
+impl TextureDeltaSummary {
+    /// Extracts a deterministic summary from `delta`.
+    #[must_use]
+    pub fn from_textures_delta(delta: &TexturesDelta) -> Self {
+        let mut set_entries = Vec::new();
+        for (&texture_id, image_deltas) in &delta.set {
+            for image_delta in image_deltas {
+                let ImageData::Color(color_image) = &image_delta.image;
+                set_entries.push(TextureSetEntry {
+                    texture_id,
+                    size: color_image.size,
+                    pixel_hash: fnv1a_pixels(&color_image.pixels),
+                });
+            }
+        }
+        set_entries.sort_by_key(|entry| {
+            let id_key = match entry.texture_id {
+                TextureId::Managed(id) => (0u8, id),
+                TextureId::User(id) => (1u8, id),
+            };
+            (id_key, entry.size, entry.pixel_hash)
+        });
+        Self {
+            set_entries,
+            freed_count: delta.free.len(),
+        }
+    }
+
+    /// Returns `true` when no textures were uploaded or freed in this frame.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set_entries.is_empty() && self.freed_count == 0
+    }
+}
+
+fn fnv1a_pixels(pixels: &[Color32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for px in pixels {
+        for byte in px.to_array() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
+        }
+    }
+    hash
+}
+
 /// Metadata extracted from a shared `egui::FullOutput` after calling
 /// `full_output.drop_without_applying_deltas()`.
 pub struct FullOutputMeta {
@@ -660,6 +768,8 @@ pub struct FullOutputMeta {
     pub platform_output: PlatformOutput,
     /// Captured clipped shapes from the frame.
     pub shapes: Vec<ClippedShape>,
+    /// Summary of texture uploads and frees captured before dropping deltas.
+    pub texture_deltas: TextureDeltaSummary,
     /// Effective `pixels_per_point` for this frame.
     pub pixels_per_point: f32,
     /// Wall-clock time spent inside `ctx.run_ui`.
@@ -679,11 +789,13 @@ impl FullOutputMeta {
             || ctx.has_requested_repaint();
         let platform_output = full_output.platform_output.clone();
         let shapes = full_output.shapes.clone();
+        let texture_deltas = TextureDeltaSummary::from_textures_delta(&full_output.textures_delta);
         let pixels_per_point = full_output.pixels_per_point;
         full_output.drop_without_applying_deltas();
         Self {
             platform_output,
             shapes,
+            texture_deltas,
             pixels_per_point,
             elapsed,
             repaint_requested,
@@ -775,6 +887,8 @@ pub struct FrameOutcome {
     pub platform_output: PlatformOutput,
     /// Captured clipped shapes.
     pub shapes: Vec<ClippedShape>,
+    /// Summary of texture uploads and frees captured before dropping deltas.
+    pub texture_deltas: TextureDeltaSummary,
     /// Effective `pixels_per_point` for this frame.
     pub pixels_per_point: f32,
     /// Wall-clock time spent inside `ctx.run_ui`.
@@ -789,6 +903,7 @@ impl FrameOutcome {
             terminal_response,
             platform_output: meta.platform_output,
             shapes: meta.shapes,
+            texture_deltas: meta.texture_deltas,
             pixels_per_point: meta.pixels_per_point,
             elapsed: meta.elapsed,
             repaint_requested: meta.repaint_requested,
@@ -949,12 +1064,17 @@ impl<I: TerminalInput> HeadlessTermHarness<I> {
                 captured_resp = Some(layout_fn(ui, &mut self.runtime, &mut self.config));
             },
         );
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness helper: egui::Context::run_ui invokes the closure synchronously"
+        )]
         let resp = captured_resp.expect("layout_fn must invoke terminal runtime");
         let outcome = FrameOutcome::from_meta(resp, meta);
         self.last_outcome = Some(FrameOutcome {
             terminal_response: outcome.terminal_response.clone(),
             platform_output: outcome.platform_output.clone(),
             shapes: outcome.shapes.clone(),
+            texture_deltas: outcome.texture_deltas.clone(),
             pixels_per_point: outcome.pixels_per_point,
             elapsed: outcome.elapsed,
             repaint_requested: outcome.repaint_requested,
@@ -1275,11 +1395,17 @@ impl<A: TerminalInput, B: TerminalInput> MultiPaneHarness<A, B> {
             },
         );
 
-        (
-            left_resp.expect("left pane rendered"),
-            right_resp.expect("right pane rendered"),
-            meta,
-        )
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness helper: egui::Context::run_ui invokes both pane closures synchronously"
+        )]
+        let left = left_resp.expect("left pane rendered");
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness helper: egui::Context::run_ui invokes both pane closures synchronously"
+        )]
+        let right = right_resp.expect("right pane rendered");
+        (left, right, meta)
     }
 }
 
@@ -1578,5 +1704,179 @@ mod tests {
         assert!(inspection.contains_text("PLACEHOLDER_OVERRIDE"));
         assert!(inspection.has_text_fg_color(fallback));
         assert!(!inspection.has_text_fg_color(Color32::PLACEHOLDER));
+    }
+
+    #[test]
+    fn texture_delta_summary_and_mesh_clip_inspection() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 200.0));
+        let term_rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(120.0, 80.0));
+        let tex_red = Color32::from_rgb(200, 30, 40);
+        let tex_blue = Color32::from_rgb(20, 90, 220);
+
+        let mut handle = Some(ctx.load_texture(
+            "unit_test_tex",
+            egui::ColorImage::filled([2, 3], tex_red),
+            egui::TextureOptions::NEAREST,
+        ));
+        let expected_id = handle.as_ref().expect("texture handle created").id();
+
+        let meta1 = run_headless_ui(&ctx, screen_rect, 1.0, 0.0, true, Vec::new(), |ui| {
+            let tex_id = handle.as_ref().expect("texture handle live").id();
+            let mut textured_mesh = epaint::Mesh::with_texture(tex_id);
+            textured_mesh.add_rect_with_uv(
+                Rect::from_min_size(pos2(20.0, 20.0), vec2(20.0, 20.0)),
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            let mut untextured_mesh = epaint::Mesh::default();
+            untextured_mesh.add_colored_rect(
+                Rect::from_min_size(pos2(250.0, 120.0), vec2(30.0, 20.0)),
+                Color32::GREEN,
+            );
+
+            ui.painter_at(term_rect)
+                .add(Shape::Mesh(Arc::new(textured_mesh)));
+            ui.painter().add(Shape::Mesh(Arc::new(untextured_mesh)));
+        });
+
+        let entry1 = meta1
+            .texture_deltas
+            .set_entries
+            .iter()
+            .find(|e| e.texture_id == expected_id)
+            .copied()
+            .expect("uploaded texture must appear in TextureDeltaSummary");
+        assert_eq!(entry1.size, [2, 3]);
+        assert_eq!(meta1.texture_deltas.freed_count, 0);
+        assert!(!meta1.texture_deltas.is_empty());
+
+        let all_insp = meta1.inspect_shapes();
+        assert_eq!(all_insp.mesh_shape_count, 2);
+        assert_eq!(
+            all_insp.mesh_texture_ids,
+            vec![expected_id, TextureId::default()]
+        );
+        assert!(all_insp.clip_rects.contains(&term_rect));
+
+        let scoped_insp =
+            ShapeInspection::from_terminal_shapes(&meta1.shapes, term_rect, meta1.pixels_per_point);
+        assert_eq!(scoped_insp.mesh_shape_count, 1);
+        assert_eq!(scoped_insp.mesh_texture_ids, vec![expected_id]);
+        assert_eq!(scoped_insp.clip_rects, vec![term_rect]);
+
+        // Updating the same TextureHandle produces a different FNV-1a pixel hash.
+        if let Some(h) = handle.as_mut() {
+            h.set(
+                egui::ColorImage::filled([2, 3], tex_blue),
+                egui::TextureOptions::NEAREST,
+            );
+        }
+        let meta2 = run_headless_ui(&ctx, screen_rect, 1.0, 0.1, true, Vec::new(), |_ui| {});
+        let entry2 = meta2
+            .texture_deltas
+            .set_entries
+            .iter()
+            .find(|e| e.texture_id == expected_id)
+            .copied()
+            .expect("updated texture must appear in TextureDeltaSummary");
+        assert_eq!(entry2.size, [2, 3]);
+        assert_ne!(entry1.pixel_hash, entry2.pixel_hash);
+
+        // Dropping the TextureHandle records a freed texture delta on the next frame.
+        drop(handle);
+        let meta3 = run_headless_ui(&ctx, screen_rect, 1.0, 0.2, true, Vec::new(), |_ui| {});
+        assert!(meta3.texture_deltas.freed_count >= 1);
+    }
+
+    #[test]
+    fn from_terminal_shapes_multi_pane_50_50_has_zero_bleed() {
+        let mut harness = MultiPaneHarness::new(
+            ScriptedInput::from_bytes(b"LEFT_PANE"),
+            ScriptedInput::from_bytes(b"RIGHT_PANE"),
+        );
+        let left_bg = [10, 20, 30];
+        let right_bg = [200, 100, 50];
+        harness.left_config.theme.scheme.background = left_bg;
+        harness.right_config.theme.scheme.background = right_bg;
+
+        let (left_resp, right_resp, meta) = harness.run_split_frame();
+        let left_rect = left_resp.response.rect;
+        let right_rect = right_resp.response.rect;
+        assert!(
+            (left_rect.max.x - right_rect.min.x).abs() < 1e-3,
+            "expected shared 50/50 split boundary: left={left_rect:?}, right={right_rect:?}"
+        );
+
+        let left_insp =
+            ShapeInspection::from_terminal_shapes(&meta.shapes, left_rect, meta.pixels_per_point);
+        let right_insp =
+            ShapeInspection::from_terminal_shapes(&meta.shapes, right_rect, meta.pixels_per_point);
+
+        let left_bg_c32 = Color32::from_rgb(left_bg[0], left_bg[1], left_bg[2]);
+        let right_bg_c32 = Color32::from_rgb(right_bg[0], right_bg[1], right_bg[2]);
+        assert!(left_insp.has_rect_or_mesh_color(left_bg_c32));
+        assert!(
+            !left_insp.has_rect_or_mesh_color(right_bg_c32),
+            "right pane background leaked into left pane inspection: clip_rects={:?}",
+            left_insp.clip_rects
+        );
+        assert!(right_insp.has_rect_or_mesh_color(right_bg_c32));
+        assert!(
+            !right_insp.has_rect_or_mesh_color(left_bg_c32),
+            "left pane background leaked into right pane inspection: clip_rects={:?}",
+            right_insp.clip_rects
+        );
+
+        assert!(!left_insp.clip_rects.is_empty());
+        assert!(!right_insp.clip_rects.is_empty());
+        assert!(left_insp.clip_rects.iter().all(|c| {
+            let inter = c.intersect(right_rect);
+            !inter.is_positive()
+        }));
+        assert!(right_insp.clip_rects.iter().all(|c| {
+            let inter = c.intersect(left_rect);
+            !inter.is_positive()
+        }));
+        assert!(
+            left_insp
+                .mesh_vertex_positions()
+                .iter()
+                .all(|p| p.x <= left_rect.max.x + 1e-3)
+        );
+        assert!(
+            right_insp
+                .mesh_vertex_positions()
+                .iter()
+                .all(|p| p.x >= right_rect.min.x - 1e-3)
+        );
+    }
+
+    #[test]
+    fn from_terminal_shapes_excludes_disjoint_clip_rect() {
+        let ctx = Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, vec2(500.0, 500.0));
+        let term_rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 80.0));
+        let disjoint_clip = Rect::from_min_size(pos2(400.0, 400.0), vec2(50.0, 50.0));
+        let edge_touching_clip = Rect::from_min_size(pos2(110.0, 10.0), vec2(50.0, 80.0));
+
+        let meta = run_headless_ui(&ctx, screen_rect, 1.0, 0.0, true, Vec::new(), |ui| {
+            let mut mesh = epaint::Mesh::default();
+            mesh.add_colored_rect(term_rect, Color32::from_rgb(220, 40, 40));
+            ui.painter_at(disjoint_clip)
+                .add(Shape::Mesh(Arc::new(mesh)));
+
+            let mut edge_mesh = epaint::Mesh::default();
+            edge_mesh.add_colored_rect(term_rect, Color32::from_rgb(40, 220, 40));
+            ui.painter_at(edge_touching_clip)
+                .add(Shape::Mesh(Arc::new(edge_mesh)));
+        });
+
+        let insp =
+            ShapeInspection::from_terminal_shapes(&meta.shapes, term_rect, meta.pixels_per_point);
+        assert_eq!(insp.mesh_shape_count, 0);
+        assert!(insp.clip_rects.is_empty());
+        assert!(!insp.has_rect_or_mesh_color(Color32::from_rgb(220, 40, 40)));
+        assert!(!insp.has_rect_or_mesh_color(Color32::from_rgb(40, 220, 40)));
     }
 }

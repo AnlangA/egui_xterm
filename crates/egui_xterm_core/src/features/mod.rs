@@ -61,7 +61,7 @@ pub(crate) fn extract_logical_line_with_spans(
         let mut c = 0usize;
         while c < take_end {
             let cell = cells[c];
-            if cell.is_wide_spacer() || cell.is_wrap_spacer() {
+            if cell.is_wide_spacer() || cell.is_wrap_spacer() || cell.is_sized_spacer() {
                 c += 1;
                 continue;
             }

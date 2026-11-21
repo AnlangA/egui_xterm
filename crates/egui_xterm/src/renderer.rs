@@ -1246,7 +1246,7 @@ impl TerminalRenderer {
         #[cfg(feature = "metrics")]
         terminal.record_frame_rendered(dirty_rows);
         #[cfg(not(feature = "metrics"))]
-        let _ = dirty_rows;
+        let _unused_dirty_rows = dirty_rows;
 
         // Stage 4: Submit batched shapes to clipped painter.
         let painter = ui.painter_at(layout.clip_rect);
@@ -1901,10 +1901,12 @@ fn build_ascii_row_galley(
         }
     };
 
-    let galley = Arc::get_mut(&mut galley_arc).expect("galley exclusively owned");
-    let job = Arc::get_mut(&mut galley.job).expect("job exclusively owned");
-    let placed_row = &mut galley.rows[0];
-    let row = Arc::get_mut(&mut placed_row.row).expect("row exclusively owned");
+    let galley = Arc::make_mut(&mut galley_arc);
+    let job = Arc::make_mut(&mut galley.job);
+    let Some(placed_row) = galley.rows.first_mut() else {
+        return false;
+    };
+    let row = Arc::make_mut(&mut placed_row.row);
 
     let n = slice.len();
     job.text.clear();
@@ -1971,7 +1973,9 @@ fn build_ascii_row_galley(
         }
 
         let idx = (cell.codepoint as usize) - 0x20;
-        let entry = cache.entries[idx].expect("verified cached above");
+        let Some(entry) = cache.entries.get(idx).copied().flatten() else {
+            return false;
+        };
         let x_off = snap_px(offset as f32 * cell_w, ppp);
         last_x_off = x_off;
         last_advance = entry.glyph.advance_width;

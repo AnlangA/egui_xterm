@@ -1,7 +1,7 @@
 //! `OSC 133` prompt & command exit-code gutter overlay (`shell-integration` feature).
 
 use egui::{Color32, Mesh, Pos2, Rect, Vec2, pos2};
-use egui_xterm_core::{RenderSnapshot, ShellZone, ZoneKind};
+use egui_xterm_core::{RenderSnapshot, ShellZonesView, ZoneKind};
 
 use crate::layout::{snap_px, snap_rect, snap_size_at_least_1px};
 
@@ -10,7 +10,7 @@ use crate::layout::{snap_px, snap_rect, snap_size_at_least_1px};
 pub(crate) fn paint_prompt_gutter(
     overlay_mesh: &mut Mesh,
     snapshot: &RenderSnapshot<'_>,
-    zones: &[ShellZone],
+    zones: ShellZonesView<'_>,
     origin: Pos2,
     cell_size: Vec2,
     ppp: f32,

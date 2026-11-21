@@ -94,10 +94,14 @@ impl DemoShellInput {
     fn push_welcome(&mut self, title: &str) {
         let mut out = String::new();
         // OSC 0 window title + OSC 7 initial working directory.
-        let _ = write!(
+        if write!(
             out,
             "\x1b]0;{title}\x07\x1b]7;file://localhost/workspace/demo\x07"
-        );
+        )
+        .is_err()
+        {
+            // `String`'s `fmt::Write` impl is infallible.
+        }
         out.push_str(
             "\x1b[1;36megui_xterm\x1b[0m — Clean-Room Trait-Driven Console (`TerminalInput`)\r\n",
         );
@@ -112,17 +116,19 @@ impl DemoShellInput {
         self.command_seq = self.command_seq.saturating_add(1);
         let mut out = String::new();
         // Emit OSC 133;D (if previous command finished) -> OSC 133;A -> prompt -> OSC 133;B.
-        if self.command_seq > 1 {
-            let _ = write!(out, "\x1b]133;D;{last_exit_code}\x07");
+        if self.command_seq > 1 && write!(out, "\x1b]133;D;{last_exit_code}\x07").is_err() {
+            // `String`'s `fmt::Write` impl is infallible.
         }
         out.push_str("\x1b]133;A\x07");
         if last_exit_code == 0 {
             out.push_str("\x1b[1;32mdemo\x1b[0m \x1b[34m~/egui_xterm\x1b[0m \x1b[1;35m>\x1b[0m ");
-        } else {
-            let _ = write!(
-                out,
-                "\x1b[1;31m[{last_exit_code}]\x1b[0m \x1b[1;32mdemo\x1b[0m \x1b[34m~/egui_xterm\x1b[0m \x1b[1;31m>\x1b[0m "
-            );
+        } else if write!(
+            out,
+            "\x1b[1;31m[{last_exit_code}]\x1b[0m \x1b[1;32mdemo\x1b[0m \x1b[34m~/egui_xterm\x1b[0m \x1b[1;31m>\x1b[0m "
+        )
+        .is_err()
+        {
+            // `String`'s `fmt::Write` impl is infallible.
         }
         out.push_str("\x1b]133;B\x07");
         self.push_str(&out);
@@ -324,10 +330,14 @@ impl DemoShellInput {
             }
             other => {
                 let mut msg = String::new();
-                let _ = write!(
+                if write!(
                     msg,
                     "\x1b[33mecho:\x1b[0m {other}\r\n\x1b[2m(type 'help' for built-in showcase commands)\x1b[0m\r\n"
-                );
+                )
+                .is_err()
+                {
+                    // `String`'s `fmt::Write` impl is infallible.
+                }
                 self.push_str(&msg);
                 0
             }
@@ -339,7 +349,9 @@ impl DemoShellInput {
     fn emit_help(&mut self) {
         let mut out = String::from("\x1b[1;36mBuilt-in Showcase Commands:\x1b[0m\r\n");
         for (name, desc) in SHOWCASE_COMMANDS {
-            let _ = write!(out, "  \x1b[1;33m{name:<9}\x1b[0m {desc}\r\n");
+            if write!(out, "  \x1b[1;33m{name:<9}\x1b[0m {desc}\r\n").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         out.push_str(
             "\x1b[1;36mShortcuts:\x1b[0m Ctrl+Shift+C copy | Ctrl+Shift+V paste | Ctrl+Shift+F find | Shift+Drag select\r\n",
@@ -350,18 +362,24 @@ impl DemoShellInput {
     fn emit_colors(&mut self) {
         let mut out = String::from("\x1b[1mANSI 16:\x1b[0m ");
         for code in 0..8 {
-            let _ = write!(out, "\x1b[4{code}m  \x1b[0m");
+            if write!(out, "\x1b[4{code}m  \x1b[0m").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         out.push(' ');
         for code in 0..8 {
-            let _ = write!(out, "\x1b[10{code}m  \x1b[0m");
+            if write!(out, "\x1b[10{code}m  \x1b[0m").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         out.push_str("\r\n\x1b[1mTrueColor:\x1b[0m ");
         for step in 0..48u8 {
             let r = step.saturating_mul(5);
             let g = 255u8.saturating_sub(r);
             let b = 128u8.wrapping_add(step.saturating_mul(2));
-            let _ = write!(out, "\x1b[48;2;{r};{g};{b}m \x1b[0m");
+            if write!(out, "\x1b[48;2;{r};{g};{b}m \x1b[0m").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         out.push_str(
             "\r\n\x1b[1mSGR:\x1b[0m \x1b[1mBold\x1b[0m \x1b[2mDim\x1b[0m \x1b[3mItalic\x1b[0m \
@@ -417,21 +435,29 @@ impl DemoShellInput {
     fn emit_size(&mut self) {
         let sz = self.last_size;
         let mut out = String::new();
-        let _ = writeln!(
+        if writeln!(
             out,
             "Latest TerminalSize: {}x{} cols/rows ({}x{} px)\r",
             sz.cols, sz.rows, sz.pixel_width, sz.pixel_height
-        );
+        )
+        .is_err()
+        {
+            // `String`'s `fmt::Write` impl is infallible.
+        }
         self.push_str(&out);
     }
 
     fn emit_scroll(&mut self) {
         let mut out = String::new();
         for idx in 1..=120u32 {
-            let _ = write!(
+            if write!(
                 out,
                 "[{idx:03}/120] Scrollback line #{idx} — egui_xterm ring buffer & search target\r\n"
-            );
+            )
+            .is_err()
+            {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         self.push_str(&out);
     }
@@ -508,7 +534,7 @@ fn pop_last_grapheme_width(line_buf: &mut String) -> usize {
         cluster_width = cluster_width.max(unicode_width_approx(ch));
 
         if line_buf.ends_with('\u{200D}') {
-            let _ = line_buf.pop();
+            line_buf.pop(); // strip trailing ZWJ so the joined cluster replaces it
             cluster_width = 2;
             continue;
         }
@@ -520,7 +546,7 @@ fn pop_last_grapheme_width(line_buf: &mut String) -> usize {
                 .take_while(|c| is_regional_indicator(*c))
                 .count();
             if trailing_ri % 2 == 1 {
-                let _ = line_buf.pop();
+                line_buf.pop(); // pair two regional indicators into one flag cluster
                 cluster_width = 2;
             }
         }

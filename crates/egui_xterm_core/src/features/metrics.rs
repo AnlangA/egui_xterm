@@ -14,6 +14,15 @@ pub struct TerminalMetrics {
     pub dirty_rows_rendered: u64,
     /// Total primary-grid resize/reflow operations executed.
     pub reflow_count: u64,
+    /// Total CSI sequences dispatched by the VT parser.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub csi_sequences: u64,
+    /// Total OSC sequences dispatched by the VT parser.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub osc_sequences: u64,
+    /// Total `HyperlinkPool` garbage-collection sweeps executed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hyperlink_gc_runs: u64,
 }
 
 impl TerminalMetrics {
@@ -25,6 +34,9 @@ impl TerminalMetrics {
             frames_rendered: 0,
             dirty_rows_rendered: 0,
             reflow_count: 0,
+            csi_sequences: 0,
+            osc_sequences: 0,
+            hyperlink_gc_runs: 0,
         }
     }
 
@@ -44,6 +56,21 @@ impl TerminalMetrics {
     /// Records a terminal resize/reflow operation.
     pub(crate) fn record_reflow(&mut self) {
         self.reflow_count = self.reflow_count.saturating_add(1);
+    }
+
+    /// Records a dispatched CSI sequence.
+    pub(crate) fn record_csi(&mut self) {
+        self.csi_sequences = self.csi_sequences.saturating_add(1);
+    }
+
+    /// Records a dispatched OSC sequence.
+    pub(crate) fn record_osc(&mut self) {
+        self.osc_sequences = self.osc_sequences.saturating_add(1);
+    }
+
+    /// Records a `HyperlinkPool` garbage-collection sweep.
+    pub(crate) fn record_hyperlink_gc(&mut self) {
+        self.hyperlink_gc_runs = self.hyperlink_gc_runs.saturating_add(1);
     }
 }
 
@@ -83,5 +110,32 @@ mod tests {
         assert_eq!(term.metrics().bytes_processed, 17);
         assert_eq!(term.metrics().frames_rendered, 2);
         assert_eq!(term.metrics().reflow_count, 1);
+    }
+
+    #[test]
+    fn metrics_csi_osc_hyperlink_gc_counters_and_saturation() {
+        let mut m = super::TerminalMetrics::new();
+        assert_eq!(m, super::TerminalMetrics::default());
+        assert_eq!(m.csi_sequences, 0);
+        assert_eq!(m.osc_sequences, 0);
+        assert_eq!(m.hyperlink_gc_runs, 0);
+
+        m.record_csi();
+        m.record_csi();
+        m.record_osc();
+        m.record_hyperlink_gc();
+        assert_eq!(m.csi_sequences, 2);
+        assert_eq!(m.osc_sequences, 1);
+        assert_eq!(m.hyperlink_gc_runs, 1);
+
+        m.csi_sequences = u64::MAX;
+        m.osc_sequences = u64::MAX;
+        m.hyperlink_gc_runs = u64::MAX;
+        m.record_csi();
+        m.record_osc();
+        m.record_hyperlink_gc();
+        assert_eq!(m.csi_sequences, u64::MAX);
+        assert_eq!(m.osc_sequences, u64::MAX);
+        assert_eq!(m.hyperlink_gc_runs, u64::MAX);
     }
 }

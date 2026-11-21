@@ -1133,10 +1133,10 @@ mod stage_m4_kitty {
 
         let mut term_rect = egui::Rect::NOTHING;
         let _ = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("before");
+            drop(ui.button("before"));
             let resp = runtime.show_with_config(ui, config);
             term_rect = resp.response.rect;
-            let _ = ui.button("after");
+            drop(ui.button("after"));
             resp
         });
         let center = term_rect.center();
@@ -1144,9 +1144,9 @@ mod stage_m4_kitty {
         h.inject_pointer_button(center, egui::PointerButton::Primary, true, Modifiers::NONE);
         h.inject_pointer_button(center, egui::PointerButton::Primary, false, Modifiers::NONE);
         let focused = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("before");
+            drop(ui.button("before"));
             let resp = runtime.show_with_config(ui, config);
-            let _ = ui.button("after");
+            drop(ui.button("after"));
             resp
         });
         assert!(focused.terminal_response.response.has_focus());
@@ -1154,9 +1154,9 @@ mod stage_m4_kitty {
         // Settle 1 frame after focus gain so egui's Memory::set_focus_lock_filter (which requires
         // had_focus_last_frame(id) == true) is armed before Tab/Escape/ArrowUp arrive.
         let settled = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("before");
+            drop(ui.button("before"));
             let resp = runtime.show_with_config(ui, config);
-            let _ = ui.button("after");
+            drop(ui.button("after"));
             resp
         });
         assert!(settled.terminal_response.response.has_focus());
@@ -1168,9 +1168,9 @@ mod stage_m4_kitty {
         h.tap_key(Key::K, Modifiers::CTRL | Modifiers::SHIFT);
 
         let after = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("before");
+            drop(ui.button("before"));
             let resp = runtime.show_with_config(ui, config);
-            let _ = ui.button("after");
+            drop(ui.button("after"));
             resp
         });
         assert!(after.terminal_response.response.has_focus());

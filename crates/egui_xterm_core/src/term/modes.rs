@@ -114,6 +114,9 @@ pub struct Modes {
     pub color_scheme_updates: bool,
     /// `DECKPAM` / `DECKPNM` (`ESC =` / `ESC >`): application keypad mode.
     pub app_keypad: bool,
+    /// xterm `modifyOtherKeys` level (`0` = disabled, `1` = enabled, `2` = always; `CSI > 4 ; Pv m`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub modify_other_keys: u8,
 }
 
 impl Default for Modes {
@@ -148,6 +151,7 @@ impl Modes {
             grapheme_clustering: true,
             color_scheme_updates: false,
             app_keypad: false,
+            modify_other_keys: 0,
         }
     }
 
@@ -166,6 +170,7 @@ impl Modes {
         self.grapheme_clustering = true;
         self.color_scheme_updates = false;
         self.app_keypad = false;
+        self.modify_other_keys = 0;
     }
 
     /// Returns the `DECRQM` (`CSI ? Ps $ p`) reply code (`1` = set, `2` = reset, `0` = unknown).

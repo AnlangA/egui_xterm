@@ -1132,6 +1132,7 @@ dependencies = [
 name = "egui_xterm_pty"
 version = "0.1.1"
 dependencies = [
+ "criterion",
  "egui_xterm_core",
  "portable-pty",
 ]

@@ -4,7 +4,7 @@
 use egui::{
     Event, FontFamily, FontId, Key, Pos2, Rect, Role, Sense, Ui, Vec2, WidgetInfo, pos2, vec2,
 };
-use egui_xterm_core::{Terminal, TerminalInput, TerminalSize};
+use egui_xterm_core::{Terminal, TerminalInput, TerminalIoError, TerminalSize};
 
 use crate::config::{ScaleMode, TerminalConfig};
 
@@ -118,6 +118,7 @@ pub(crate) struct FrameLayout {
     pub effective_font_size: f32,
     pub pixels_per_point: f32,
     pub resized_this_frame: bool,
+    pub io_error: Option<TerminalIoError>,
 }
 
 fn measure_cell(ctx: &egui::Context, font_size: f32, ppp: f32) -> (f32, Vec2) {
@@ -294,7 +295,7 @@ impl TerminalLayoutState {
             grid_size.x.min(avail_w.max(0.0)),
             grid_size.y.min(avail_h.max(0.0)),
         );
-        let _ = ui.allocate_space(space_size);
+        ui.allocate_space(space_size);
 
         let id = ui.make_persistent_id(id_salt);
         let clamped_interact = term_rect.intersect(clip_rect);
@@ -395,7 +396,7 @@ impl TerminalLayoutState {
         }
         let term_size = TerminalSize::with_pixels(cols, rows, pixel_width, pixel_height);
 
-        self.propagate_backend_resize(
+        let io_error = self.propagate_backend_resize(
             ui.ctx(),
             input,
             term_size,
@@ -414,6 +415,7 @@ impl TerminalLayoutState {
             effective_font_size,
             pixels_per_point: ppp,
             resized_this_frame,
+            io_error,
         }
     }
 
@@ -424,7 +426,7 @@ impl TerminalLayoutState {
         term_size: TerminalSize,
         debounce_secs: f64,
         now_secs: f64,
-    ) {
+    ) -> Option<TerminalIoError> {
         let debounce = if debounce_secs.is_finite() && debounce_secs > 0.0 {
             debounce_secs.min(MAX_DEBOUNCE_SECS)
         } else {
@@ -433,24 +435,25 @@ impl TerminalLayoutState {
 
         if self.last_sent_size.is_none() {
             // First frame: send initial terminal size immediately so PTY/backend knows starting dimensions.
-            let _ = input.resize(term_size);
+            let io_error = input.resize(term_size).err();
             self.last_sent_size = Some(term_size);
             self.pending_resize = None;
-            return;
+            return io_error;
         }
 
         if debounce == 0.0 {
+            let mut io_error = None;
             if self.last_sent_size != Some(term_size) {
-                let _ = input.resize(term_size);
+                io_error = input.resize(term_size).err();
                 self.last_sent_size = Some(term_size);
             }
             self.pending_resize = None;
-            return;
+            return io_error;
         }
 
         if Some(term_size) == self.last_sent_size {
             self.pending_resize = None;
-            return;
+            return None;
         }
 
         let safe_now = if now_secs.is_finite() { now_secs } else { 0.0 };
@@ -462,14 +465,16 @@ impl TerminalLayoutState {
                     debounce
                 };
                 if elapsed >= debounce {
-                    let _ = input.resize(term_size);
+                    let io_error = input.resize(term_size).err();
                     self.last_sent_size = Some(term_size);
                     self.pending_resize = None;
+                    io_error
                 } else {
                     let remaining = (debounce - elapsed).clamp(0.001, MAX_DEBOUNCE_SECS);
                     if remaining.is_finite() {
                         ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
                     }
+                    None
                 }
             }
             _ => {
@@ -478,6 +483,7 @@ impl TerminalLayoutState {
                 if wait.is_finite() {
                     ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
                 }
+                None
             }
         }
     }

@@ -382,7 +382,7 @@ pub fn extract_text(grid: &Grid, selection: &Selection) -> Option<String> {
         if let Some((c0, c1)) = selection.row_col_range(abs, row) {
             let cells = row.cells();
             for cell in &cells[c0..=c1] {
-                if cell.is_wide_spacer() || cell.is_wrap_spacer() {
+                if cell.is_wide_spacer() || cell.is_wrap_spacer() || cell.is_sized_spacer() {
                     continue;
                 }
                 if cell.extra_id != 0
@@ -410,4 +410,51 @@ pub fn extract_text(grid: &Grid, selection: &Selection) -> Option<String> {
     }
 
     Some(out)
+}
+
+/// Returns `true` if [`extract_text`] would produce a non-empty string, without allocating.
+#[must_use]
+pub(crate) fn has_non_empty_text(grid: &Grid, selection: &Selection) -> bool {
+    let (start, start_past_eol, end, _) = selection.ordered_endpoints_with_eol();
+    let lo = start.line.0.max(grid.oldest_abs_line().0);
+    let hi = end.line.0.min(grid.newest_abs_line().0);
+    if lo > hi {
+        return false;
+    }
+    if lo == hi && start.line.0 == lo && start_past_eol {
+        return false;
+    }
+
+    let is_block = selection.mode == SelectionMode::Block;
+    for abs_u64 in lo..=hi {
+        let abs = AbsLine(abs_u64);
+        if abs == start.line && start_past_eol {
+            continue;
+        }
+        let Some(row) = grid.row_by_abs(abs) else {
+            continue;
+        };
+        if abs_u64 < hi && (!row.soft_wrapped() || is_block) {
+            return true;
+        }
+        if let Some((c0, c1)) = selection.row_col_range(abs, row) {
+            let cells = row.cells();
+            for cell in &cells[c0..=c1] {
+                if cell.is_wide_spacer() || cell.is_wrap_spacer() || cell.is_sized_spacer() {
+                    continue;
+                }
+                if cell.codepoint != ' ' {
+                    return true;
+                }
+                if cell.extra_id != 0
+                    && let Some(ext) = grid.cell_extra(cell.extra_id)
+                    && !ext.combining.is_empty()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }

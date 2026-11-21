@@ -4,7 +4,7 @@ use crate::cell::{CellFlags, HyperlinkId};
 use crate::color::PackedColor;
 use crate::term::modes::CursorStyle;
 
-/// Character set designation for G0/G1 slots.
+/// Character set designation for G0–G3 slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Charset {
@@ -13,14 +13,24 @@ pub enum Charset {
     Ascii,
     /// VT100 DEC Special Graphics line-drawing set (`ESC ( 0`).
     DecSpecialGraphics,
+    /// British National Replacement Character Set (`ESC ( A`, maps `#` to `£`).
+    Uk,
 }
 
 impl Charset {
-    /// Translates `ch` according to this charset (`0x5F..=0x7E` when [`Self::DecSpecialGraphics`]).
+    /// Translates `ch` according to this charset (`0x5F..=0x7E` when [`Self::DecSpecialGraphics`],
+    /// `#` to `£` when [`Self::Uk`]).
     #[must_use]
     pub const fn map_char(self, ch: char) -> char {
         match self {
             Self::Ascii => ch,
+            Self::Uk => {
+                if ch == '#' {
+                    '\u{00A3}'
+                } else {
+                    ch
+                }
+            }
             Self::DecSpecialGraphics => match ch {
                 '_' => '\u{00A0}',
                 '`' => '\u{25C6}',
@@ -60,28 +70,106 @@ impl Charset {
     }
 }
 
-/// Active G0/G1 charset slots and GL selector (`SO`/`SI`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg(feature = "serde")]
+const fn default_gr_slot() -> u8 {
+    2
+}
+
+/// Active G0–G3 charset slots, GL/GR selectors (`SO`/`SI`/`LS2`/`LS3`/`LS1R`–`LS3R`),
+/// and pending `SS2`/`SS3` single-shift slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CharsetSlots {
     /// Designated G0 character set (`ESC ( ...`).
     pub g0: Charset,
-    /// Designated G1 character set (`ESC ) ...`).
+    /// Designated G1 character set (`ESC ) ...` / `ESC - ...`).
     pub g1: Charset,
-    /// `true` when GL invokes G1 (`SO`, `0x0E`), `false` for G0 (`SI`, `0x0F`).
-    pub gl_is_g1: bool,
+    /// Designated G2 character set (`ESC * ...` / `ESC . ...`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub g2: Charset,
+    /// Designated G3 character set (`ESC + ...` / `ESC / ...`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub g3: Charset,
+    /// Active GL slot index (`0..=3` for G0–G3).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gl: u8,
+    /// Active GR slot index (`0..=3` for G0–G3; default `2`).
+    #[cfg_attr(feature = "serde", serde(default = "default_gr_slot"))]
+    pub gr: u8,
+    /// Pending ISO 2022 single-shift slot (`Some(2)` for `SS2`, `Some(3)` for `SS3`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub single_shift: Option<u8>,
+}
+
+impl Default for CharsetSlots {
+    fn default() -> Self {
+        Self {
+            g0: Charset::Ascii,
+            g1: Charset::Ascii,
+            g2: Charset::Ascii,
+            g3: Charset::Ascii,
+            gl: 0,
+            gr: 2,
+            single_shift: None,
+        }
+    }
 }
 
 impl CharsetSlots {
+    /// Returns the [`Charset`] designated into slot `idx` (`0..=3`).
+    #[must_use]
+    pub const fn slot(self, idx: u8) -> Charset {
+        match idx {
+            0 => self.g0,
+            1 => self.g1,
+            2 => self.g2,
+            _ => self.g3,
+        }
+    }
+
     /// Returns the currently active GL character set.
     #[must_use]
     pub const fn active(self) -> Charset {
-        if self.gl_is_g1 { self.g1 } else { self.g0 }
+        self.slot(self.gl)
     }
 
-    /// Translates `ch` through the active GL character set.
+    /// Returns the currently active GR character set.
     #[must_use]
-    pub const fn translate(self, ch: char) -> char {
+    pub const fn active_gr(self) -> Charset {
+        self.slot(self.gr)
+    }
+
+    /// Returns `true` when an `SS2`/`SS3` single shift is pending for the next printable character.
+    #[must_use]
+    pub const fn has_single_shift(self) -> bool {
+        self.single_shift.is_some()
+    }
+
+    /// Selects GL slot `slot` (`0..=3`).
+    pub fn set_gl(&mut self, slot: u8) {
+        self.gl = slot.min(3);
+    }
+
+    /// Selects GR slot `slot` (`0..=3`).
+    pub fn set_gr(&mut self, slot: u8) {
+        self.gr = slot.min(3);
+    }
+
+    /// Arms a single-shift (`Some(2)` for `SS2`, `Some(3)` for `SS3`).
+    pub fn set_single_shift(&mut self, slot: u8) {
+        self.single_shift = Some(slot.min(3));
+    }
+
+    /// Clears any unconsumed `SS2`/`SS3` single-shift state.
+    pub fn clear_single_shift(&mut self) {
+        self.single_shift = None;
+    }
+
+    /// Translates `ch` through the pending single-shift slot (consuming it) or active GL charset.
+    pub fn translate(&mut self, ch: char) -> char {
+        if let Some(ss) = self.single_shift.take() {
+            return self.slot(ss).map_char(ch);
+        }
         self.active().map_char(ch)
     }
 }
@@ -94,7 +182,7 @@ pub struct CursorAttrs {
     pub fg: PackedColor,
     /// Background color (also used for Background Color Erase).
     pub bg: PackedColor,
-    /// Visual SGR attribute flags (`CellFlags::SGR_MASK`).
+    /// Visual SGR attribute flags (`CellFlags::SGR_MASK`) plus `CellFlags::PROTECTED`.
     pub flags: CellFlags,
     /// Optional `SGR 58` underline color override.
     pub underline_color: Option<PackedColor>,
@@ -103,18 +191,32 @@ pub struct CursorAttrs {
 }
 
 impl CursorAttrs {
-    /// Resets visual SGR attributes (`fg`, `bg`, `flags`, `underline_color`) while preserving
-    /// any active `OSC 8` hyperlink.
+    /// Returns `true` when `DECSCA` character protection is active.
+    #[must_use]
+    pub const fn is_protected(&self) -> bool {
+        self.flags.contains(CellFlags::PROTECTED)
+    }
+
+    /// Sets or clears `DECSCA` character protection (`CellFlags::PROTECTED`).
+    pub fn set_protected(&mut self, protected: bool) {
+        self.flags.set(CellFlags::PROTECTED, protected);
+    }
+
+    /// Resets visual SGR attributes (`fg`, `bg`, `SGR_MASK`, `underline_color`) while preserving
+    /// any active `OSC 8` hyperlink and `DECSCA` protection.
     pub fn reset_sgr(&mut self) {
+        self.fg = PackedColor::Default;
+        self.bg = PackedColor::Default;
+        self.flags &= CellFlags::PROTECTED;
+        self.underline_color = None;
+    }
+
+    /// Resets all cursor attributes including `DECSCA` protection and hyperlinks.
+    pub fn reset_all(&mut self) {
         self.fg = PackedColor::Default;
         self.bg = PackedColor::Default;
         self.flags = CellFlags::empty();
         self.underline_color = None;
-    }
-
-    /// Resets all cursor attributes including hyperlinks.
-    pub fn reset_all(&mut self) {
-        self.reset_sgr();
         self.hyperlink_id = None;
     }
 }

@@ -216,10 +216,10 @@ impl TerminalTab {
         match &mut self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             PaneBackend::Pty(rt) => {
-                let _ = rt.terminal_mut().jump_to_prompt(delta);
+                rt.terminal_mut().jump_to_prompt(delta);
             }
             PaneBackend::Trait(rt) => {
-                let _ = rt.terminal_mut().jump_to_prompt(delta);
+                rt.terminal_mut().jump_to_prompt(delta);
             }
             #[cfg(not(target_arch = "wasm32"))]
             PaneBackend::Error(_) => {}
@@ -259,7 +259,7 @@ impl EguiXtermDemoApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = cc;
+            let _unused_cc = cc;
             app.add_trait_tab("Trait Demo", TerminalConfig::default());
             app.add_trait_tab("Trait Console #2", TerminalConfig::default());
         }
@@ -713,7 +713,7 @@ impl EguiXtermDemoApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     if let Some(tab) = self.tabs.get_mut(active) {
-                        let _ = tab.show_in_frame(ui, true);
+                        tab.show_in_frame(ui, true);
                     }
                 });
         }

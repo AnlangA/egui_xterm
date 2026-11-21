@@ -237,6 +237,80 @@ pub struct Theme {
     pub bold_is_bright: bool,
 }
 
+/// Special SGR attribute color overrides configured via `OSC 5` / `OSC 105`.
+///
+/// Register indices follow xterm `OSC 5`: `0` = bold, `1` = underline, `2` = blink,
+/// `3` = reverse, `4` = italic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SpecialColors {
+    /// Bold attribute foreground override (`OSC 5 ; 0`).
+    pub bold: Option<[u8; 3]>,
+    /// Underline attribute foreground override (`OSC 5 ; 1`).
+    pub underline: Option<[u8; 3]>,
+    /// Blink attribute foreground override (`OSC 5 ; 2`).
+    pub blink: Option<[u8; 3]>,
+    /// Reverse attribute color override (`OSC 5 ; 3`).
+    pub reverse: Option<[u8; 3]>,
+    /// Italic attribute foreground override (`OSC 5 ; 4`).
+    pub italic: Option<[u8; 3]>,
+}
+
+impl SpecialColors {
+    /// Returns the special color override at register `index` (`0..=4`), or `None` if out of range.
+    #[must_use]
+    pub const fn get(&self, index: usize) -> Option<[u8; 3]> {
+        match index {
+            0 => self.bold,
+            1 => self.underline,
+            2 => self.blink,
+            3 => self.reverse,
+            4 => self.italic,
+            _ => None,
+        }
+    }
+
+    /// Sets or clears register `index` (`0..=4`), returning `true` if `index <= 4` and the value changed.
+    pub fn set(&mut self, index: usize, value: Option<[u8; 3]>) -> bool {
+        let slot = match index {
+            0 => &mut self.bold,
+            1 => &mut self.underline,
+            2 => &mut self.blink,
+            3 => &mut self.reverse,
+            4 => &mut self.italic,
+            _ => return false,
+        };
+        if *slot == value {
+            return false;
+        }
+        *slot = value;
+        true
+    }
+
+    /// Clears all five special color registers, returning `true` if any was previously set.
+    pub fn clear(&mut self) -> bool {
+        let any_set = self.bold.is_some()
+            || self.underline.is_some()
+            || self.blink.is_some()
+            || self.reverse.is_some()
+            || self.italic.is_some();
+        *self = Self::default();
+        any_set
+    }
+
+    /// Converts all five registers (`0..=4`) into a fixed array for [`RenderSnapshot`](crate::RenderSnapshot).
+    #[must_use]
+    pub const fn as_array(&self) -> [Option<[u8; 3]>; 5] {
+        [
+            self.bold,
+            self.underline,
+            self.blink,
+            self.reverse,
+            self.italic,
+        ]
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::dark()

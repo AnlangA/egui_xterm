@@ -502,6 +502,7 @@ impl Grid {
         self.dirty.resize(new_rows);
         self.damage_epoch += 1;
         self.content_epoch += 1;
+        self.mark_dirty_abs(self.oldest_abs_line());
 
         let oldest_abs = self.oldest_abs_line();
         let bottom_row_abs = AbsLine(self.total_evicted + (new_rows - 1) as u64);
@@ -748,6 +749,7 @@ impl Grid {
             self.dirty.resize(new_rows);
             self.damage_epoch += 1;
             self.content_epoch += 1;
+            self.mark_dirty_abs(self.oldest_abs_line());
             return (
                 ReflowResult {
                     cursor_row: new_cursor_row,
@@ -854,10 +856,30 @@ impl Grid {
             push_grid_point(&mut tracked, AnchorKind::Extra(i), pt, false, is_pw);
         }
 
-        let old_rows_vec: Vec<Row> = self.rows.drain(..).collect();
+        let mut old_rows_vec: Vec<Row> = self.rows.drain(..).collect();
         let mut new_rows_vec: Vec<Row> = Vec::with_capacity(old_rows_vec.len());
         let mut logical: Vec<LogicalGlyph> = Vec::with_capacity(old_cols * 2);
         let mut scratch = String::new();
+
+        // Pre-sort active anchors by (buf_row, col) so every logical line scans only its O(k) slice.
+        let mut sorted_anchors: Vec<usize> = tracked
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, a)| (!a.already_evicted && a.blank_offset == 0).then_some(idx))
+            .collect();
+        sorted_anchors.sort_unstable_by_key(|&idx| (tracked[idx].buf_row, tracked[idx].col));
+        let mut anchor_cursor = 0usize;
+
+        // Recycle Vec<Cell> allocations across row_pool and consumed old rows.
+        let pool_cap = self.row_pool_cap.max(128);
+        let mut cell_vec_pool: Vec<Vec<Cell>> = Vec::with_capacity(pool_cap);
+        for mut row in self.row_pool.drain(..) {
+            let cells = row.take_cells();
+            if cells.capacity() > 0 && cell_vec_pool.len() < pool_cap {
+                cell_vec_pool.push(cells);
+            }
+        }
+
         let mut phys_start = 0usize;
 
         while phys_start < old_rows_vec.len() {
@@ -866,17 +888,59 @@ impl Grid {
                 phys_end += 1;
             }
 
-            logical.clear();
-            let mut active_anchors: Vec<usize> = Vec::new();
-            for (idx, a) in tracked.iter().enumerate() {
-                if !a.already_evicted
-                    && a.blank_offset == 0
-                    && a.buf_row >= phys_start
-                    && a.buf_row <= phys_end
-                {
-                    active_anchors.push(idx);
+            while anchor_cursor < sorted_anchors.len()
+                && tracked[sorted_anchors[anchor_cursor]].buf_row < phys_start
+            {
+                anchor_cursor += 1;
+            }
+            let active_start = anchor_cursor;
+            while anchor_cursor < sorted_anchors.len()
+                && tracked[sorted_anchors[anchor_cursor]].buf_row <= phys_end
+            {
+                anchor_cursor += 1;
+            }
+            let active_slice = &mut sorted_anchors[active_start..anchor_cursor];
+
+            // In-place fast path for non-wrapped single rows whose trimmed content fits `new_cols`.
+            if phys_start == phys_end
+                && !old_rows_vec[phys_start].soft_wrapped()
+                && old_cols > 1
+                && new_cols > 1
+            {
+                let take_end = old_rows_vec[phys_start].trimmed_len();
+                let fast_ok = take_end <= new_cols
+                    && active_slice.iter().all(|&idx| {
+                        let a = &tracked[idx];
+                        !a.is_pending_wrap && (a.past_eol || a.col < new_cols)
+                    });
+                if fast_ok {
+                    self.damage_epoch += 1;
+                    let epoch = self.damage_epoch;
+                    let row_idx = new_rows_vec.len();
+                    for &a_idx in active_slice.iter() {
+                        let a = &mut tracked[a_idx];
+                        if a.past_eol {
+                            a.mapped_row = row_idx;
+                            a.mapped_col = new_cols;
+                            a.mapped_past_eol = true;
+                            a.mapped_pending_wrap = false;
+                        } else {
+                            a.mapped_row = row_idx;
+                            a.mapped_col = a.col;
+                            a.mapped_past_eol = false;
+                            a.mapped_pending_wrap = false;
+                        }
+                    }
+                    let mut row = std::mem::replace(&mut old_rows_vec[phys_start], Row::new(0, 0));
+                    row.resize_cols_in_place_fast(new_cols, epoch, take_end);
+                    new_rows_vec.push(row);
+                    phys_start = phys_end + 1;
+                    continue;
                 }
             }
+
+            logical.clear();
+            let mut col_cursor = 0usize;
 
             for (r, old_row) in old_rows_vec
                 .iter()
@@ -884,6 +948,12 @@ impl Grid {
                 .take(phys_end + 1)
                 .skip(phys_start)
             {
+                while col_cursor < active_slice.len()
+                    && tracked[active_slice[col_cursor]].buf_row < r
+                {
+                    col_cursor += 1;
+                }
+
                 let cells = old_row.cells();
                 let take_end = if r < phys_end {
                     if old_cols > 0 && cells[old_cols - 1].is_wrap_spacer() {
@@ -891,6 +961,14 @@ impl Grid {
                     } else {
                         old_cols
                     }
+                } else if old_row.soft_wrapped()
+                    && old_cols > 0
+                    && cells[old_cols - 1].is_wrap_spacer()
+                {
+                    cells[..old_cols - 1]
+                        .iter()
+                        .rposition(|c| !c.is_empty())
+                        .map_or(0, |idx| idx + 1)
                 } else {
                     old_row.trimmed_len()
                 };
@@ -902,6 +980,19 @@ impl Grid {
                         c += 1;
                         continue;
                     }
+
+                    while col_cursor < active_slice.len()
+                        && tracked[active_slice[col_cursor]].buf_row == r
+                        && tracked[active_slice[col_cursor]].col < c
+                    {
+                        let a = &mut tracked[active_slice[col_cursor]];
+                        if a.past_eol {
+                            a.target_glyph = usize::MAX;
+                            a.trailing_delta = 0;
+                        }
+                        col_cursor += 1;
+                    }
+
                     if cell.is_wide_lead() && c + 1 < take_end && cells[c + 1].is_wide_spacer() {
                         let glyph_idx = logical.len();
                         let mut clean = cell;
@@ -912,26 +1003,31 @@ impl Grid {
                             cell: clean,
                             width: 2,
                         });
-                        for &a_idx in &active_anchors {
-                            let a = &mut tracked[a_idx];
-                            if !a.past_eol && a.buf_row == r {
-                                if a.is_pending_wrap && c + 1 == take_end - 1 && a.col == c + 1 {
-                                    if r == phys_end {
-                                        // Anchor in pending_wrap after trailing wide char on full row.
-                                        a.target_glyph = usize::MAX;
-                                        a.trailing_delta = 0;
-                                    } else {
-                                        a.target_glyph = glyph_idx + 1;
-                                        a.is_trailing_wide = false;
-                                    }
-                                } else if a.col == c {
-                                    a.target_glyph = glyph_idx;
+                        while col_cursor < active_slice.len()
+                            && tracked[active_slice[col_cursor]].buf_row == r
+                            && tracked[active_slice[col_cursor]].col <= c + 1
+                        {
+                            let a = &mut tracked[active_slice[col_cursor]];
+                            if a.past_eol {
+                                a.target_glyph = usize::MAX;
+                                a.trailing_delta = 0;
+                            } else if a.is_pending_wrap && c + 1 == take_end - 1 && a.col == c + 1 {
+                                if r == phys_end {
+                                    // Anchor in pending_wrap after trailing wide char on full row.
+                                    a.target_glyph = usize::MAX;
+                                    a.trailing_delta = 0;
+                                } else {
+                                    a.target_glyph = glyph_idx + 1;
                                     a.is_trailing_wide = false;
-                                } else if a.col == c + 1 {
-                                    a.target_glyph = glyph_idx;
-                                    a.is_trailing_wide = true;
                                 }
+                            } else if a.col == c {
+                                a.target_glyph = glyph_idx;
+                                a.is_trailing_wide = false;
+                            } else {
+                                a.target_glyph = glyph_idx;
+                                a.is_trailing_wide = true;
                             }
+                            col_cursor += 1;
                         }
                         c += 2;
                     } else {
@@ -946,51 +1042,65 @@ impl Grid {
                             CellFlags::WIDE_LEAD | CellFlags::WIDE_SPACER | CellFlags::WRAP_SPACER,
                         );
                         logical.push(LogicalGlyph { cell: clean, width });
-                        for &a_idx in &active_anchors {
-                            let a = &mut tracked[a_idx];
-                            if !a.past_eol && a.buf_row == r && a.col == c {
-                                if a.is_pending_wrap && c == take_end - 1 {
-                                    if r == phys_end {
-                                        a.target_glyph = usize::MAX;
-                                        a.trailing_delta = 0;
-                                    } else {
-                                        a.target_glyph = glyph_idx + 1;
-                                        a.is_trailing_wide = false;
-                                    }
+                        while col_cursor < active_slice.len()
+                            && tracked[active_slice[col_cursor]].buf_row == r
+                            && tracked[active_slice[col_cursor]].col == c
+                        {
+                            let a = &mut tracked[active_slice[col_cursor]];
+                            if a.past_eol {
+                                a.target_glyph = usize::MAX;
+                                a.trailing_delta = 0;
+                            } else if a.is_pending_wrap && c == take_end - 1 {
+                                if r == phys_end {
+                                    a.target_glyph = usize::MAX;
+                                    a.trailing_delta = 0;
                                 } else {
-                                    a.target_glyph = glyph_idx;
+                                    a.target_glyph = glyph_idx + 1;
                                     a.is_trailing_wide = false;
                                 }
+                            } else {
+                                a.target_glyph = glyph_idx;
+                                a.is_trailing_wide = false;
                             }
+                            col_cursor += 1;
                         }
                         c += 1;
                     }
                 }
 
-                for &a_idx in &active_anchors {
-                    let a = &mut tracked[a_idx];
-                    if a.buf_row == r && a.past_eol {
+                while col_cursor < active_slice.len()
+                    && tracked[active_slice[col_cursor]].buf_row == r
+                {
+                    let a = &mut tracked[active_slice[col_cursor]];
+                    if a.past_eol {
                         a.target_glyph = usize::MAX;
                         a.trailing_delta = 0;
-                    } else if a.buf_row == r && a.col >= take_end {
-                        if r < phys_end {
-                            a.target_glyph = logical.len();
-                            a.is_trailing_wide = false;
+                    } else if r < phys_end {
+                        a.target_glyph = logical.len();
+                        a.is_trailing_wide = false;
+                    } else {
+                        a.target_glyph = usize::MAX;
+                        a.trailing_delta = if a.is_pending_wrap {
+                            a.col - take_end + 1
                         } else {
-                            a.target_glyph = usize::MAX;
-                            a.trailing_delta = if a.is_pending_wrap {
-                                a.col - take_end + 1
-                            } else {
-                                a.col - take_end
-                            };
-                        }
+                            a.col - take_end
+                        };
                     }
+                    col_cursor += 1;
+                }
+            }
+
+            // Immediately recycle consumed physical cell vectors for subsequent output rows.
+            for old_row in old_rows_vec.iter_mut().take(phys_end + 1).skip(phys_start) {
+                let cells = old_row.take_cells();
+                if cells.capacity() > 0 && cell_vec_pool.len() < pool_cap {
+                    cell_vec_pool.push(cells);
                 }
             }
 
             // Normalize target_glyph == usize::MAX to logical.len().
             let end_glyph = logical.len();
-            for &a_idx in &active_anchors {
+            for &a_idx in active_slice.iter() {
                 if tracked[a_idx].target_glyph == usize::MAX {
                     tracked[a_idx].target_glyph = end_glyph;
                 }
@@ -1000,7 +1110,7 @@ impl Grid {
             if logical.is_empty() {
                 let base_row_idx = new_rows_vec.len();
                 let mut extra_blank_rows = 0usize;
-                for &a_idx in &active_anchors {
+                for &a_idx in active_slice.iter() {
                     let a = &mut tracked[a_idx];
                     if a.kind == AnchorKind::Cursor {
                         let total_pos = a.trailing_delta;
@@ -1022,7 +1132,7 @@ impl Grid {
                         }
                     }
                 }
-                for &a_idx in &active_anchors {
+                for &a_idx in active_slice.iter() {
                     let a = &mut tracked[a_idx];
                     if a.kind != AnchorKind::Cursor {
                         if a.past_eol {
@@ -1050,49 +1160,77 @@ impl Grid {
                 for r_i in 0..=extra_blank_rows {
                     self.damage_epoch += 1;
                     let epoch = self.damage_epoch;
-                    let mut out = Self::alloc_reflow_row(&mut self.row_pool, new_cols, epoch);
-                    out.set_soft_wrapped(r_i < extra_blank_rows);
-                    new_rows_vec.push(out);
+                    let cells = Self::acquire_cells(&mut cell_vec_pool, new_cols);
+                    new_rows_vec.push(Row::from_parts(
+                        cells,
+                        r_i < extra_blank_rows,
+                        epoch,
+                        false,
+                        0,
+                    ));
                 }
             } else {
+                if active_slice.len() > 1 {
+                    active_slice.sort_unstable_by_key(|&idx| tracked[idx].target_glyph);
+                }
+                let mut rewrap_cursor = 0usize;
+
                 self.damage_epoch += 1;
                 let mut epoch = self.damage_epoch;
-                let mut cur_cells = vec![Cell::BLANK; new_cols];
+                let mut cur_cells = Self::acquire_cells(&mut cell_vec_pool, new_cols);
+                let mut cur_has_extras = false;
+                let mut cur_trimmed_len = 0usize;
                 let mut out_col = 0usize;
 
                 for (g_idx, g) in logical.iter().enumerate() {
                     let w = if new_cols == 1 { 1 } else { g.width };
                     if w == 1 {
                         if out_col == new_cols {
-                            let mut finished =
-                                Self::alloc_reflow_row(&mut self.row_pool, new_cols, epoch);
-                            finished.replace_cells(cur_cells, true, epoch);
-                            new_rows_vec.push(finished);
+                            new_rows_vec.push(Row::from_parts(
+                                cur_cells,
+                                true,
+                                epoch,
+                                cur_has_extras,
+                                cur_trimmed_len,
+                            ));
                             self.damage_epoch += 1;
                             epoch = self.damage_epoch;
-                            cur_cells = vec![Cell::BLANK; new_cols];
+                            cur_cells = Self::acquire_cells(&mut cell_vec_pool, new_cols);
+                            cur_has_extras = false;
+                            cur_trimmed_len = 0;
                             out_col = 0;
                         }
                         let row_idx = new_rows_vec.len();
                         cur_cells[out_col] = g.cell;
-                        for &a_idx in &active_anchors {
-                            let a = &mut tracked[a_idx];
-                            if a.target_glyph == g_idx {
-                                a.mapped_row = row_idx;
-                                a.mapped_col = out_col;
-                                a.mapped_pending_wrap = false;
-                            }
+                        if g.cell.has_extra() {
+                            cur_has_extras = true;
+                        }
+                        if !g.cell.is_empty() {
+                            cur_trimmed_len = out_col + 1;
+                        }
+                        while rewrap_cursor < active_slice.len()
+                            && tracked[active_slice[rewrap_cursor]].target_glyph == g_idx
+                        {
+                            let a = &mut tracked[active_slice[rewrap_cursor]];
+                            a.mapped_row = row_idx;
+                            a.mapped_col = out_col;
+                            a.mapped_pending_wrap = false;
+                            rewrap_cursor += 1;
                         }
                         out_col += 1;
                     } else {
                         if out_col == new_cols {
-                            let mut finished =
-                                Self::alloc_reflow_row(&mut self.row_pool, new_cols, epoch);
-                            finished.replace_cells(cur_cells, true, epoch);
-                            new_rows_vec.push(finished);
+                            new_rows_vec.push(Row::from_parts(
+                                cur_cells,
+                                true,
+                                epoch,
+                                cur_has_extras,
+                                cur_trimmed_len,
+                            ));
                             self.damage_epoch += 1;
                             epoch = self.damage_epoch;
-                            cur_cells = vec![Cell::BLANK; new_cols];
+                            cur_cells = Self::acquire_cells(&mut cell_vec_pool, new_cols);
+                            cur_has_extras = false;
                             out_col = 0;
                         } else if out_col == new_cols - 1 {
                             cur_cells[new_cols - 1] = Cell::new(
@@ -1101,13 +1239,17 @@ impl Grid {
                                 PackedColor::Default,
                                 CellFlags::WRAP_SPACER,
                             );
-                            let mut finished =
-                                Self::alloc_reflow_row(&mut self.row_pool, new_cols, epoch);
-                            finished.replace_cells(cur_cells, true, epoch);
-                            new_rows_vec.push(finished);
+                            new_rows_vec.push(Row::from_parts(
+                                cur_cells,
+                                true,
+                                epoch,
+                                cur_has_extras,
+                                new_cols,
+                            ));
                             self.damage_epoch += 1;
                             epoch = self.damage_epoch;
-                            cur_cells = vec![Cell::BLANK; new_cols];
+                            cur_cells = Self::acquire_cells(&mut cell_vec_pool, new_cols);
+                            cur_has_extras = false;
                             out_col = 0;
                         }
                         let row_idx = new_rows_vec.len();
@@ -1117,25 +1259,31 @@ impl Grid {
                             ' ',
                             lead.fg,
                             lead.bg,
-                            CellFlags::WIDE_SPACER | (lead.flags & CellFlags::SGR_MASK),
+                            CellFlags::WIDE_SPACER | (lead.flags & CellFlags::WRITE_ATTR_MASK),
                         );
                         cur_cells[out_col] = lead;
                         cur_cells[out_col + 1] = spacer;
-                        for &a_idx in &active_anchors {
-                            let a = &mut tracked[a_idx];
-                            if a.target_glyph == g_idx {
-                                a.mapped_row = row_idx;
-                                a.mapped_col = out_col + usize::from(a.is_trailing_wide);
-                                a.mapped_pending_wrap = false;
-                            }
+                        if lead.has_extra() {
+                            cur_has_extras = true;
+                        }
+                        cur_trimmed_len = out_col + 2;
+                        while rewrap_cursor < active_slice.len()
+                            && tracked[active_slice[rewrap_cursor]].target_glyph == g_idx
+                        {
+                            let a = &mut tracked[active_slice[rewrap_cursor]];
+                            a.mapped_row = row_idx;
+                            a.mapped_col = out_col + usize::from(a.is_trailing_wide);
+                            a.mapped_pending_wrap = false;
+                            rewrap_cursor += 1;
                         }
                         out_col += 2;
                     }
                 }
 
                 let final_row_idx = new_rows_vec.len();
+                let tail_anchors = &active_slice[rewrap_cursor..];
                 let mut extra_blank_rows = 0usize;
-                for &a_idx in &active_anchors {
+                for &a_idx in tail_anchors {
                     let a = &mut tracked[a_idx];
                     if a.target_glyph == end_glyph && a.kind == AnchorKind::Cursor {
                         let total_pos = out_col + a.trailing_delta;
@@ -1157,7 +1305,7 @@ impl Grid {
                         }
                     }
                 }
-                for &a_idx in &active_anchors {
+                for &a_idx in tail_anchors {
                     let a = &mut tracked[a_idx];
                     if a.target_glyph == end_glyph && a.kind != AnchorKind::Cursor {
                         if a.past_eol {
@@ -1183,29 +1331,38 @@ impl Grid {
                     }
                 }
 
-                let mut final_row = Self::alloc_reflow_row(&mut self.row_pool, new_cols, epoch);
-                final_row.replace_cells(cur_cells, extra_blank_rows > 0, epoch);
-                new_rows_vec.push(final_row);
+                new_rows_vec.push(Row::from_parts(
+                    cur_cells,
+                    extra_blank_rows > 0,
+                    epoch,
+                    cur_has_extras,
+                    cur_trimmed_len,
+                ));
                 for r_i in 0..extra_blank_rows {
                     self.damage_epoch += 1;
                     epoch = self.damage_epoch;
-                    let mut cont = Self::alloc_reflow_row(&mut self.row_pool, new_cols, epoch);
-                    cont.set_soft_wrapped(r_i + 1 < extra_blank_rows);
-                    new_rows_vec.push(cont);
+                    let blank_cells = Self::acquire_cells(&mut cell_vec_pool, new_cols);
+                    new_rows_vec.push(Row::from_parts(
+                        blank_cells,
+                        r_i + 1 < extra_blank_rows,
+                        epoch,
+                        false,
+                        0,
+                    ));
                 }
             }
 
             phys_start = phys_end + 1;
         }
 
-        // Recycle old_rows_vec shells into row_pool without freeing extras (they moved bitwise).
-        for mut row in old_rows_vec {
-            row.cells_mut().fill(Cell::BLANK);
-            row.set_soft_wrapped(false);
-            row.clear_may_have_extras();
-            if self.row_pool.len() < self.row_pool_cap {
-                self.row_pool.push(row);
+        // Return leftover recycled cell buffers to row_pool without touching extras (moved bitwise).
+        for mut cells in cell_vec_pool {
+            if self.row_pool.len() >= self.row_pool_cap {
+                break;
             }
+            cells.fill(Cell::BLANK);
+            self.row_pool
+                .push(Row::from_parts(cells, false, 0, false, 0));
         }
 
         let total_new = new_rows_vec.len();
@@ -1237,6 +1394,7 @@ impl Grid {
         self.dirty.resize(new_rows);
         self.damage_epoch += 1;
         self.content_epoch += 1;
+        self.mark_dirty_abs(self.oldest_abs_line());
 
         let last_kept_buf_row = (total_new - 1) - evict_count;
         let has_blank_tail = total_new < new_rows;
@@ -1378,19 +1536,13 @@ impl Grid {
         )
     }
 
-    fn alloc_reflow_row(row_pool: &mut Vec<Row>, cols: usize, generation: u64) -> Row {
-        if let Some(mut r) = row_pool.pop() {
-            r.cells_mut().fill(Cell::BLANK);
-            r.set_soft_wrapped(false);
-            r.set_generation(generation);
-            if r.len() != cols {
-                let mut v = r.take_cells();
-                v.resize(cols, Cell::BLANK);
-                r.replace_cells(v, false, generation);
-            }
-            r
+    fn acquire_cells(pool: &mut Vec<Vec<Cell>>, cols: usize) -> Vec<Cell> {
+        if let Some(mut v) = pool.pop() {
+            v.resize(cols, Cell::BLANK);
+            v.fill(Cell::BLANK);
+            v
         } else {
-            Row::new(cols, generation)
+            vec![Cell::BLANK; cols]
         }
     }
 }
@@ -1450,6 +1602,7 @@ mod tests {
             combining: vec!['\u{0301}'],
             underline_color: Some(PackedColor::rgb(255, 0, 0)),
             hyperlink_id: None,
+            text_sizing: None,
         };
         grid.write_cell(
             0,
@@ -1789,5 +1942,158 @@ mod tests {
         assert_eq!(alt.viewport_row(0).unwrap().text(alt.extras()), "abc");
         alt.debug_verify_extra_invariants();
         alt.debug_verify_wide_invariants();
+    }
+
+    #[test]
+    fn reflow_sorted_anchors_and_fast_path_preserve_points_and_protected_flags() {
+        use crate::cell::TextSizing;
+
+        let mut grid = Grid::new(ScreenKind::Primary, 12, 4, 2000);
+        let mut extra_points = Vec::new();
+        for i in 0..600 {
+            let line_idx = i;
+            if i % 3 == 0 {
+                // Non-wrapped short line eligible for fast path when widening.
+                grid.write_ascii_slice(
+                    3,
+                    0,
+                    b"short",
+                    PackedColor::Default,
+                    PackedColor::Default,
+                    CellFlags::PROTECTED,
+                );
+            } else {
+                // Longer line that wraps when narrowing to 6 cols.
+                grid.write_ascii_slice(
+                    3,
+                    0,
+                    b"abcdefghij",
+                    PackedColor::Default,
+                    PackedColor::Default,
+                    CellFlags::empty(),
+                );
+                grid.write_cell(
+                    3,
+                    10,
+                    Cell::new(
+                        'X',
+                        PackedColor::Default,
+                        PackedColor::Default,
+                        CellFlags::PROTECTED,
+                    ),
+                    Some(CellExtra {
+                        text_sizing: Some(TextSizing::default()),
+                        ..CellExtra::default()
+                    }),
+                    PackedColor::Default,
+                );
+            }
+            let abs = grid.live_viewport_to_abs(3);
+            extra_points.push(GridPoint::new(abs, 0));
+            extra_points.push(GridPoint::new(abs, 7));
+            if line_idx + 1 < 600 {
+                grid.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+            }
+        }
+
+        // Reverse order to verify sorted_anchors handles unsorted extra_points cleanly.
+        extra_points.reverse();
+        let res_narrow = grid.resize(
+            6,
+            4,
+            ReflowAnchors {
+                cursor_row: 3,
+                cursor_col: 10,
+                pending_wrap: false,
+                selection: None,
+                extra_points,
+            },
+        );
+        grid.debug_verify_extra_invariants();
+        grid.debug_verify_wide_invariants();
+        assert_eq!(res_narrow.extra_points.len(), 1200);
+        // Point at col 7 of the last (i = 599, i % 3 == 2 -> "abcdefghijX") wrapped to next row col 1.
+        let p_last_col7 = res_narrow.extra_points[0].unwrap();
+        let p_last_col0 = res_narrow.extra_points[1].unwrap();
+        assert_eq!(p_last_col0.col, 0);
+        assert_eq!(p_last_col7.col, 1);
+        assert_eq!(p_last_col7.line.0, p_last_col0.line.0 + 1);
+
+        // Widen to 20 cols -> fast path triggers for non-wrapped lines and unwraps wrapped lines.
+        let remapped_in: Vec<GridPoint> = res_narrow.extra_points.into_iter().flatten().collect();
+        let res_wide = grid.resize(
+            20,
+            4,
+            ReflowAnchors {
+                cursor_row: res_narrow.cursor_row,
+                cursor_col: res_narrow.cursor_col,
+                pending_wrap: res_narrow.pending_wrap,
+                selection: None,
+                extra_points: remapped_in,
+            },
+        );
+        grid.debug_verify_extra_invariants();
+        grid.debug_verify_wide_invariants();
+        let w_col7 = res_wide.extra_points[0].unwrap();
+        let w_col0 = res_wide.extra_points[1].unwrap();
+        assert_eq!(w_col0.line, w_col7.line);
+        assert_eq!(w_col7.col, 7);
+        let row_last = grid.row_by_abs(w_col0.line).unwrap();
+        assert_eq!(row_last.text(grid.extras()), "abcdefghijX");
+        assert!(row_last.cells()[10].is_protected());
+        assert!(
+            grid.extras()
+                .get(row_last.cells()[10].extra_id)
+                .unwrap()
+                .text_sizing
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reflow_trailing_soft_wrapped_row_skips_fast_path_and_clears_wrap() {
+        // Trailing soft-wrapped row with no following row (e.g. after erasing trailing blank rows
+        // or snapshot restore) must not enter `resize_cols_in_place_fast`.
+        let mut grid = Grid::new(ScreenKind::Primary, 5, 3, 10);
+        write_ascii_line(&mut grid, 0, "abcd");
+        grid.set_wrap_spacer(0, PackedColor::Default);
+        assert!(grid.viewport_row(0).unwrap().soft_wrapped());
+
+        let res = grid.resize(
+            10,
+            3,
+            ReflowAnchors {
+                cursor_row: 0,
+                cursor_col: 4,
+                pending_wrap: false,
+                selection: None,
+                extra_points: Vec::new(),
+            },
+        );
+        assert_eq!(res.cursor_row, 0);
+        assert_eq!(grid.viewport_row(0).unwrap().text(grid.extras()), "abcd");
+        assert!(!grid.viewport_row(0).unwrap().soft_wrapped());
+        grid.debug_verify_wide_invariants();
+        grid.debug_verify_extra_invariants();
+
+        // Also verify trailing soft-wrapped row without WRAP_SPACER when narrowing & widening.
+        grid.set_row_soft_wrapped(0, true);
+        let res2 = grid.resize(
+            6,
+            3,
+            ReflowAnchors {
+                cursor_row: 0,
+                cursor_col: 2,
+                pending_wrap: false,
+                selection: None,
+                extra_points: Vec::new(),
+            },
+        );
+        assert_eq!(res2.cursor_row, 0);
+        assert_eq!(res2.cursor_col, 2);
+        assert_eq!(grid.viewport_row(0).unwrap().text(grid.extras()), "abcd");
+        assert!(!grid.viewport_row(0).unwrap().soft_wrapped());
+        grid.debug_verify_wide_invariants();
+        grid.debug_verify_extra_invariants();
     }
 }

@@ -17,9 +17,9 @@ pub mod term;
 
 pub use crate::cell::{
     Cell, CellExtra, CellFlags, Hyperlink, HyperlinkId, HyperlinkPool, MAX_HYPERLINK_ID_BYTES,
-    MAX_HYPERLINK_URI_BYTES, UnderlineStyle,
+    MAX_HYPERLINK_URI_BYTES, TextSizing, UnderlineStyle,
 };
-pub use crate::color::{ColorScheme, PackedColor, Theme};
+pub use crate::color::{ColorScheme, PackedColor, SpecialColors, Theme};
 #[cfg(feature = "hyperlinks")]
 pub use crate::features::hyperlinks::{HyperlinkInfo, HyperlinkSpan};
 #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
@@ -29,14 +29,14 @@ pub use crate::features::inline_images::{
 #[cfg(feature = "kitty-keyboard")]
 pub use crate::features::kitty_keyboard::{
     KITTY_STACK_CAP, KittyEventType, KittyKey, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers,
-    encode_kitty_key,
+    ModifyOtherKeys, encode_kitty_key, encode_kitty_key_into, encode_modify_other_keys_into,
 };
 #[cfg(feature = "metrics")]
 pub use crate::features::metrics::TerminalMetrics;
 #[cfg(feature = "search")]
-pub use crate::features::search::{SearchError, SearchMatch, SearchQuery};
+pub use crate::features::search::{SearchError, SearchMatch, SearchQuery, SearchStepProgress};
 #[cfg(feature = "shell-integration")]
-pub use crate::features::shell_integration::{ShellZone, ZoneKind};
+pub use crate::features::shell_integration::{ShellZone, ShellZonesIter, ShellZonesView, ZoneKind};
 pub use crate::grid::{
     AbsLine, CellExtraTable, DirtyTracker, Grid, GridPoint, ROW_POOL_CAP, ReflowAnchors,
     ReflowResult, Row, ScreenKind, ViewportPos,
@@ -50,7 +50,9 @@ pub use crate::term::TerminalSnapshot;
 pub use crate::term::{
     CellSnapshot, Charset, CharsetSlots, ClipboardSelection, CoreConfig, Cursor, CursorAttrs,
     CursorShape, CursorSnapshot, CursorStyle, Modes, MouseButton, MouseEncoding, MouseEventKind,
-    MouseInputEvent, MouseModifiers, MouseProtocol, PaletteOverrides, RenderSnapshot, SavedCursor,
-    Selection, SelectionKind, SelectionMode, TabStops, Terminal, TerminalEvent, encode_mouse_event,
-    encode_mouse_event_pixels, focus_event_bytes, format_paste_bytes,
+    MouseInputEvent, MouseModifiers, MouseProtocol, Osc52ReadPolicy, PaletteOverrides,
+    RenderSnapshot, SavedCursor, Selection, SelectionKind, SelectionMode, TabStops, Terminal,
+    TerminalEvent, TerminalState, VisibleRowsIter, VisibleRowsView, encode_mouse_event,
+    encode_mouse_event_into, encode_mouse_event_pixels, encode_mouse_event_pixels_into,
+    focus_event_bytes, format_paste_bytes, format_paste_bytes_into,
 };

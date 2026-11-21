@@ -44,7 +44,7 @@ pub(crate) struct InputMapperState {
 /// Output produced by [`InputMapperState::process_frame_events`].
 pub(crate) struct InputFrameOutcome {
     pub bytes_to_write: Vec<u8>,
-    #[cfg_attr(not(feature = "hyperlinks"), allow(dead_code))]
+    #[cfg(feature = "hyperlinks")]
     pub clean_primary_click: bool,
     pub any_user_activity: bool,
     #[cfg(feature = "search")]
@@ -105,6 +105,7 @@ impl InputMapperState {
     ) -> InputFrameOutcome {
         let mut out = InputFrameOutcome {
             bytes_to_write: Vec::new(),
+            #[cfg(feature = "hyperlinks")]
             clean_primary_click: false,
             any_user_activity: false,
             #[cfg(feature = "search")]
@@ -453,9 +454,13 @@ impl InputMapperState {
                                     }
                                 } else if self.click_count == 1 && !context_menu_open {
                                     terminal.selection_clear();
+                                    #[cfg(feature = "hyperlinks")]
                                     if in_bounds && !over_overlay && !scrollbar_pointer_active {
                                         out.clean_primary_click = true;
                                     }
+                                    #[cfg(not(feature = "hyperlinks"))]
+                                    let (_in_bounds, _over_overlay, _scrollbar_pointer_active) =
+                                        (in_bounds, over_overlay, scrollbar_pointer_active);
                                 }
                                 continue;
                             }
@@ -764,7 +769,7 @@ impl InputMapperState {
                     ..
                 } => {
                     #[cfg(not(feature = "kitty-keyboard"))]
-                    let _ = repeat;
+                    let _unused_repeat = repeat;
                     // Check for an immediately following Event::Text so Kitty Flag 16 and legacy
                     // shortcut suppression stay synchronized without double-sending.
                     let paired_text = if *pressed {
@@ -935,8 +940,10 @@ fn handle_copy_shortcut(
 pub(crate) fn copy_text_everywhere(ui: &Ui, text: String) {
     #[cfg(all(feature = "native-clipboard", not(target_arch = "wasm32")))]
     {
-        if let Ok(mut cb) = arboard::Clipboard::new() {
-            let _ = cb.set_text(text.clone());
+        if let Ok(mut cb) = arboard::Clipboard::new()
+            && cb.set_text(text.clone()).is_err()
+        {
+            // Best-effort native clipboard write; `ui.ctx().copy_text` below is authoritative.
         }
     }
     ui.ctx().copy_text(text);

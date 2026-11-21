@@ -71,7 +71,207 @@ enum ActivePhase {
     },
 }
 
-const ZONES_HEAD_COMPACT_THRESHOLD: usize = 1024;
+#[inline]
+fn adjust_zone(mut z: ShellZone, oldest: AbsLine, max_line: usize) -> ShellZone {
+    let start_line = usize::try_from(z.start_abs.line.0.saturating_sub(oldest.0))
+        .unwrap_or(0)
+        .min(max_line);
+    let end_line = usize::try_from(z.end_abs.line.0.saturating_sub(oldest.0))
+        .unwrap_or(start_line)
+        .clamp(start_line, max_line);
+    z.start_line = start_line;
+    z.end_line = end_line;
+    z
+}
+
+#[inline]
+fn adjust_zone_unbounded(mut z: ShellZone, oldest: AbsLine) -> ShellZone {
+    let start_line = usize::try_from(z.start_abs.line.0.saturating_sub(oldest.0)).unwrap_or(0);
+    let end_line = usize::try_from(z.end_abs.line.0.saturating_sub(oldest.0)).unwrap_or(start_line);
+    z.start_line = start_line;
+    z.end_line = end_line.max(start_line);
+    z
+}
+
+/// Read-only view of retained `OSC 133` [`ShellZone`]s with `O(1)` length and `O(log Z)` range queries.
+#[derive(Debug, Clone, Copy)]
+pub struct ShellZonesView<'a> {
+    front: &'a [ShellZone],
+    back: &'a [ShellZone],
+    oldest: AbsLine,
+    max_line: usize,
+    has_out_of_order: bool,
+}
+
+impl<'a> ShellZonesView<'a> {
+    /// Returns the number of retained shell zones in `O(1)`.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.front.len() + self.back.len()
+    }
+
+    /// Returns `true` if no shell zones are retained.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.front.is_empty() && self.back.is_empty()
+    }
+
+    /// Returns the `idx`-th shell zone with line coordinates normalized to the current grid.
+    #[must_use]
+    pub fn get(&self, idx: usize) -> Option<ShellZone> {
+        let raw = if idx < self.front.len() {
+            self.front.get(idx)?
+        } else {
+            self.back.get(idx - self.front.len())?
+        };
+        Some(adjust_zone(raw.clone(), self.oldest, self.max_line))
+    }
+
+    /// Returns the oldest retained shell zone, if any.
+    #[must_use]
+    pub fn first(&self) -> Option<ShellZone> {
+        self.front
+            .first()
+            .or_else(|| self.back.first())
+            .cloned()
+            .map(|z| adjust_zone(z, self.oldest, self.max_line))
+    }
+
+    /// Returns the most recently closed shell zone, if any.
+    #[must_use]
+    pub fn last(&self) -> Option<ShellZone> {
+        self.back
+            .last()
+            .or_else(|| self.front.last())
+            .cloned()
+            .map(|z| adjust_zone(z, self.oldest, self.max_line))
+    }
+
+    /// Iterates over all retained shell zones in chronological insertion order.
+    #[must_use]
+    pub fn iter(&self) -> ShellZonesIter<'a> {
+        ShellZonesIter {
+            front: self.front,
+            back: self.back,
+            oldest: self.oldest,
+            max_line: self.max_line,
+        }
+    }
+
+    /// Returns an iterator over retained zones intersecting `[start_line, end_line_excl)` in
+    /// `O(log Z + K)` when zones are ordered (`!has_out_of_order`).
+    pub fn in_line_range(
+        &self,
+        start_line: usize,
+        end_line_excl: usize,
+    ) -> impl Iterator<Item = ShellZone> + 'a {
+        let (front_slice, back_slice, fallback) =
+            if start_line >= end_line_excl || start_line > self.max_line || self.is_empty() {
+                (&[][..], &[][..], false)
+            } else if !self.has_out_of_order {
+                let start_abs = AbsLine(self.oldest.0.saturating_add(start_line as u64));
+                let end_abs_excl = AbsLine(self.oldest.0.saturating_add(end_line_excl as u64));
+                let f_lo = self.front.partition_point(|z| z.end_abs.line < start_abs);
+                let f_hi =
+                    f_lo + self.front[f_lo..].partition_point(|z| z.start_abs.line < end_abs_excl);
+                let b_lo = self.back.partition_point(|z| z.end_abs.line < start_abs);
+                let b_hi =
+                    b_lo + self.back[b_lo..].partition_point(|z| z.start_abs.line < end_abs_excl);
+                (&self.front[f_lo..f_hi], &self.back[b_lo..b_hi], false)
+            } else {
+                (self.front, self.back, true)
+            };
+        let iter = ShellZonesIter {
+            front: front_slice,
+            back: back_slice,
+            oldest: self.oldest,
+            max_line: self.max_line,
+        };
+        iter.filter(move |z| {
+            !fallback || (z.end_line >= start_line && z.start_line < end_line_excl)
+        })
+    }
+
+    /// Collects all retained shell zones into a newly allocated `Vec<ShellZone>`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<ShellZone> {
+        self.iter().collect()
+    }
+}
+
+impl PartialEq for ShellZonesView<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ShellZonesView<'_> {}
+
+impl<'a> IntoIterator for ShellZonesView<'a> {
+    type Item = ShellZone;
+    type IntoIter = ShellZonesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &ShellZonesView<'a> {
+    type Item = ShellZone;
+    type IntoIter = ShellZonesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over [`ShellZonesView`] yielding normalized [`ShellZone`] values.
+#[derive(Debug, Clone)]
+pub struct ShellZonesIter<'a> {
+    front: &'a [ShellZone],
+    back: &'a [ShellZone],
+    oldest: AbsLine,
+    max_line: usize,
+}
+
+impl Iterator for ShellZonesIter<'_> {
+    type Item = ShellZone;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((first, rest)) = self.front.split_first() {
+            self.front = rest;
+            return Some(adjust_zone(first.clone(), self.oldest, self.max_line));
+        }
+        if let Some((first, rest)) = self.back.split_first() {
+            self.back = rest;
+            return Some(adjust_zone(first.clone(), self.oldest, self.max_line));
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.front.len() + self.back.len();
+        (len, Some(len))
+    }
+}
+
+impl DoubleEndedIterator for ShellZonesIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if let Some((last, rest)) = self.back.split_last() {
+            self.back = rest;
+            return Some(adjust_zone(last.clone(), self.oldest, self.max_line));
+        }
+        if let Some((last, rest)) = self.front.split_last() {
+            self.front = rest;
+            return Some(adjust_zone(last.clone(), self.oldest, self.max_line));
+        }
+        None
+    }
+}
+
+impl ExactSizeIterator for ShellZonesIter<'_> {}
+
+impl std::iter::FusedIterator for ShellZonesIter<'_> {}
 
 #[derive(Debug, Clone, Default)]
 struct RowEolBucket {
@@ -94,9 +294,7 @@ impl RowEolBucket {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 pub(crate) struct ShellIntegrationState {
-    zones: Vec<ShellZone>,
-    #[cfg_attr(feature = "serde", serde(skip))]
-    zones_head: usize,
+    zones: VecDeque<ShellZone>,
     phase: ActivePhase,
     next_command_id: u64,
     max_zones: usize,
@@ -116,6 +314,27 @@ pub(crate) struct ShellIntegrationState {
     live_eol_total: usize,
     #[cfg_attr(feature = "serde", serde(skip))]
     base_seq: usize,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    has_out_of_order: bool,
+}
+
+#[cfg(feature = "serde")]
+struct AdjustedZonesSeq<'a>(&'a VecDeque<ShellZone>, AbsLine);
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for AdjustedZonesSeq<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for z in self.0 {
+            let adjusted = adjust_zone_unbounded(z.clone(), self.1);
+            seq.serialize_element(&adjusted)?;
+        }
+        seq.end()
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -126,7 +345,8 @@ impl serde::Serialize for ShellIntegrationState {
     {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("ShellIntegrationState", 4)?;
-        state.serialize_field("zones", self.zones())?;
+        let adjusted = AdjustedZonesSeq(&self.zones, AbsLine(self.last_synced_oldest_line));
+        state.serialize_field("zones", &adjusted)?;
         state.serialize_field("phase", &self.phase)?;
         state.serialize_field("next_command_id", &self.next_command_id)?;
         state.serialize_field("max_zones", &self.max_zones)?;
@@ -136,10 +356,19 @@ impl serde::Serialize for ShellIntegrationState {
 
 impl PartialEq for ShellIntegrationState {
     fn eq(&self, other: &Self) -> bool {
-        self.zones() == other.zones()
-            && self.phase == other.phase
-            && self.next_command_id == other.next_command_id
-            && self.max_zones == other.max_zones
+        if self.zones.len() != other.zones.len()
+            || self.phase != other.phase
+            || self.next_command_id != other.next_command_id
+            || self.max_zones != other.max_zones
+        {
+            return false;
+        }
+        let self_oldest = AbsLine(self.last_synced_oldest_line);
+        let other_oldest = AbsLine(other.last_synced_oldest_line);
+        self.zones.iter().zip(other.zones.iter()).all(|(a, b)| {
+            adjust_zone_unbounded(a.clone(), self_oldest)
+                == adjust_zone_unbounded(b.clone(), other_oldest)
+        })
     }
 }
 
@@ -148,8 +377,7 @@ impl Eq for ShellIntegrationState {}
 impl ShellIntegrationState {
     pub(crate) fn new(scrollback_limit: usize, viewport_rows: usize) -> Self {
         Self {
-            zones: Vec::new(),
-            zones_head: 0,
+            zones: VecDeque::new(),
             phase: ActivePhase::Idle,
             next_command_id: 1,
             max_zones: compute_max_zones(scrollback_limit, viewport_rows),
@@ -161,12 +389,12 @@ impl ShellIntegrationState {
             live_eol_base_abs: 0,
             live_eol_total: 0,
             base_seq: 0,
+            has_out_of_order: false,
         }
     }
 
     pub(crate) fn reset(&mut self) {
         self.zones.clear();
-        self.zones_head = 0;
         self.phase = ActivePhase::Idle;
         self.next_command_id = 1;
         self.last_synced_content_epoch = 0;
@@ -177,13 +405,19 @@ impl ShellIntegrationState {
         self.live_eol_base_abs = 0;
         self.live_eol_total = 0;
         self.base_seq = 0;
+        self.has_out_of_order = false;
     }
 
     #[cfg(feature = "serde")]
     pub(crate) fn snapshot_clone(&self) -> Self {
+        let oldest = AbsLine(self.last_synced_oldest_line);
+        let zones: VecDeque<ShellZone> = self
+            .zones
+            .iter()
+            .map(|z| adjust_zone_unbounded(z.clone(), oldest))
+            .collect();
         Self {
-            zones: self.zones().to_vec(),
-            zones_head: 0,
+            zones,
             phase: self.phase,
             next_command_id: self.next_command_id,
             max_zones: self.max_zones,
@@ -195,6 +429,7 @@ impl ShellIntegrationState {
             live_eol_base_abs: 0,
             live_eol_total: 0,
             base_seq: 0,
+            has_out_of_order: self.has_out_of_order,
         }
     }
 
@@ -203,8 +438,16 @@ impl ShellIntegrationState {
         self.enforce_cap();
     }
 
-    pub(crate) fn zones(&self) -> &[ShellZone] {
-        &self.zones[self.zones_head..]
+    /// Returns a read-only [`ShellZonesView`] with `O(1)` length and `O(log Z)` range queries.
+    pub(crate) fn zones_view(&self, primary: &Grid) -> ShellZonesView<'_> {
+        let (front, back) = self.zones.as_slices();
+        ShellZonesView {
+            front,
+            back,
+            oldest: primary.oldest_abs_line(),
+            max_line: primary.total_len().saturating_sub(1),
+            has_out_of_order: self.has_out_of_order,
+        }
     }
 
     fn alloc_command_id(&mut self) -> u64 {
@@ -213,21 +456,11 @@ impl ShellIntegrationState {
         id
     }
 
-    fn compact_head(&mut self) {
-        if self.zones_head > 0 {
-            let drain_end = self.zones_head.min(self.zones.len());
-            self.zones.drain(..drain_end);
-            self.zones_head = 0;
-            self.base_seq = self.base_seq.saturating_add(drain_end);
-            self.prune_stale_live_eol();
-        }
-    }
-
     fn prune_stale_live_eol(&mut self) {
         if self.live_eol_total == 0 {
             return;
         }
-        let min_seq = self.base_seq + self.zones_head;
+        let min_seq = self.base_seq;
         let mut total = 0usize;
         for bucket in &mut self.live_eol_rows {
             if !bucket.same_line.is_empty() {
@@ -372,18 +605,17 @@ impl ShellIntegrationState {
             let multi = std::mem::take(&mut bucket.multi_line);
             self.live_eol_total = self.live_eol_total.saturating_sub(multi.len());
             for seq in multi {
-                if let Some(abs_idx) = seq.checked_sub(self.base_seq)
-                    && abs_idx >= self.zones_head
-                    && abs_idx < self.zones.len()
+                if let Some(idx) = seq.checked_sub(self.base_seq)
+                    && let Some(z) = self.zones.get_mut(idx)
+                    && z.end_is_eol
+                    && z.end_abs.line == oldest
+                    && z.start_abs.line < oldest
                 {
-                    let z = &mut self.zones[abs_idx];
-                    if z.end_is_eol && z.end_abs.line == oldest && z.start_abs.line < oldest {
-                        z.start_abs = GridPoint::new(oldest, 0);
-                        z.start_col = 0;
-                        z.end_col = 0;
-                        z.end_abs = z.start_abs;
-                        z.end_is_eol = false;
-                    }
+                    z.start_abs = GridPoint::new(oldest, 0);
+                    z.start_col = 0;
+                    z.end_col = 0;
+                    z.end_abs = z.start_abs;
+                    z.end_is_eol = false;
                 }
             }
         }
@@ -421,34 +653,32 @@ impl ShellIntegrationState {
                 }
                 bucket.same_line.pop();
                 self.live_eol_total = self.live_eol_total.saturating_sub(1);
-                if let Some(abs_idx) = seq.checked_sub(self.base_seq)
-                    && abs_idx >= self.zones_head
-                    && abs_idx < self.zones.len()
+                if let Some(idx) = seq.checked_sub(self.base_seq)
+                    && let Some(z) = self.zones.get_mut(idx)
+                    && z.end_is_eol
+                    && z.end_abs.line == abs_line
+                    && z.start_abs.line == abs_line
                 {
-                    let z = &mut self.zones[abs_idx];
-                    if z.end_is_eol && z.end_abs.line == abs_line && z.start_abs.line == abs_line {
-                        z.end_col = z.start_col;
-                        z.end_abs = z.start_abs;
-                        z.end_is_eol = false;
-                    }
+                    z.end_col = z.start_col;
+                    z.end_abs = z.start_abs;
+                    z.end_is_eol = false;
                 }
             }
             if trimmed == 0 && abs_line == oldest && !bucket.multi_line.is_empty() {
                 let multi = std::mem::take(&mut bucket.multi_line);
                 self.live_eol_total = self.live_eol_total.saturating_sub(multi.len());
                 for seq in multi {
-                    if let Some(abs_idx) = seq.checked_sub(self.base_seq)
-                        && abs_idx >= self.zones_head
-                        && abs_idx < self.zones.len()
+                    if let Some(idx) = seq.checked_sub(self.base_seq)
+                        && let Some(z) = self.zones.get_mut(idx)
+                        && z.end_is_eol
+                        && z.end_abs.line == abs_line
+                        && z.start_abs.line < oldest
                     {
-                        let z = &mut self.zones[abs_idx];
-                        if z.end_is_eol && z.end_abs.line == abs_line && z.start_abs.line < oldest {
-                            z.start_abs = GridPoint::new(oldest, 0);
-                            z.start_col = 0;
-                            z.end_col = 0;
-                            z.end_abs = z.start_abs;
-                            z.end_is_eol = false;
-                        }
+                        z.start_abs = GridPoint::new(oldest, 0);
+                        z.start_col = 0;
+                        z.end_col = 0;
+                        z.end_abs = z.start_abs;
+                        z.end_is_eol = false;
                     }
                 }
             }
@@ -503,13 +733,20 @@ impl ShellIntegrationState {
     }
 
     fn enforce_cap(&mut self) {
-        let active_len = self.zones.len().saturating_sub(self.zones_head);
-        if active_len > self.max_zones {
-            let excess = active_len - self.max_zones;
-            self.zones_head += excess;
+        if self.zones.len() > self.max_zones {
+            let excess = self.zones.len() - self.max_zones;
+            let mut need_prune = false;
+            for _ in 0..excess {
+                if let Some(popped) = self.zones.pop_front() {
+                    self.base_seq = self.base_seq.saturating_add(1);
+                    if popped.end_is_eol && popped.end_abs.line.0 >= self.live_eol_base_abs {
+                        need_prune = true;
+                    }
+                }
+            }
             self.frozen_prefix_len = self.frozen_prefix_len.saturating_sub(excess);
-            if self.zones_head >= ZONES_HEAD_COMPACT_THRESHOLD {
-                self.compact_head();
+            if need_prune {
+                self.prune_stale_live_eol();
             }
         }
     }
@@ -631,7 +868,12 @@ impl ShellIntegrationState {
                 (clamped_start.line == end_abs.line).then_some(clamped_start.col),
             )
         });
-        self.zones.push(ShellZone {
+        if let Some(back) = self.zones.back()
+            && (clamped_start < back.start_abs || end_abs < back.end_abs)
+        {
+            self.has_out_of_order = true;
+        }
+        self.zones.push_back(ShellZone {
             kind,
             start_line,
             start_col: clamped_start.col,
@@ -647,19 +889,25 @@ impl ShellIntegrationState {
             let vp_top_abs = primary.live_viewport_to_abs(0);
             self.track_live_eol(end_abs_line, start_col_if_same, pushed_seq, vp_top_abs);
         }
-        if self.zones.len().saturating_sub(self.zones_head) > self.max_zones {
-            let mut popped = 0usize;
-            while self.zones_head < self.zones.len()
-                && self.zones[self.zones_head].end_abs.line < oldest
-            {
-                self.zones_head += 1;
-                popped += 1;
-            }
-            if popped > 0 {
-                self.frozen_prefix_len = self.frozen_prefix_len.saturating_sub(popped);
-                if self.zones_head >= ZONES_HEAD_COMPACT_THRESHOLD {
-                    self.compact_head();
+        if self.zones.len() > self.max_zones {
+            let mut need_prune = false;
+            while self.zones.front().is_some_and(|z| z.end_abs.line < oldest) {
+                if let Some(popped) = self.zones.pop_front() {
+                    self.base_seq = self.base_seq.saturating_add(1);
+                    self.frozen_prefix_len = self.frozen_prefix_len.saturating_sub(1);
+                    if popped.end_is_eol && popped.end_abs.line.0 >= self.live_eol_base_abs {
+                        need_prune = true;
+                    }
                 }
+            }
+            if need_prune {
+                self.prune_stale_live_eol();
+            }
+            if self.has_out_of_order
+                && self.zones.len() > self.max_zones
+                && self.zones.iter().any(|z| z.end_abs.line < oldest)
+            {
+                self.sync_after_eviction(primary);
             }
             self.enforce_cap();
         }
@@ -945,7 +1193,7 @@ impl ShellIntegrationState {
                     }
                 };
                 if let Some(cmd_id) = finished_cmd {
-                    for z in self.zones[self.zones_head..].iter_mut().rev() {
+                    for z in self.zones.iter_mut().rev() {
                         if z.command_id < cmd_id {
                             break;
                         }
@@ -964,14 +1212,13 @@ impl ShellIntegrationState {
     pub(crate) fn sync_after_eviction_if_needed(&mut self, primary: &Grid) {
         let oldest = primary.oldest_abs_line().0;
         if oldest != self.last_synced_oldest_line {
-            if self.zones().is_empty() && matches!(self.phase, ActivePhase::Idle) {
-                self.zones.clear();
-                self.zones_head = 0;
+            if self.zones.is_empty() && matches!(self.phase, ActivePhase::Idle) {
                 self.last_synced_oldest_line = oldest;
                 self.last_synced_content_epoch = primary.content_epoch();
                 self.last_synced_damage_epoch = primary.damage_epoch();
                 self.frozen_prefix_len = 0;
                 self.clear_live_eol();
+                self.has_out_of_order = false;
             } else {
                 self.sync_after_eviction(primary);
             }
@@ -982,14 +1229,13 @@ impl ShellIntegrationState {
         let oldest = primary.oldest_abs_line().0;
         let content_epoch = primary.content_epoch();
         let damage_epoch = primary.damage_epoch();
-        if self.zones().is_empty() && matches!(self.phase, ActivePhase::Idle) {
-            self.zones.clear();
-            self.zones_head = 0;
+        if self.zones.is_empty() && matches!(self.phase, ActivePhase::Idle) {
             self.last_synced_content_epoch = content_epoch;
             self.last_synced_damage_epoch = damage_epoch;
             self.last_synced_oldest_line = oldest;
             self.frozen_prefix_len = 0;
             self.clear_live_eol();
+            self.has_out_of_order = false;
             return;
         }
         if oldest != self.last_synced_oldest_line {
@@ -1000,10 +1246,10 @@ impl ShellIntegrationState {
             return;
         }
         let vp_top_abs = primary.live_viewport_to_abs(0);
-        let active_len = self.zones().len();
+        let active_len = self.zones.len();
+        self.frozen_prefix_len = self.frozen_prefix_len.min(active_len);
         for rel_idx in self.frozen_prefix_len..active_len {
-            let abs_idx = self.zones_head + rel_idx;
-            let z = &mut self.zones[abs_idx];
+            let z = &mut self.zones[rel_idx];
             if z.end_is_eol
                 && let Some(row) = primary.row_by_abs(z.end_abs.line)
                 && row.generation() > self.last_synced_damage_epoch
@@ -1022,29 +1268,72 @@ impl ShellIntegrationState {
 
     pub(crate) fn sync_after_eviction(&mut self, primary: &Grid) {
         let oldest = primary.oldest_abs_line();
-        let total = primary.total_len();
-        let max_line = total.saturating_sub(1);
         let cols = primary.cols();
         let vp_top_abs = primary.live_viewport_to_abs(0);
         let prev_damage_epoch = self.last_synced_damage_epoch;
-        let head = self.zones_head.min(self.zones.len());
-        let active_len = self.zones.len() - head;
-        let old_frozen = self.frozen_prefix_len.min(active_len);
 
-        self.clear_live_eol();
-        let mut write_idx = 0usize;
-        let mut new_frozen = 0usize;
-        for rel_idx in 0..active_len {
-            let read_idx = head + rel_idx;
-            if self.zones[read_idx].end_abs.line < oldest {
-                continue;
+        if !self.has_out_of_order {
+            // 1) Evict expired front zones in O(evicted).
+            while self.zones.front().is_some_and(|z| z.end_abs.line < oldest) {
+                self.zones.pop_front();
+                self.base_seq = self.base_seq.saturating_add(1);
+                self.frozen_prefix_len = self.frozen_prefix_len.saturating_sub(1);
             }
-            if write_idx != read_idx {
-                self.zones.swap(write_idx, read_idx);
+
+            // 2) Clamp only straddling front zone(s) in O(1); do NOT scan remaining zones.
+            for z in &mut self.zones {
+                if z.start_abs.line >= oldest {
+                    break;
+                }
+                z.start_abs = GridPoint::new(oldest, 0);
+                z.start_col = 0;
+                if z.end_is_eol {
+                    normalize_eol_zone(z, primary);
+                }
+                if z.start_abs.line == z.end_abs.line && z.end_col < z.start_col {
+                    z.end_col = z.start_col.min(cols);
+                    z.end_abs = z.start_abs;
+                    z.end_is_eol = false;
+                }
             }
-            let was_frozen = rel_idx < old_frozen;
-            let eol_track = {
-                let z = &mut self.zones[write_idx];
+
+            // 3) Sync only non-frozen suffix (~viewport zones) and advance live_eol_rows in O(1).
+            self.frozen_prefix_len = self.frozen_prefix_len.min(self.zones.len());
+            let active_len = self.zones.len();
+            for rel_idx in self.frozen_prefix_len..active_len {
+                let z = &mut self.zones[rel_idx];
+                if z.end_is_eol
+                    && primary
+                        .row_by_abs(z.end_abs.line)
+                        .is_some_and(|row| row.generation() > prev_damage_epoch)
+                {
+                    normalize_eol_zone(z, primary);
+                }
+                if rel_idx == self.frozen_prefix_len && z.end_abs.line < vp_top_abs {
+                    self.frozen_prefix_len += 1;
+                }
+            }
+            self.advance_live_eol_base(primary);
+            if self.zones.is_empty() {
+                self.clear_live_eol();
+            }
+        } else {
+            // Fallback for out-of-order zones (e.g., CUP backwards jump).
+            let old_len = self.zones.len();
+            let old_frozen = self.frozen_prefix_len.min(old_len);
+            self.clear_live_eol();
+            let mut new_frozen = 0usize;
+            let mut has_ooo = false;
+            let mut prev_start = GridPoint::new(AbsLine(0), 0);
+            let mut prev_end = GridPoint::new(AbsLine(0), 0);
+            for rel_idx in 0..old_len {
+                let Some(mut z) = self.zones.pop_front() else {
+                    break;
+                };
+                if z.end_abs.line < oldest {
+                    continue;
+                }
+                let was_frozen = rel_idx < old_frozen;
                 let mut clamped_start = false;
                 if z.start_abs.line < oldest {
                     z.start_abs = GridPoint::new(oldest, 0);
@@ -1060,7 +1349,7 @@ impl ShellIntegrationState {
                             .row_by_abs(z.end_abs.line)
                             .is_some_and(|row| row.generation() > prev_damage_epoch))
                 {
-                    normalize_eol_zone(z, primary);
+                    normalize_eol_zone(&mut z, primary);
                 }
                 if !in_frozen_scrollback
                     && z.start_abs.line == z.end_abs.line
@@ -1070,31 +1359,26 @@ impl ShellIntegrationState {
                     z.end_abs = z.start_abs;
                     z.end_is_eol = false;
                 }
-                z.start_line = usize::try_from(z.start_abs.line.0.saturating_sub(oldest.0))
-                    .unwrap_or(0)
-                    .min(max_line);
-                z.end_line = usize::try_from(z.end_abs.line.0.saturating_sub(oldest.0))
-                    .unwrap_or(z.start_line)
-                    .clamp(z.start_line, max_line);
-
-                if write_idx == new_frozen && z.end_abs.line < vp_top_abs {
+                if !self.zones.is_empty() && (z.start_abs < prev_start || z.end_abs < prev_end) {
+                    has_ooo = true;
+                }
+                prev_start = z.start_abs;
+                prev_end = z.end_abs;
+                let seq = self.zones.len();
+                if seq == new_frozen && z.end_abs.line < vp_top_abs {
                     new_frozen += 1;
                 }
-                (z.end_is_eol && z.end_abs.line >= vp_top_abs).then(|| {
-                    (
-                        z.end_abs.line,
-                        (z.start_abs.line == z.end_abs.line).then_some(z.start_col),
-                    )
-                })
-            };
-            if let Some((end_abs_line, start_col_if_same)) = eol_track {
-                self.track_live_eol(end_abs_line, start_col_if_same, write_idx, vp_top_abs);
+                if z.end_is_eol && z.end_abs.line >= vp_top_abs {
+                    let start_col_if_same =
+                        (z.start_abs.line == z.end_abs.line).then_some(z.start_col);
+                    self.track_live_eol(z.end_abs.line, start_col_if_same, seq, vp_top_abs);
+                }
+                self.zones.push_back(z);
             }
-            write_idx += 1;
+            self.frozen_prefix_len = new_frozen;
+            self.has_out_of_order = has_ooo;
         }
-        self.zones.truncate(write_idx);
-        self.zones_head = 0;
-        self.frozen_prefix_len = new_frozen;
+
         self.last_synced_content_epoch = primary.content_epoch();
         self.last_synced_damage_epoch = primary.damage_epoch();
         self.last_synced_oldest_line = oldest.0;
@@ -1110,7 +1394,6 @@ impl ShellIntegrationState {
         let max_line = total.saturating_sub(1);
         let cols = primary.cols();
 
-        self.compact_head();
         self.zones.retain(|z| {
             z.end_abs.line >= oldest
                 && z.start_abs.line <= newest
@@ -1121,6 +1404,9 @@ impl ShellIntegrationState {
         self.clear_live_eol();
         let mut new_frozen = 0usize;
         let mut prev_cmd_id = 1u64;
+        let mut has_ooo = false;
+        let mut prev_start = GridPoint::new(AbsLine(0), 0);
+        let mut prev_end = GridPoint::new(AbsLine(0), 0);
         for idx in 0..self.zones.len() {
             let eol_track = {
                 let z = &mut self.zones[idx];
@@ -1153,6 +1439,11 @@ impl ShellIntegrationState {
                     .clamp(z.start_line, max_line);
                 z.command_id = z.command_id.max(prev_cmd_id);
                 prev_cmd_id = z.command_id;
+                if idx > 0 && (z.start_abs < prev_start || z.end_abs < prev_end) {
+                    has_ooo = true;
+                }
+                prev_start = z.start_abs;
+                prev_end = z.end_abs;
                 if idx == new_frozen && z.end_abs.line < vp_top_abs {
                     new_frozen += 1;
                 }
@@ -1168,11 +1459,12 @@ impl ShellIntegrationState {
             }
         }
         self.frozen_prefix_len = new_frozen;
+        self.has_out_of_order = has_ooo;
         self.last_synced_content_epoch = primary.content_epoch();
         self.last_synced_damage_epoch = primary.damage_epoch();
         self.last_synced_oldest_line = oldest.0;
 
-        let last_zone_cmd = self.zones.last().map_or(0, |z| z.command_id);
+        let last_zone_cmd = self.zones.back().map_or(0, |z| z.command_id);
 
         match &mut self.phase {
             ActivePhase::Idle => {}
@@ -1314,7 +1606,7 @@ impl ShellIntegrationState {
     }
 
     pub(crate) fn collect_reflow_points(&self, out: &mut Vec<GridPoint>) -> Option<usize> {
-        for z in self.zones() {
+        for z in &self.zones {
             out.push(z.start_abs);
             out.push(z.end_abs);
         }
@@ -1361,7 +1653,7 @@ impl ShellIntegrationState {
         let total = primary.total_len();
         let max_line = total.saturating_sub(1);
 
-        let active_len = self.zones().len();
+        let active_len = self.zones.len();
         let expected_zone_pts = active_len * 2;
         if mapped.len() < expected_zone_pts {
             self.sync_after_eviction(primary);
@@ -1392,20 +1684,27 @@ impl ShellIntegrationState {
 
         let cols = primary.cols();
         let vp_top_abs = primary.live_viewport_to_abs(0);
+        let prev_oldest = AbsLine(self.last_synced_oldest_line);
         self.clear_live_eol();
         let mut new_frozen = 0usize;
-        let mut kept = Vec::with_capacity(active_len);
-        let head = self.zones_head.min(self.zones.len());
-        let old_zones = std::mem::take(&mut self.zones);
-        self.zones_head = 0;
-        for (idx, mut z) in old_zones.into_iter().skip(head).enumerate() {
+        let mut has_ooo = false;
+        let mut prev_start = GridPoint::new(AbsLine(0), 0);
+        let mut prev_end = GridPoint::new(AbsLine(0), 0);
+        for idx in 0..active_len {
+            let Some(mut z) = self.zones.pop_front() else {
+                break;
+            };
             let s_opt = mapped[idx * 2];
             let e_opt = mapped[idx * 2 + 1];
             let Some(mut e_pt) = e_opt else {
                 continue;
             };
             let mut s_pt = s_opt.unwrap_or_else(|| GridPoint::new(oldest, 0));
-            let was_empty = !z.end_is_eol && z.start_line == z.end_line && z.start_col >= z.end_col;
+            let old_s_line = usize::try_from(z.start_abs.line.0.saturating_sub(prev_oldest.0))
+                .unwrap_or(z.start_line);
+            let old_e_line = usize::try_from(z.end_abs.line.0.saturating_sub(prev_oldest.0))
+                .unwrap_or(z.end_line);
+            let was_empty = !z.end_is_eol && old_s_line == old_e_line && z.start_col >= z.end_col;
             if e_pt < s_pt {
                 s_pt = e_pt;
             }
@@ -1437,17 +1736,23 @@ impl ShellIntegrationState {
             z.end_line = usize::try_from(z.end_abs.line.0.saturating_sub(oldest.0))
                 .unwrap_or(z.start_line)
                 .clamp(z.start_line, max_line);
-            if kept.len() == new_frozen && z.end_abs.line < vp_top_abs {
+            if !self.zones.is_empty() && (z.start_abs < prev_start || z.end_abs < prev_end) {
+                has_ooo = true;
+            }
+            prev_start = z.start_abs;
+            prev_end = z.end_abs;
+            let seq = self.zones.len();
+            if seq == new_frozen && z.end_abs.line < vp_top_abs {
                 new_frozen += 1;
             }
             if z.end_is_eol && z.end_abs.line >= vp_top_abs {
                 let start_col_if_same = (z.start_abs.line == z.end_abs.line).then_some(z.start_col);
-                self.track_live_eol(z.end_abs.line, start_col_if_same, kept.len(), vp_top_abs);
+                self.track_live_eol(z.end_abs.line, start_col_if_same, seq, vp_top_abs);
             }
-            kept.push(z);
+            self.zones.push_back(z);
         }
-        self.zones = kept;
         self.frozen_prefix_len = new_frozen;
+        self.has_out_of_order = has_ooo;
         self.last_synced_content_epoch = primary.content_epoch();
         self.last_synced_damage_epoch = primary.damage_epoch();
         self.last_synced_oldest_line = oldest.0;
@@ -1520,37 +1825,111 @@ impl ShellIntegrationState {
     }
 
     pub(crate) fn jump_to_prompt(&self, primary: &mut Grid, delta: i32) -> bool {
-        let zones = self.zones();
-        if delta == 0 || zones.is_empty() {
+        if delta == 0 || self.zones.is_empty() {
             return false;
         }
         let history_len = primary.history_len();
         let top_line = history_len.saturating_sub(primary.display_offset());
+        let oldest = primary.oldest_abs_line();
+        let max_line = primary.total_len().saturating_sub(1);
 
-        let mut prompt_lines: Vec<usize> = zones
-            .iter()
-            .filter(|z| z.kind == ZoneKind::Prompt)
-            .map(|z| z.start_line)
-            .collect();
-        prompt_lines.sort_unstable();
-        prompt_lines.dedup();
-
-        let target_line = if delta < 0 {
-            let candidates: Vec<usize> =
-                prompt_lines.into_iter().filter(|&l| l < top_line).collect();
-            if candidates.is_empty() {
-                return false;
+        let target_line = if !self.has_out_of_order {
+            let target_abs = AbsLine(oldest.0.saturating_add(top_line as u64));
+            let (front, back) = self.zones.as_slices();
+            if delta < 0 {
+                let split = if back.first().is_some_and(|z| z.start_abs.line < target_abs) {
+                    front.len() + back.partition_point(|z| z.start_abs.line < target_abs)
+                } else {
+                    front.partition_point(|z| z.start_abs.line < target_abs)
+                };
+                let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
+                let mut count = 0usize;
+                let mut last_seen: Option<usize> = None;
+                let mut best: Option<usize> = None;
+                for z in self.zones.range(..split).rev() {
+                    if z.kind != ZoneKind::Prompt {
+                        continue;
+                    }
+                    let line = usize::try_from(z.start_abs.line.0.saturating_sub(oldest.0))
+                        .unwrap_or(0)
+                        .min(max_line);
+                    if line >= top_line || last_seen == Some(line) {
+                        continue;
+                    }
+                    last_seen = Some(line);
+                    best = Some(line);
+                    count += 1;
+                    if count == step {
+                        break;
+                    }
+                }
+                let Some(found) = best else {
+                    return false;
+                };
+                found
+            } else {
+                let start = if back.first().is_some_and(|z| z.start_abs.line <= target_abs) {
+                    front.len() + back.partition_point(|z| z.start_abs.line <= target_abs)
+                } else {
+                    front.partition_point(|z| z.start_abs.line <= target_abs)
+                };
+                let step = usize::try_from(delta).unwrap_or(1);
+                let mut count = 0usize;
+                let mut last_seen: Option<usize> = None;
+                let mut best: Option<usize> = None;
+                for z in self.zones.range(start..) {
+                    if z.kind != ZoneKind::Prompt {
+                        continue;
+                    }
+                    let line = usize::try_from(z.start_abs.line.0.saturating_sub(oldest.0))
+                        .unwrap_or(0)
+                        .min(max_line);
+                    if line <= top_line || last_seen == Some(line) {
+                        continue;
+                    }
+                    last_seen = Some(line);
+                    best = Some(line);
+                    count += 1;
+                    if count == step {
+                        break;
+                    }
+                }
+                let Some(found) = best else {
+                    return false;
+                };
+                found
             }
-            let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
-            candidates[candidates.len().saturating_sub(step)]
         } else {
-            let candidates: Vec<usize> =
-                prompt_lines.into_iter().filter(|&l| l > top_line).collect();
-            if candidates.is_empty() {
-                return false;
+            let mut prompt_lines: Vec<usize> = self
+                .zones
+                .iter()
+                .filter(|z| z.kind == ZoneKind::Prompt)
+                .map(|z| {
+                    usize::try_from(z.start_abs.line.0.saturating_sub(oldest.0))
+                        .unwrap_or(0)
+                        .min(max_line)
+                })
+                .collect();
+            prompt_lines.sort_unstable();
+            prompt_lines.dedup();
+
+            if delta < 0 {
+                let candidates: Vec<usize> =
+                    prompt_lines.into_iter().filter(|&l| l < top_line).collect();
+                if candidates.is_empty() {
+                    return false;
+                }
+                let step = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
+                candidates[candidates.len().saturating_sub(step)]
+            } else {
+                let candidates: Vec<usize> =
+                    prompt_lines.into_iter().filter(|&l| l > top_line).collect();
+                if candidates.is_empty() {
+                    return false;
+                }
+                let step = usize::try_from(delta).unwrap_or(1).saturating_sub(1);
+                candidates[step.min(candidates.len() - 1)]
             }
-            let step = usize::try_from(delta).unwrap_or(1).saturating_sub(1);
-            candidates[step.min(candidates.len() - 1)]
         };
 
         let target_offset = history_len.saturating_sub(target_line);
@@ -1558,39 +1937,94 @@ impl ShellIntegrationState {
     }
 
     pub(crate) fn command_output_at(&self, primary: &Grid, line: usize) -> Option<String> {
-        let zones = self.zones();
-        let zone = zones
-            .iter()
-            .find(|z| z.kind == ZoneKind::Output && line >= z.start_line && line <= z.end_line)
-            .or_else(|| {
-                let cmd_id = zones
-                    .iter()
-                    .find(|z| line >= z.start_line && line <= z.end_line)
-                    .map(|z| z.command_id)?;
-                zones
-                    .iter()
-                    .find(|z| z.command_id == cmd_id && z.kind == ZoneKind::Output)
-            })?;
+        let total = primary.total_len();
+        if line >= total || self.zones.is_empty() {
+            return None;
+        }
+        let oldest = primary.oldest_abs_line();
+        let max_line = total - 1;
+        let target_abs = AbsLine(oldest.0.saturating_add(line as u64));
 
-        Some(extract_zone_text(primary, zone))
+        let zone = if !self.has_out_of_order {
+            let (front, back) = self.zones.as_slices();
+            let lo = if back.first().is_some_and(|z| z.end_abs.line < target_abs) {
+                front.len() + back.partition_point(|z| z.end_abs.line < target_abs)
+            } else {
+                front.partition_point(|z| z.end_abs.line < target_abs)
+            };
+            let mut output_match: Option<&ShellZone> = None;
+            let mut fallback_cmd: Option<u64> = None;
+            for z in self.zones.range(lo..) {
+                if z.start_abs.line > target_abs {
+                    break;
+                }
+                if target_abs <= z.end_abs.line {
+                    if z.kind == ZoneKind::Output {
+                        output_match = Some(z);
+                        break;
+                    }
+                    if fallback_cmd.is_none() {
+                        fallback_cmd = Some(z.command_id);
+                    }
+                }
+            }
+            if let Some(found) = output_match {
+                found
+            } else {
+                let cmd_id = fallback_cmd?;
+                let mut cmd_output: Option<&ShellZone> = None;
+                for z in self.zones.range(lo..) {
+                    if z.command_id > cmd_id {
+                        break;
+                    }
+                    if z.command_id == cmd_id && z.kind == ZoneKind::Output {
+                        cmd_output = Some(z);
+                        break;
+                    }
+                }
+                cmd_output?
+            }
+        } else {
+            self.zones
+                .iter()
+                .find(|z| {
+                    z.kind == ZoneKind::Output
+                        && z.start_abs.line <= target_abs
+                        && target_abs <= z.end_abs.line
+                })
+                .or_else(|| {
+                    let cmd_id = self
+                        .zones
+                        .iter()
+                        .find(|z| z.start_abs.line <= target_abs && target_abs <= z.end_abs.line)
+                        .map(|z| z.command_id)?;
+                    self.zones
+                        .iter()
+                        .find(|z| z.command_id == cmd_id && z.kind == ZoneKind::Output)
+                })?
+        };
+
+        let adjusted = adjust_zone(zone.clone(), oldest, max_line);
+        Some(extract_zone_text(primary, &adjusted))
     }
 
     #[cfg(all(test, feature = "serde"))]
     pub(crate) fn tamper_for_test(&mut self) {
-        if let Some(first) = self.zones().first().cloned() {
+        if let Some(first) = self.zones.front().cloned() {
             let mut inverted = first.clone();
             std::mem::swap(&mut inverted.start_abs, &mut inverted.end_abs);
             inverted.start_abs.line = AbsLine(inverted.end_abs.line.0 + 1);
-            self.zones.push(inverted);
+            self.zones.push_back(inverted);
 
             let mut oob_line = first.clone();
             oob_line.end_abs = GridPoint::new(AbsLine(999_999), 0);
-            self.zones.push(oob_line);
+            self.zones.push_back(oob_line);
 
             let mut oob_col = first;
             oob_col.start_abs.col = 999;
             oob_col.end_abs.col = 999;
-            self.zones.push(oob_col);
+            self.zones.push_back(oob_col);
+            self.has_out_of_order = true;
         }
         self.phase = ActivePhase::InOutput {
             start: GridPoint::new(AbsLine(999_999), 999),
@@ -1780,7 +2214,7 @@ mod tests {
         term.advance(
             b"\x1b]133;A\x071234567890\x1b]133;B\x07ls\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07",
         );
-        let zones = term.shell_zones();
+        let zones = term.shell_zones().to_vec();
         assert_eq!(
             (
                 zones[0].kind,
@@ -1810,7 +2244,7 @@ mod tests {
             b"\x1b]133;A\x071234567890\x1b]133;B\x07x\x1b]133;C\x07y\x1b]133;D;0\x07\r\n12345\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07",
         );
         term.resize(80, 6);
-        let z = term.shell_zones();
+        let z = term.shell_zones().to_vec();
         assert_eq!((z[0].start_line, z[0].start_col, z[0].end_col), (0, 0, 10));
         assert_eq!((z[1].start_line, z[1].start_col, z[1].end_col), (0, 10, 11));
         assert_eq!((z[2].start_line, z[2].start_col, z[2].end_col), (0, 11, 12));
@@ -2023,7 +2457,7 @@ mod tests {
             ),
             (0, 10, 1, 4)
         );
-        assert_eq!(extract_zone_text(t3a.grid(), in_3a), "1234567890more");
+        assert_eq!(extract_zone_text(t3a.grid(), &in_3a), "1234567890more");
 
         // 3b. Same with "ab" already typed before resize(20, 6).
         let mut t3b = Terminal::new(10, 6, CoreConfig::default());
@@ -2044,7 +2478,7 @@ mod tests {
             ),
             (0, 10, 1, 4)
         );
-        assert_eq!(extract_zone_text(t3b.grid(), in_3b), "ab34567890more");
+        assert_eq!(extract_zone_text(t3b.grid(), &in_3b), "ab34567890more");
 
         // 4. Mid-command resize while in alternate screen (?1049h) with alt_cursor_backup active.
         let mut t4 = Terminal::new(10, 6, CoreConfig::default());
@@ -2103,7 +2537,7 @@ mod tests {
             same_col.start_abs = GridPoint::new(AbsLine(3), 8);
             same_col.end_abs = GridPoint::new(AbsLine(3), 8);
             same_col.end_is_eol = true;
-            si.zones.push(same_col);
+            si.zones.push_back(same_col);
 
             // Case 2: start_abs.col < end_abs.col on row 2 ("xy", trimmed_len() == 2 < 3) with end_is_eol: true.
             let mut distinct_cols = template;
@@ -2115,11 +2549,11 @@ mod tests {
             distinct_cols.start_abs = GridPoint::new(AbsLine(2), 3);
             distinct_cols.end_abs = GridPoint::new(AbsLine(2), 6);
             distinct_cols.end_is_eol = true;
-            si.zones.push(distinct_cols);
+            si.zones.push_back(distinct_cols);
         }
 
         let mut restored = Terminal::from_snapshot(snap, CoreConfig::default());
-        let zones = restored.shell_zones();
+        let zones = restored.shell_zones().to_vec();
         assert_eq!(zones.len(), 2);
 
         assert_eq!(zones[0].start_line, 3);
@@ -2170,26 +2604,28 @@ mod tests {
         term.advance(b"0123456789\x1b]133;C\x07ab\r\n\x1b]133;D;0\x07\x1b[1;9H\x1b[0K");
         assert_zone_invariants(&term);
         assert_eq!(term.shell_zones().len(), 1);
+        let z0 = term.shell_zones().get(0).unwrap();
         assert_eq!(
             (
-                term.shell_zones()[0].start_line,
-                term.shell_zones()[0].start_col,
-                term.shell_zones()[0].end_line,
-                term.shell_zones()[0].end_col,
-                term.shell_zones()[0].end_is_eol,
+                z0.start_line,
+                z0.start_col,
+                z0.end_line,
+                z0.end_col,
+                z0.end_is_eol
             ),
             (0, 10, 0, 10, false)
         );
 
         term.resize(14, 4);
         assert_zone_invariants(&term);
+        let z0 = term.shell_zones().get(0).unwrap();
         assert_eq!(
             (
-                term.shell_zones()[0].start_line,
-                term.shell_zones()[0].start_col,
-                term.shell_zones()[0].end_line,
-                term.shell_zones()[0].end_col,
-                term.shell_zones()[0].end_is_eol,
+                z0.start_line,
+                z0.start_col,
+                z0.end_line,
+                z0.end_col,
+                z0.end_is_eol
             ),
             (0, 10, 0, 10, false)
         );
@@ -2198,24 +2634,12 @@ mod tests {
         let mut partial = Terminal::new(12, 4, CoreConfig::default());
         partial.advance(b"0123456789\x1b]133;C\x07ab\r\n\x1b]133;D;0\x07\x1b[1;12H\x1b[0K");
         assert_zone_invariants(&partial);
-        assert_eq!(
-            (
-                partial.shell_zones()[0].start_col,
-                partial.shell_zones()[0].end_col,
-                partial.shell_zones()[0].end_is_eol,
-            ),
-            (10, 11, true)
-        );
+        let p0 = partial.shell_zones().get(0).unwrap();
+        assert_eq!((p0.start_col, p0.end_col, p0.end_is_eol), (10, 11, true));
         partial.resize(14, 4);
         assert_zone_invariants(&partial);
-        assert_eq!(
-            (
-                partial.shell_zones()[0].start_col,
-                partial.shell_zones()[0].end_col,
-                partial.shell_zones()[0].end_is_eol,
-            ),
-            (10, 11, true)
-        );
+        let p0 = partial.shell_zones().get(0).unwrap();
+        assert_eq!((p0.start_col, p0.end_col, p0.end_is_eol), (10, 11, true));
         partial.resize(6, 4);
         assert_zone_invariants(&partial);
 
@@ -2223,14 +2647,8 @@ mod tests {
         let mut exact_trim = Terminal::new(12, 4, CoreConfig::default());
         exact_trim.advance(b"0123456789\x1b]133;C\x07ab\r\n\x1b]133;D;0\x07\x1b[1;11H\x1b[0K");
         assert_zone_invariants(&exact_trim);
-        assert_eq!(
-            (
-                exact_trim.shell_zones()[0].start_col,
-                exact_trim.shell_zones()[0].end_col,
-                exact_trim.shell_zones()[0].end_is_eol,
-            ),
-            (10, 10, false)
-        );
+        let e0 = exact_trim.shell_zones().get(0).unwrap();
+        assert_eq!((e0.start_col, e0.end_col, e0.end_is_eol), (10, 10, false));
         exact_trim.resize(14, 4);
         assert_zone_invariants(&exact_trim);
     }
@@ -2449,8 +2867,9 @@ mod tests {
         term.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\r\n\x1b]133;D;0\x07");
         assert_zone_invariants(&term);
         assert_eq!(term.shell_zones().len(), 1);
-        assert_eq!(term.shell_zones()[0].kind, ZoneKind::Output);
-        assert_eq!(term.shell_zones()[0].start_line, 0);
+        let first_z = term.shell_zones().first().unwrap();
+        assert_eq!(first_z.kind, ZoneKind::Output);
+        assert_eq!(first_z.start_line, 0);
 
         // 3. Mid-advance eviction with retained zones followed by new OSC 133;A/B/C/D and ED 3.
         let mut stream = Vec::new();
@@ -2555,19 +2974,19 @@ mod tests {
     }
 
     #[test]
-    fn dense_osc133_max_zones_head_offset_compaction_and_reflow() {
+    fn dense_osc133_max_zones_vecdeque_eviction_and_reflow() {
         use crate::color::PackedColor;
         use crate::grid::ScreenKind;
 
-        // 1. Direct ShellIntegrationState: zones_head advances past max_zones (256),
-        // compacts at ZONES_HEAD_COMPACT_THRESHOLD (1024), and advances again cleanly.
+        // 1. Direct ShellIntegrationState: VecDeque O(1) pop_front keeps len == max_zones (256)
+        // and advances base_seq cleanly without compaction thresholds.
         let grid = Grid::new(ScreenKind::Primary, 40, 4, 0);
         let mut si = ShellIntegrationState::new(0, 4);
         assert_eq!(si.max_zones, 256);
         let mut events = Vec::new();
 
         for i in 0..100u32 {
-            // 3 zones per command => 300 zones => zones_head == 44 (< 1024).
+            // 3 zones per command => 300 zones => 44 popped from front.
             si.handle_osc_133(&[b"133", b"A"], &grid, 0, 0, false, &mut events);
             si.handle_osc_133(&[b"133", b"B"], &grid, 0, 2, false, &mut events);
             si.handle_osc_133(&[b"133", b"C"], &grid, 0, 4, false, &mut events);
@@ -2581,17 +3000,18 @@ mod tests {
                 &mut events,
             );
         }
-        assert_eq!(si.zones().len(), 256);
-        assert_eq!(si.zones_head, 44);
-        let tail_zones: Vec<_> = si.zones().iter().rev().take(3).collect();
+        let view = si.zones_view(&grid);
+        assert_eq!(view.len(), 256);
+        assert_eq!(si.base_seq, 44);
+        let tail_zones: Vec<_> = view.iter().rev().take(3).collect();
         assert!(tail_zones.iter().all(|z| z.exit_code == Some(99)));
         assert_eq!(
-            si.zones()[si.zones().len() - 4].exit_code,
+            view.get(view.len() - 4).unwrap().exit_code,
             Some(98),
             "O(1) backward D scan must not touch earlier commands"
         );
 
-        // Push enough commands to cross ZONES_HEAD_COMPACT_THRESHOLD (1024) and then advance again.
+        // Push more commands and verify VecDeque stays bounded at 256.
         for i in 100..470u32 {
             si.handle_osc_133(&[b"133", b"A"], &grid, 0, 0, false, &mut events);
             si.handle_osc_133(&[b"133", b"B"], &grid, 0, 2, false, &mut events);
@@ -2606,15 +3026,11 @@ mod tests {
                 &mut events,
             );
         }
-        assert_eq!(si.zones().len(), 256);
-        assert!(
-            si.zones_head > 0 && si.zones_head < ZONES_HEAD_COMPACT_THRESHOLD,
-            "expected post-compaction non-zero zones_head, got {}",
-            si.zones_head
-        );
+        assert_eq!(si.zones_view(&grid).len(), 256);
+        assert_eq!(si.base_seq, 470 * 3 - 256);
 
         // 2. When max_zones is reached while evicted front zones sit at the front,
-        // close_zone pops evicted front zones via zones_head before dropping live zones.
+        // close_zone pops evicted front zones in O(1) before dropping live zones.
         let mut grid2 = Grid::new(ScreenKind::Primary, 20, 4, 0);
         let mut si2 = ShellIntegrationState::new(0, 4);
         for _ in 0..80 {
@@ -2636,14 +3052,14 @@ mod tests {
             si2.handle_osc_133(&[b"133", b"C"], &grid2, 3, 4, false, &mut events);
             si2.handle_osc_133(&[b"133", b"D", b"7"], &grid2, 3, 8, false, &mut events);
         }
-        assert_eq!(si2.zones().len(), 30);
+        assert_eq!(si2.zones_view(&grid2).len(), 30);
         assert!(
-            si2.zones()
+            si2.zones_view(&grid2)
                 .iter()
                 .all(|z| z.end_abs.line >= oldest_after_scroll && z.exit_code == Some(7))
         );
 
-        // 3. Terminal-level dense OSC 133 without eviction triggers zones_head > 0 and reflows cleanly.
+        // 3. Terminal-level dense OSC 133 without eviction triggers pop_front and reflows cleanly.
         let cfg = CoreConfig {
             scrollback_limit: 0,
             ..CoreConfig::default()
@@ -2661,7 +3077,7 @@ mod tests {
         assert_eq!(term.shell_zones().len(), 256);
         let last_zone = term.shell_zones().last().unwrap();
         assert_eq!(last_zone.exit_code, Some(119));
-        assert_eq!(extract_zone_text(term.grid(), last_zone), "o119");
+        assert_eq!(extract_zone_text(term.grid(), &last_zone), "o119");
         assert!(term.command_output_at(0).is_some());
         term.resize(12, 4);
         assert_zone_invariants(&term);
@@ -2672,7 +3088,7 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn zones_head_nonzero_snapshot_parity_and_partial_eq() {
+    fn vecdeque_base_seq_nonzero_snapshot_parity_and_partial_eq() {
         use crate::grid::ScreenKind;
         use serde::Serialize;
 
@@ -2993,28 +3409,21 @@ mod tests {
             si.handle_osc_133(&[b"133", b"C"], &grid, 0, 4, false, &mut events);
             si.handle_osc_133(&[b"133", b"D", b"0"], &grid, 0, 8, false, &mut events);
         }
-        assert_eq!(si.zones_head, 44);
-        assert_eq!(si.zones.len(), 300);
-        assert_eq!(si.zones().len(), 256);
+        assert_eq!(si.base_seq, 44);
+        assert_eq!(si.zones.len(), 256);
+        assert_eq!(si.zones_view(&grid).len(), 256);
 
-        // Verify custom Serialize on uncompacted state emits active slice length (256), not 300.
+        // Verify custom Serialize emits active slice length (256).
         let emitted = si.serialize(OuterSer).unwrap();
         assert_eq!(emitted, 256);
 
-        // PartialEq ignores evicted pre-zones_head elements.
-        let mut compacted = si.clone();
-        compacted.compact_head();
-        assert_eq!(compacted.zones_head, 0);
-        assert_eq!(compacted.zones.len(), 256);
-        assert_eq!(si, compacted);
-
-        // snapshot_clone strips pre-zones_head elements.
+        // snapshot_clone resets base_seq cleanly and preserves PartialEq.
         let snapped = si.snapshot_clone();
-        assert_eq!(snapped.zones_head, 0);
+        assert_eq!(snapped.base_seq, 0);
         assert_eq!(snapped.zones.len(), 256);
         assert_eq!(si, snapped);
 
-        // Terminal export_snapshot / from_snapshot parity when zones_head > 0.
+        // Terminal export_snapshot / from_snapshot parity when base_seq > 0.
         let cfg = CoreConfig {
             scrollback_limit: 0,
             ..CoreConfig::default()
@@ -3036,9 +3445,8 @@ mod tests {
         let mut snap = term.export_snapshot();
         {
             let snap_si = snap.shell_integration_mut().unwrap();
-            assert_eq!(snap_si.zones_head, 0);
+            assert_eq!(snap_si.base_seq, 0);
             assert_eq!(snap_si.zones.len(), 256);
-            // Also verify sanitize_snapshot compacts an uncompacted state with zones_head > 0.
             *snap_si = si;
         }
         let mut restored = Terminal::from_snapshot(snap, cfg);
@@ -3072,7 +3480,7 @@ mod tests {
 
         let mut restored = Terminal::from_snapshot(snap, CoreConfig::default());
         assert_zone_invariants(&restored);
-        let z = restored.shell_zones();
+        let z = restored.shell_zones().to_vec();
         assert_eq!(z.len(), 3);
         assert!(z.windows(2).all(|w| w[0].command_id <= w[1].command_id));
         assert_eq!(z[0].command_id, 500);
@@ -3081,7 +3489,7 @@ mod tests {
 
         // Finishing the tampered active phase assigns exit code 77 only to the active zone (501).
         restored.advance(b"\r\n\x1b]133;D;77\x07");
-        let z_after_d = restored.shell_zones();
+        let z_after_d = restored.shell_zones().to_vec();
         assert_eq!(z_after_d.len(), 4);
         assert_eq!(z_after_d[0].exit_code, Some(0));
         assert_eq!(z_after_d[3].command_id, 501);
@@ -3091,7 +3499,7 @@ mod tests {
         restored.advance(
             b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n\x1b]133;C\x07/tmp\r\n\x1b]133;D;99\x07",
         );
-        let z_final = restored.shell_zones();
+        let z_final = restored.shell_zones().to_vec();
         assert_eq!(z_final.len(), 7);
         assert!(
             z_final[4..7]
@@ -3109,7 +3517,7 @@ mod tests {
         t.advance(b"1234567890\x1b]133;A\x07\x1b[1;1H");
         t.resize(20, 4);
         t.advance(b"\x1b[1;10HXYZ\x1b]133;B\x07");
-        let zones = t.shell_zones();
+        let zones = t.shell_zones().to_vec();
         assert_eq!(zones.len(), 1);
         assert_eq!((zones[0].start_line, zones[0].start_col), (0, 10));
         assert_eq!((zones[0].end_line, zones[0].end_col), (0, 12));
@@ -3122,20 +3530,15 @@ mod tests {
         // On 5 cols, row 1 has "67890", writing at (1, 4) overwrites '0' and moves cursor to
         // pending_wrap after col 4, while start had pending_wrap at (1, 4) -> close_zone starts at (1, 5).
         assert_eq!(t_even.shell_zones().len(), 1);
-        assert_eq!(t_even.shell_zones()[0].start_col, 5);
+        assert_eq!(t_even.shell_zones().get(0).unwrap().start_col, 5);
 
         let mut t_wrap = Terminal::new(10, 4, CoreConfig::default());
         t_wrap.advance(b"1234567890\x1b]133;A\x07AB\x1b[1;1H");
         t_wrap.resize(20, 4);
         t_wrap.advance(b"\x1b[1;13H\x1b]133;B\x07");
         assert_eq!(t_wrap.shell_zones().len(), 1);
-        assert_eq!(
-            (
-                t_wrap.shell_zones()[0].start_col,
-                t_wrap.shell_zones()[0].end_col
-            ),
-            (10, 12)
-        );
+        let z0 = t_wrap.shell_zones().get(0).unwrap();
+        assert_eq!((z0.start_col, z0.end_col), (10, 12));
     }
 
     #[cfg(feature = "serde")]
@@ -3517,5 +3920,148 @@ mod tests {
         assert_eq!(whole_b.command_output_at(0).as_deref(), Some(""));
         assert_eq!(split_b.command_output_at(0).as_deref(), Some(""));
         assert_eq!(byte_b.command_output_at(0).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn vecdeque_eviction_zones_view_range_and_log_z_lookup() {
+        use crate::cell::{Cell, CellFlags};
+        use crate::color::PackedColor;
+        use crate::grid::ScreenKind;
+
+        let mut grid = Grid::new(ScreenKind::Primary, 20, 4, 24);
+        let mut si = ShellIntegrationState::new(24, 4);
+        let mut events = Vec::new();
+
+        // Populate 20 commands (each 2 lines: Prompt+Input on row A, Output on row B)
+        // so scrollback wraps around and evicts earlier commands.
+        for i in 0..20u32 {
+            grid.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+            si.sync_with_grid(&grid);
+            si.handle_osc_133(&[b"133", b"A"], &grid, 3, 0, false, &mut events);
+            si.handle_osc_133(&[b"133", b"B"], &grid, 3, 2, false, &mut events);
+            si.handle_osc_133(&[b"133", b"C"], &grid, 3, 4, false, &mut events);
+            grid.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+            si.sync_with_grid(&grid);
+            let txt = format!("out{i:02}");
+            for (c, ch) in txt.chars().enumerate() {
+                grid.write_cell(
+                    3,
+                    c,
+                    Cell::new(
+                        ch,
+                        PackedColor::Default,
+                        PackedColor::Default,
+                        CellFlags::empty(),
+                    ),
+                    None,
+                    PackedColor::Default,
+                );
+            }
+            si.handle_osc_133(
+                &[b"133", b"D", b"0"],
+                &grid,
+                3,
+                txt.len(),
+                false,
+                &mut events,
+            );
+            si.sync_with_grid(&grid);
+        }
+
+        let view = si.zones_view(&grid);
+        assert!(!view.is_empty());
+        assert_eq!(view.len(), view.to_vec().len());
+        assert_eq!(view.first(), view.get(0));
+        assert_eq!(view.last(), view.get(view.len() - 1));
+        assert!(view.get(view.len()).is_none());
+
+        // in_line_range binary search must match full scan exactly across all ranges.
+        let all = view.to_vec();
+        let total = grid.total_len();
+        for start in 0..=total {
+            for end in start..=(total + 1) {
+                let expected: Vec<ShellZone> = all
+                    .iter()
+                    .filter(|z| z.end_line >= start && z.start_line < end)
+                    .cloned()
+                    .collect();
+                let got: Vec<ShellZone> = view.in_line_range(start, end).collect();
+                assert_eq!(
+                    got, expected,
+                    "in_line_range({start}, {end}) mismatch after eviction"
+                );
+            }
+        }
+
+        // O(log Z) command_output_at resolves both Output line and Prompt line.
+        let last_out = all
+            .iter()
+            .rev()
+            .find(|z| z.kind == ZoneKind::Output)
+            .unwrap();
+        assert_eq!(
+            si.command_output_at(&grid, last_out.start_line).as_deref(),
+            Some("out19")
+        );
+        let last_prompt = all
+            .iter()
+            .rev()
+            .find(|z| z.kind == ZoneKind::Prompt)
+            .unwrap();
+        assert_eq!(
+            si.command_output_at(&grid, last_prompt.start_line)
+                .as_deref(),
+            Some("out19")
+        );
+
+        // O(log Z) jump_to_prompt navigates backwards and forwards cleanly.
+        assert_eq!(grid.display_offset(), 0);
+        assert!(si.jump_to_prompt(&mut grid, -1));
+        let off1 = grid.display_offset();
+        assert!(off1 > 0);
+        assert!(si.jump_to_prompt(&mut grid, -2));
+        assert!(grid.display_offset() > off1);
+        assert!(si.jump_to_prompt(&mut grid, 1));
+        assert!(grid.display_offset() < off1 + 20);
+    }
+
+    #[test]
+    fn close_zone_out_of_order_overflow_evicts_middle_dead_zones_preserving_live_front() {
+        use crate::color::PackedColor;
+        use crate::grid::ScreenKind;
+
+        let mut grid = Grid::new(ScreenKind::Primary, 20, 4, 0);
+        let mut si = ShellIntegrationState::new(0, 4);
+        let mut events = Vec::new();
+
+        // Live command on row 3 (abs line 3), followed by 84 commands on row 0 (abs line 0)
+        // to mark has_out_of_order = true while holding 255 zones (<= max_zones) before scroll.
+        si.handle_osc_133(&[b"133", b"A"], &grid, 3, 0, false, &mut events);
+        si.handle_osc_133(&[b"133", b"B"], &grid, 3, 2, false, &mut events);
+        si.handle_osc_133(&[b"133", b"C"], &grid, 3, 4, false, &mut events);
+        si.handle_osc_133(&[b"133", b"D", b"1"], &grid, 3, 8, false, &mut events);
+
+        for _ in 0..84 {
+            si.handle_osc_133(&[b"133", b"A"], &grid, 0, 0, false, &mut events);
+            si.handle_osc_133(&[b"133", b"B"], &grid, 0, 2, false, &mut events);
+            si.handle_osc_133(&[b"133", b"C"], &grid, 0, 4, false, &mut events);
+            si.handle_osc_133(&[b"133", b"D", b"0"], &grid, 0, 8, false, &mut events);
+        }
+
+        // Scroll 1 row so abs line 0 is evicted (oldest == 1) while front abs line 3 remains live.
+        grid.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+        let oldest = grid.oldest_abs_line();
+
+        // Pushing another command triggers > max_zones (256) with a live front zone and dead middle zones.
+        si.handle_osc_133(&[b"133", b"A"], &grid, 3, 0, false, &mut events);
+        si.handle_osc_133(&[b"133", b"B"], &grid, 3, 2, false, &mut events);
+        si.handle_osc_133(&[b"133", b"C"], &grid, 3, 4, false, &mut events);
+        si.handle_osc_133(&[b"133", b"D", b"9"], &grid, 3, 8, false, &mut events);
+
+        let view = si.zones_view(&grid);
+        assert_eq!(view.len(), 6);
+        assert!(view.iter().all(|z| z.end_abs.line >= oldest));
+        assert_eq!(view.first().unwrap().exit_code, Some(1));
+        assert_eq!(view.last().unwrap().exit_code, Some(9));
     }
 }

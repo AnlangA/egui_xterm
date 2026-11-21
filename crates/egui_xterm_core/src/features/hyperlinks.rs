@@ -1,7 +1,7 @@
 //! Explicit (`OSC 8`) and implicit (`http://`, `https://`, `ftp://`) hyperlink tracking
 //! (`hyperlinks` feature).
 
-use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use crate::cell::{HyperlinkId, HyperlinkPool, MAX_HYPERLINK_URI_BYTES};
 use crate::features::{CellSpan, extract_logical_line_with_spans};
@@ -50,23 +50,28 @@ impl ImplicitLink {
 /// Per-screen incremental store of implicitly detected `http://`, `https://`, and `ftp://` links.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ImplicitLinkStore {
-    links: Vec<ImplicitLink>,
+    links: VecDeque<ImplicitLink>,
     last_content_epoch: u64,
     last_damage_epoch: u64,
     last_cols: usize,
     last_oldest_line: AbsLine,
+    text_buf: String,
+    spans: Vec<CellSpan>,
 }
 
 impl ImplicitLinkStore {
     pub(crate) fn clear(&mut self) {
         self.links.clear();
+        self.text_buf.clear();
+        self.spans.clear();
         self.last_content_epoch = 0;
         self.last_damage_epoch = 0;
         self.last_cols = 0;
         self.last_oldest_line = AbsLine(0);
     }
 
-    pub(crate) fn refresh(&mut self, grid: &Grid) {
+    /// Incrementally updates implicit hyperlinks for grid mutations starting at `dirty_from`.
+    pub(crate) fn refresh_dirty(&mut self, grid: &Grid, dirty_from: Option<AbsLine>) {
         let content_epoch = grid.content_epoch();
         let damage_epoch = grid.damage_epoch();
         let cols = grid.cols();
@@ -76,110 +81,127 @@ impl ImplicitLinkStore {
         }
 
         let oldest = grid.oldest_abs_line();
-        let force_rescan = self.last_cols != cols || self.last_content_epoch == 0;
-        let head_evicted = !force_rescan && oldest > self.last_oldest_line;
-        let mut dropped_ranges: Vec<(AbsLine, AbsLine)> = Vec::new();
+        let Some(end_buf_idx) = grid.last_non_empty_buf_idx() else {
+            self.links.clear();
+            self.last_content_epoch = content_epoch;
+            self.last_damage_epoch = damage_epoch;
+            self.last_cols = cols;
+            self.last_oldest_line = oldest;
+            return;
+        };
+
+        let force_rescan = self.last_cols != cols
+            || self.last_content_epoch == 0
+            || oldest < self.last_oldest_line;
+
         if force_rescan {
             self.links.clear();
+            scan_buf_range(
+                grid,
+                0,
+                end_buf_idx,
+                &mut self.text_buf,
+                &mut self.spans,
+                &mut self.links,
+            );
         } else {
-            let prev_damage = self.last_damage_epoch;
-            self.links.retain(|link| {
-                if link.start_line < oldest {
-                    if link.end_line >= oldest {
-                        dropped_ranges.push((oldest, link.end_line));
-                    }
-                    return false;
+            let head_evicted = oldest > self.last_oldest_line;
+            if head_evicted {
+                while self.links.front().is_some_and(|l| l.end_line < oldest) {
+                    self.links.pop_front();
                 }
-                let mut line = link.start_line.0;
-                while line <= link.end_line.0 {
-                    let Some(row) = grid.row_by_abs(AbsLine(line)) else {
-                        dropped_ranges.push((link.start_line, link.end_line));
-                        return false;
-                    };
-                    if row.generation() > prev_damage {
-                        dropped_ranges.push((link.start_line, link.end_line));
-                        return false;
-                    }
-                    line += 1;
+                while self.links.front().is_some_and(|l| l.start_line < oldest) {
+                    self.links.pop_front();
                 }
-                true
-            });
-        }
-
-        if let Some(end_buf_idx) = grid.last_non_empty_buf_idx() {
-            let mut text_buf = String::new();
-            let mut spans: Vec<CellSpan> = Vec::new();
-            let mut phys_start = 0usize;
-
-            while phys_start <= end_buf_idx {
-                let mut phys_end = phys_start;
-                while phys_end < end_buf_idx
-                    && grid.row_by_buf(phys_end).is_some_and(Row::soft_wrapped)
-                {
-                    phys_end += 1;
-                }
-
-                let abs_start = grid.abs_line_of_buf(phys_start);
-                let abs_end = grid.abs_line_of_buf(phys_end);
-                let trailing_erased_continuation = phys_end == end_buf_idx
-                    && grid.row_by_buf(phys_end).is_some_and(Row::soft_wrapped)
-                    && ((end_buf_idx + 1)..grid.total_len()).any(|idx| {
-                        grid.row_by_buf(idx)
-                            .is_some_and(|r| r.generation() > self.last_damage_epoch)
-                    });
-                let had_dropped_link = !dropped_ranges.is_empty()
-                    && dropped_ranges
-                        .iter()
-                        .any(|&(s, e)| !(e < abs_start || s > abs_end));
-                let evicted_head_line = head_evicted && phys_start == 0;
-                let prev_row_dirty = phys_start > 0
-                    && grid
-                        .row_by_buf(phys_start - 1)
-                        .is_some_and(|r| r.generation() > self.last_damage_epoch);
-
-                let any_dirty = force_rescan
-                    || evicted_head_line
-                    || prev_row_dirty
-                    || trailing_erased_continuation
-                    || had_dropped_link
-                    || (phys_start..=phys_end).any(|idx| {
-                        grid.row_by_buf(idx)
-                            .is_some_and(|r| r.generation() > self.last_damage_epoch)
-                    });
-
-                if any_dirty {
-                    if !force_rescan && !self.links.is_empty() {
-                        self.links
-                            .retain(|l| l.end_line < abs_start || l.start_line > abs_end);
-                    }
-
-                    let has_colon = (phys_start..=phys_end).any(|idx| {
-                        grid.row_by_buf(idx).is_some_and(|row| {
-                            let trimmed = row.trimmed_len();
-                            row.cells()[..trimmed].iter().any(|c| c.codepoint == ':')
-                        })
-                    });
-
-                    if has_colon {
-                        extract_logical_line_with_spans(
-                            grid,
-                            phys_start,
-                            phys_end,
-                            &mut text_buf,
-                            &mut spans,
-                        );
-                        scan_implicit_urls(grid, &text_buf, &spans, &mut self.links);
-                    }
-                }
-
-                phys_start = phys_end + 1;
             }
-        } else {
-            self.links.clear();
+
+            let max_abs_non_empty = grid.abs_line_of_buf(end_buf_idx);
+            while self
+                .links
+                .back()
+                .is_some_and(|l| l.end_line > max_abs_non_empty)
+            {
+                self.links.pop_back();
+            }
+
+            let scan_start_buf = if let Some(d) = dirty_from {
+                let raw = if d <= oldest {
+                    0
+                } else if let Some(idx) = grid.buf_idx_of_abs(d) {
+                    idx
+                } else {
+                    end_buf_idx + 1
+                };
+
+                if raw > end_buf_idx {
+                    while self.links.back().is_some_and(|l| l.end_line >= d) {
+                        self.links.pop_back();
+                    }
+                    if grid.row_by_buf(end_buf_idx).is_some_and(Row::soft_wrapped) {
+                        let start = logical_line_start(grid, end_buf_idx);
+                        let abs_start = grid.abs_line_of_buf(start);
+                        while self.links.back().is_some_and(|l| l.end_line >= abs_start) {
+                            self.links.pop_back();
+                        }
+                        start
+                    } else {
+                        end_buf_idx + 1
+                    }
+                } else {
+                    let start = logical_line_start(grid, raw);
+                    let abs_start = grid.abs_line_of_buf(start);
+                    while self.links.back().is_some_and(|l| l.end_line >= abs_start) {
+                        self.links.pop_back();
+                    }
+                    start
+                }
+            } else {
+                end_buf_idx + 1
+            };
+
+            if head_evicted && scan_start_buf > 0 {
+                let mut phys_end_0 = 0usize;
+                while phys_end_0 < end_buf_idx
+                    && grid.row_by_buf(phys_end_0).is_some_and(Row::soft_wrapped)
+                {
+                    phys_end_0 += 1;
+                }
+                let abs_end_0 = grid.abs_line_of_buf(phys_end_0);
+                while self
+                    .links
+                    .front()
+                    .is_some_and(|l| l.start_line <= abs_end_0)
+                {
+                    self.links.pop_front();
+                }
+                if logical_line_has_scheme_sep(grid, 0, phys_end_0) {
+                    extract_logical_line_with_spans(
+                        grid,
+                        0,
+                        phys_end_0,
+                        &mut self.text_buf,
+                        &mut self.spans,
+                    );
+                    let mut front_links = VecDeque::new();
+                    scan_implicit_urls(grid, &self.text_buf, &self.spans, &mut front_links);
+                    for link in front_links.into_iter().rev() {
+                        self.links.push_front(link);
+                    }
+                }
+            }
+
+            if scan_start_buf <= end_buf_idx {
+                scan_buf_range(
+                    grid,
+                    scan_start_buf,
+                    end_buf_idx,
+                    &mut self.text_buf,
+                    &mut self.spans,
+                    &mut self.links,
+                );
+            }
         }
 
-        self.links
-            .sort_unstable_by_key(|a| (a.start_line, a.start_col));
         self.last_content_epoch = content_epoch;
         self.last_damage_epoch = damage_epoch;
         self.last_cols = cols;
@@ -187,10 +209,23 @@ impl ImplicitLinkStore {
     }
 
     pub(crate) fn find_at(&self, line: AbsLine, col: u16) -> Option<&HyperlinkInfo> {
-        self.links
+        self.find_link(line, col).map(|link| &link.info)
+    }
+
+    fn find_link(&self, line: AbsLine, col: u16) -> Option<&ImplicitLink> {
+        let (a, b) = self.links.as_slices();
+        let slice = if let Some(b_first) = b.first()
+            && (line, col) >= (b_first.start_line, b_first.start_col)
+        {
+            b
+        } else {
+            a
+        };
+        let idx = slice.partition_point(|l| l.end_line < line);
+        slice[idx..]
             .iter()
-            .find(|link| link.contains(line, col))
-            .map(|link| &link.info)
+            .take_while(|l| l.start_line <= line)
+            .find(|l| l.contains(line, col))
     }
 
     pub(crate) fn visible_spans_at(
@@ -199,7 +234,7 @@ impl ImplicitLinkStore {
         line: AbsLine,
         col: u16,
     ) -> Option<(&HyperlinkInfo, Vec<HyperlinkSpan>)> {
-        let link = self.links.iter().find(|link| link.contains(line, col))?;
+        let link = self.find_link(line, col)?;
         let mut out = Vec::new();
         let cols_u16 = u16::try_from(grid.cols()).unwrap_or(u16::MAX);
         for vp_row in 0..grid.viewport_rows() {
@@ -236,6 +271,69 @@ impl ImplicitLinkStore {
     }
 }
 
+fn logical_line_start(grid: &Grid, mut buf_idx: usize) -> usize {
+    while buf_idx > 0 && grid.row_by_buf(buf_idx - 1).is_some_and(Row::soft_wrapped) {
+        buf_idx -= 1;
+    }
+    buf_idx
+}
+
+fn logical_line_has_scheme_sep(grid: &Grid, phys_start: usize, phys_end: usize) -> bool {
+    let mut stage = 0u8;
+    for r in phys_start..=phys_end {
+        let Some(row) = grid.row_by_buf(r) else {
+            continue;
+        };
+        let cells = row.cells();
+        let cols = cells.len();
+        let take_end = if r < phys_end {
+            if cols > 0 && cells[cols - 1].is_wrap_spacer() {
+                cols - 1
+            } else {
+                cols
+            }
+        } else {
+            row.trimmed_len()
+        };
+        for &cell in &cells[..take_end] {
+            if cell.is_wide_spacer() || cell.is_wrap_spacer() || cell.is_sized_spacer() {
+                continue;
+            }
+            stage = match (stage, cell.codepoint) {
+                (_, ':') => 1,
+                (1, '/') => 2,
+                (2, '/') => return true,
+                _ => 0,
+            };
+        }
+    }
+    false
+}
+
+fn scan_buf_range(
+    grid: &Grid,
+    start_buf: usize,
+    end_buf_idx: usize,
+    text_buf: &mut String,
+    spans: &mut Vec<CellSpan>,
+    out: &mut VecDeque<ImplicitLink>,
+) {
+    let mut phys_start = start_buf;
+    while phys_start <= end_buf_idx {
+        let mut phys_end = phys_start;
+        while phys_end < end_buf_idx && grid.row_by_buf(phys_end).is_some_and(Row::soft_wrapped) {
+            phys_end += 1;
+        }
+
+        if logical_line_has_scheme_sep(grid, phys_start, phys_end) {
+            extract_logical_line_with_spans(grid, phys_start, phys_end, text_buf, spans);
+            scan_implicit_urls(grid, text_buf, spans, out);
+        }
+
+        phys_start = phys_end + 1;
+    }
+}
+
 fn cell_has_explicit_link(grid: &Grid, span: &CellSpan) -> bool {
     let Some(row) = grid.row_by_buf(span.buf_row) else {
         return false;
@@ -249,7 +347,12 @@ fn cell_has_explicit_link(grid: &Grid, span: &CellSpan) -> bool {
             .is_some_and(|e| e.hyperlink_id.is_some())
 }
 
-fn scan_implicit_urls(grid: &Grid, text: &str, spans: &[CellSpan], out: &mut Vec<ImplicitLink>) {
+fn scan_implicit_urls(
+    grid: &Grid,
+    text: &str,
+    spans: &[CellSpan],
+    out: &mut VecDeque<ImplicitLink>,
+) {
     const SCHEMES: [&str; 3] = ["https://", "http://", "ftp://"];
     let bytes = text.as_bytes();
     let mut cursor = 0usize;
@@ -336,7 +439,7 @@ fn scan_implicit_urls(grid: &Grid, text: &str, spans: &[CellSpan], out: &mut Vec
                     .partition_point(|s| s.byte_start < url_end)
                     .saturating_sub(1);
                 if let (Some(first), Some(last)) = (spans.get(first_idx), spans.get(last_idx)) {
-                    out.push(ImplicitLink {
+                    out.push_back(ImplicitLink {
                         info: HyperlinkInfo {
                             id: None,
                             uri: url_str.to_owned(),
@@ -516,23 +619,6 @@ pub(crate) fn explicit_visible_spans(
         });
     }
     spans
-}
-
-/// Helper to collect all live `HyperlinkId`s referenced by a [`Grid`].
-pub(crate) fn collect_grid_hyperlink_ids(grid: &Grid, out: &mut HashSet<HyperlinkId>) {
-    for row in grid.rows_deque() {
-        if !row.may_have_extras() {
-            continue;
-        }
-        for cell in row.cells() {
-            if cell.extra_id != 0
-                && let Some(ext) = grid.cell_extra(cell.extra_id)
-                && let Some(hid) = ext.hyperlink_id
-            {
-                out.insert(hid);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -938,5 +1024,82 @@ mod tests {
             t_sb.hyperlink_at(0, 1).map(|h| h.uri.as_str()),
             Some("https://b.test/ok")
         );
+    }
+
+    #[test]
+    fn scheme_sep_prefilter_dirty_range_and_vecdeque_lookup() {
+        use super::{ImplicitLinkStore, logical_line_has_scheme_sep};
+        use crate::cell::{Cell, CellFlags};
+        use crate::color::PackedColor;
+        use crate::grid::{Grid, ScreenKind};
+
+        let mut grid = Grid::new(ScreenKind::Primary, 6, 4, 4);
+        let write_str = |g: &mut Grid, vp_row: usize, s: &str, soft_wrap: bool| {
+            for (c, ch) in s.chars().enumerate() {
+                g.write_cell(
+                    vp_row,
+                    c,
+                    Cell::new(
+                        ch,
+                        PackedColor::Default,
+                        PackedColor::Default,
+                        CellFlags::empty(),
+                    ),
+                    None,
+                    PackedColor::Default,
+                );
+            }
+            if soft_wrap {
+                g.set_row_soft_wrapped(vp_row, true);
+            }
+        };
+
+        // Timestamps with ':' never trigger scheme separator prefilter.
+        write_str(&mut grid, 0, "12:00:", true);
+        write_str(&mut grid, 1, "00Z ok", false);
+        assert!(!logical_line_has_scheme_sep(&grid, 0, 1));
+
+        // "http:" split right at soft-wrap boundary before "//a.io" is detected by prefilter.
+        write_str(&mut grid, 2, " http:", true);
+        write_str(&mut grid, 3, "//a.io", false);
+        assert!(logical_line_has_scheme_sep(&grid, 2, 3));
+
+        let mut store = ImplicitLinkStore::default();
+        store.refresh_dirty(&grid, Some(grid.oldest_abs_line()));
+        assert_eq!(
+            store
+                .find_at(grid.abs_line_of_buf(2), 1)
+                .map(|h| h.uri.as_str()),
+            Some("http://a.io")
+        );
+        assert_eq!(
+            store
+                .find_at(grid.abs_line_of_buf(3), 5)
+                .map(|h| h.uri.as_str()),
+            Some("http://a.io")
+        );
+
+        // Scroll & evict while adding many links so VecDeque wraps around (both as_slices() non-empty).
+        let mut big = Grid::new(ScreenKind::Primary, 24, 4, 16);
+        let mut big_store = ImplicitLinkStore::default();
+        for i in 0..40 {
+            big.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+            let dirty = big.live_viewport_to_abs(3);
+            let s = format!("https://u{i:02}.test/p");
+            write_str(&mut big, 3, &s, false);
+            big_store.refresh_dirty(&big, Some(dirty));
+        }
+        // Verify every retained line resolves via binary search on VecDeque slices.
+        for buf_idx in 0..big.total_len() {
+            let abs = big.abs_line_of_buf(buf_idx);
+            let row = big.row_by_buf(buf_idx).unwrap();
+            if row.trimmed_len() > 0 {
+                assert!(
+                    big_store.find_at(abs, 0).is_some(),
+                    "missing link at buf_idx={buf_idx} abs={abs:?}"
+                );
+            }
+        }
+        assert!(big_store.find_at(crate::grid::AbsLine(0), 0).is_none());
     }
 }

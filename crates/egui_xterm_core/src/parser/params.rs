@@ -55,6 +55,7 @@ impl CsiParams {
     }
 
     /// Appends a decimal digit (`0..=9`) to the active slot with `u16` saturation.
+    #[inline]
     pub(crate) fn push_digit(&mut self, digit: u8) {
         if self.truncated {
             return;
@@ -67,7 +68,26 @@ impl CsiParams {
         *slot = slot.saturating_mul(10).saturating_add(u16::from(digit));
     }
 
+    /// Begins or resumes the active parameter slot, returning its current `u16` value.
+    #[inline]
+    pub(crate) fn start_or_resume_param(&mut self) -> u16 {
+        if !self.in_param {
+            self.values[self.current_slot as usize] = 0;
+            self.in_param = true;
+            0
+        } else {
+            self.values[self.current_slot as usize]
+        }
+    }
+
+    /// Updates the active parameter slot value after [`Self::start_or_resume_param`].
+    #[inline]
+    pub(crate) fn set_active_param(&mut self, value: u16) {
+        self.values[self.current_slot as usize] = value;
+    }
+
     /// Commits the current parameter and advances to the next `;`-delimited parameter.
+    #[inline]
     pub(crate) fn next_param(&mut self) {
         if self.truncated {
             return;
@@ -89,6 +109,7 @@ impl CsiParams {
     }
 
     /// Advances to the next `:`-delimited subparameter within the current parameter.
+    #[inline]
     pub(crate) fn next_subparam(&mut self) {
         if self.truncated {
             return;
@@ -110,6 +131,7 @@ impl CsiParams {
     }
 
     /// Finalizes any trailing active parameter before dispatch.
+    #[inline]
     pub(crate) fn finish(&mut self) {
         if self.in_param {
             let next = self.current_slot + 1;

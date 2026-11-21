@@ -143,9 +143,9 @@ fn apply_search_query(state: &mut SearchBarState, terminal: &mut Terminal) {
 
 fn apply_search_step(terminal: &mut Terminal, step_dir: i32) {
     if step_dir > 0 {
-        let _ = terminal.next_search_match();
+        terminal.next_search_match();
     } else if step_dir < 0 {
-        let _ = terminal.prev_search_match();
+        terminal.prev_search_match();
     }
 }
 

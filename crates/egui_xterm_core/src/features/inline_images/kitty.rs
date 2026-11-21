@@ -236,17 +236,21 @@ fn write_response(
 
     let mut resp = String::from("\x1b_G");
     if image_id != 0 {
-        let _ = write!(resp, "i={image_id}");
-    } else if image_number != 0 {
-        let _ = write!(resp, "I={image_number}");
+        if write!(resp, "i={image_id}").is_err() {
+            // `String`'s `fmt::Write` impl is infallible.
+        }
+    } else if image_number != 0 && write!(resp, "I={image_number}").is_err() {
+        // `String`'s `fmt::Write` impl is infallible.
     }
-    if placement_id != 0 {
-        let _ = write!(resp, ",p={placement_id}");
+    if placement_id != 0 && write!(resp, ",p={placement_id}").is_err() {
+        // `String`'s `fmt::Write` impl is infallible.
     }
     match status {
         Ok(()) => resp.push_str(";OK\x1b\\"),
         Err(msg) => {
-            let _ = write!(resp, ";{msg}\x1b\\");
+            if write!(resp, ";{msg}\x1b\\").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
     }
     outgoing.extend_from_slice(resp.as_bytes());

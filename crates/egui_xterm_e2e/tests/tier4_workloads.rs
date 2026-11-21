@@ -105,14 +105,15 @@ fn w2_60fps_system_monitor() {
         h.advance_time(1.0 / 60.0);
         let pct = (frame * 7) % 100;
         let mut payload = String::with_capacity(512);
-        let _ = write!(
+        write!(
             payload,
             "\x1b[?2026h\x1b[H┌──────System Monitor F{frame:02}──────┐\r\n\
              │CPU \x1b[48:2::30:140:70m▁▃▅▇█\x1b[0m {pct:02}% ⣿⣿⣿⣿│\r\n\
              │RAM \x1b[48:2::40:90:180m▁▃▅▇ \x1b[0m {}% ⡇⡇⡇⡇│\r\n\
              └───────────────────────────────┘\x1b[?2026l",
             (pct + 15) % 100
-        );
+        )
+        .expect("String fmt::Write is infallible");
         h.runtime.input_mut().push_str(&payload);
 
         if frame == 30 {
@@ -189,7 +190,8 @@ fn w3_interactive_developer_shell() {
     let mut transcript =
         String::from("\x1b]133;A\x07$ \x1b]133;B\x07cargo test -p ok\r\n\x1b]133;C\x07");
     for i in 0..60 {
-        let _ = writeln!(transcript, "\x1b[32mok\x1b[0m case_{i:02}\r");
+        writeln!(transcript, "\x1b[32mok\x1b[0m case_{i:02}\r")
+            .expect("String fmt::Write is infallible");
     }
     transcript.push_str("\x1b]133;D;0\x07");
     transcript.push_str(

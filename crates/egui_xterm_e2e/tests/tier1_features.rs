@@ -201,6 +201,10 @@ impl VtHandler for RecordingHandler {
     }
 
     fn print_ascii_run(&mut self, bytes: &[u8]) {
+        #[expect(
+            clippy::expect_used,
+            reason = "test spy helper: parser guarantees ASCII run"
+        )]
         let s = std::str::from_utf8(bytes)
             .expect("ASCII run is valid UTF-8")
             .to_owned();
@@ -2071,7 +2075,7 @@ mod stage_m4_f18 {
     fn f18_t1_01_focus_and_event_filter_capture_tab_and_arrows() {
         let mut h = HeadlessTermHarness::scripted();
         let _ = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("other_focusable");
+            drop(ui.button("other_focusable"));
             runtime.show_with_config(ui, config)
         });
         let center = h
@@ -2085,14 +2089,14 @@ mod stage_m4_f18 {
         h.inject_pointer_button(center, PointerButton::Primary, true, Modifiers::NONE);
         h.inject_pointer_button(center, PointerButton::Primary, false, Modifiers::NONE);
         let _ = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("other_focusable");
+            drop(ui.button("other_focusable"));
             runtime.show_with_config(ui, config)
         });
 
         h.tap_key(Key::Tab, Modifiers::NONE);
         h.tap_key(Key::ArrowUp, Modifiers::NONE);
         let outcome = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("other_focusable");
+            drop(ui.button("other_focusable"));
             runtime.show_with_config(ui, config)
         });
         assert!(outcome.terminal_response.response.has_focus());
@@ -2358,13 +2362,14 @@ mod stage_m4_f19 {
         let mut dense = String::new();
         for row in 0..total_rows {
             for col in 0..total_cols {
-                let _ = write!(
+                write!(
                     dense,
                     "\x1b[38;2;{};{};{}mX",
                     (col * 2) % 255,
                     (row * 6) % 255,
                     128
-                );
+                )
+                .expect("String fmt::Write is infallible");
             }
             if row + 1 < total_rows {
                 dense.push_str("\r\n");
@@ -2383,7 +2388,8 @@ mod stage_m4_f19 {
         let update_rows = (total_rows / 5).max(8).min(total_rows);
         let mut patch = String::new();
         for row in 1..=update_rows {
-            let _ = write!(patch, "\x1b[{row};1HUPDATED_ROW_{row:02}");
+            write!(patch, "\x1b[{row};1HUPDATED_ROW_{row:02}")
+                .expect("String fmt::Write is infallible");
         }
         h.runtime.input_mut().push_str(&patch);
 
@@ -2416,7 +2422,7 @@ mod stage_m4_f19 {
         for frame in 0..200 {
             let mut batch = String::new();
             for line in 0..100 {
-                let _ = writeln!(batch, "churn {frame}:{line}\r");
+                writeln!(batch, "churn {frame}:{line}\r").expect("String fmt::Write is infallible");
             }
             h.runtime.input_mut().push_str(&batch);
             let _ = h.run_frame();
@@ -2532,7 +2538,9 @@ mod stage_m5_f20 {
         let (text, ok) = poll_until(&mut backend, Duration::from_secs(5), |s, _| {
             s.contains("ROUNDTRIP_123")
         });
-        let _ = backend.write_bytes(b"exit\r");
+        if backend.write_bytes(b"exit\r").is_err() {
+            // Child may have already exited.
+        }
         assert!(ok, "missing ROUNDTRIP_123: {text:?}");
     }
 
@@ -2640,7 +2648,9 @@ mod stage_m5_f20 {
         let (text, ok) = poll_until(&mut backend, Duration::from_secs(8), |s, _| {
             s.contains(expected)
         });
-        let _ = backend.write_bytes(b"exit\r");
+        if backend.write_bytes(b"exit\r").is_err() {
+            // Child may have already exited.
+        }
         assert!(ok, "expected {expected:?} in {text:?}");
     }
 

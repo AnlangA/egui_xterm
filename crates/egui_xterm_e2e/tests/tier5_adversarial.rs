@@ -542,6 +542,7 @@ fn t5_f11_search_combining_wide_wrap_unicode_ci_and_eviction() {
             pattern: "k".to_owned(),
             is_regex: false,
             case_sensitive: false,
+            whole_word: false,
         })
         .expect("valid ci literal");
     assert_eq!(ci.len(), 3, "expected 2 ASCII 'k' + Kelvin U+212A: {ci:?}");

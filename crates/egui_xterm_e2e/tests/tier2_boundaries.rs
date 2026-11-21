@@ -331,7 +331,7 @@ mod stage_m1_f3 {
             if i > 1 {
                 many_params.push(';');
             }
-            let _ = write!(many_params, "{i}");
+            write!(many_params, "{i}").expect("String fmt::Write is infallible");
         }
         many_params.push('m');
         parser.advance(many_params.as_bytes(), &mut spy);
@@ -2211,7 +2211,7 @@ mod stage_m4_f17 {
             egui::Modifiers::NONE,
         );
         let unfocused_out = h.run_frame_in_ui(|ui, runtime, config| {
-            let _ = ui.button("ext");
+            drop(ui.button("ext"));
             let resp = runtime.show_with_config(ui, config);
             term_rect = resp.response.rect;
             resp
@@ -2595,7 +2595,7 @@ mod stage_m2_f19 {
         let filler = "x".repeat(174);
         let mut batch = String::with_capacity(2_000 * 182);
         for i in 0..2_000 {
-            let _ = write!(batch, "R{i:04}_{filler}\r\n");
+            write!(batch, "R{i:04}_{filler}\r\n").expect("String fmt::Write is infallible");
         }
         term.advance(batch.as_bytes());
 
@@ -2804,7 +2804,7 @@ mod stage_m5_f20 {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut buf = [0u8; 256];
         while !backend.is_closed() && Instant::now() < deadline {
-            let _ = backend.poll_read(&mut buf);
+            drop(backend.poll_read(&mut buf));
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(backend.is_closed(), "child did not exit within 5s");

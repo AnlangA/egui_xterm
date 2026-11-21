@@ -1,7 +1,7 @@
 //! Compact terminal cell, attribute flags, sparse extra storage, and hyperlink interning.
 
 use std::collections::HashMap;
-#[cfg(any(test, feature = "hyperlinks"))]
+#[cfg(test)]
 use std::collections::HashSet;
 
 use crate::color::PackedColor;
@@ -89,6 +89,10 @@ bitflags::bitflags! {
         const UNDERLINE_BIT1 = 1 << 13;
         /// Most-significant bit of the 3-bit [`UnderlineStyle`] field.
         const UNDERLINE_BIT2 = 1 << 14;
+        /// Character protection attribute (`DECSCA`, `CSI Ps " q`).
+        const PROTECTED      = 1 << 15;
+        /// Continuation/placeholder spacer cell for `OSC 66` sized text.
+        const SIZED_SPACER   = 1 << 16;
     }
 }
 
@@ -96,7 +100,7 @@ impl CellFlags {
     const UNDERLINE_SHIFT: u32 = 12;
     const UNDERLINE_MASK: u32 = 0b111 << Self::UNDERLINE_SHIFT;
 
-    /// Mask of all visual SGR flags, excluding grid-layout spacer flags.
+    /// Mask of all visual SGR flags, excluding layout spacers and `DECSCA` protection.
     pub const SGR_MASK: Self = Self::from_bits_retain(
         Self::BOLD.bits()
             | Self::DIM.bits()
@@ -109,6 +113,10 @@ impl CellFlags {
             | Self::OVERLINE.bits()
             | Self::UNDERLINE_MASK,
     );
+
+    /// Mask of cell attributes applied when writing printable characters (`SGR_MASK | PROTECTED`).
+    pub const WRITE_ATTR_MASK: Self =
+        Self::from_bits_retain(Self::SGR_MASK.bits() | Self::PROTECTED.bits());
 
     /// Extracts the packed [`UnderlineStyle`].
     #[must_use]
@@ -216,6 +224,18 @@ impl Cell {
         self.flags.contains(CellFlags::WRAP_SPACER)
     }
 
+    /// Returns `true` if this cell is protected against selective erasure (`DECSCA`).
+    #[must_use]
+    pub const fn is_protected(&self) -> bool {
+        self.flags.contains(CellFlags::PROTECTED)
+    }
+
+    /// Returns `true` if this cell is a continuation spacer for `OSC 66` sized text.
+    #[must_use]
+    pub const fn is_sized_spacer(&self) -> bool {
+        self.flags.contains(CellFlags::SIZED_SPACER)
+    }
+
     /// Returns the cell's [`UnderlineStyle`].
     #[must_use]
     pub const fn underline_style(&self) -> UnderlineStyle {
@@ -238,7 +258,40 @@ impl Cell {
     }
 }
 
-/// Sparse per-cell extension data for combining marks, underline colors, and hyperlinks.
+const COMBINING_RETAIN_CAP: usize = 64;
+
+/// Metadata for Kitty Text Sizing Protocol (`OSC 66`) attached to the origin cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TextSizing {
+    /// Uniform cell scale factor `s` (`1..=7`, default `1`).
+    pub scale: u8,
+    /// Explicit cell width `w` (`0..=7`, `0` = auto).
+    pub width: u8,
+    /// Fractional scale numerator `n` (`0..=15`, `0` = unscaled).
+    pub frac_num: u8,
+    /// Fractional scale denominator `d` (`0..=15`, `0` = unscaled).
+    pub frac_den: u8,
+    /// Vertical alignment `v` (`0` = top, `1` = bottom, `2` = center).
+    pub v_align: u8,
+    /// Horizontal alignment `h` (`0` = left, `1` = right, `2` = center).
+    pub h_align: u8,
+}
+
+impl Default for TextSizing {
+    fn default() -> Self {
+        Self {
+            scale: 1,
+            width: 0,
+            frac_num: 0,
+            frac_den: 0,
+            v_align: 0,
+            h_align: 0,
+        }
+    }
+}
+
+/// Sparse per-cell extension data for combining marks, underline colors, hyperlinks, and text sizing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CellExtra {
@@ -248,13 +301,30 @@ pub struct CellExtra {
     pub underline_color: Option<PackedColor>,
     /// Optional interned `OSC 8` hyperlink handle.
     pub hyperlink_id: Option<HyperlinkId>,
+    /// Optional `OSC 66` text sizing metadata.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub text_sizing: Option<TextSizing>,
 }
 
 impl CellExtra {
-    /// Returns `true` if no combining marks, underline color, or hyperlink are stored.
+    /// Returns `true` if no combining marks, underline color, hyperlink, or text sizing are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.combining.is_empty() && self.underline_color.is_none() && self.hyperlink_id.is_none()
+        self.combining.is_empty()
+            && self.underline_color.is_none()
+            && self.hyperlink_id.is_none()
+            && self.text_sizing.is_none()
+    }
+
+    /// Clears all fields in place while retaining `combining` capacity up to a bounded cap.
+    pub fn clear(&mut self) {
+        self.combining.clear();
+        if self.combining.capacity() > COMBINING_RETAIN_CAP {
+            self.combining.shrink_to(COMBINING_RETAIN_CAP);
+        }
+        self.underline_color = None;
+        self.hyperlink_id = None;
+        self.text_sizing = None;
     }
 
     /// Appends a combining scalar value to the cell's grapheme cluster.
@@ -336,15 +406,18 @@ impl HyperlinkPool {
         {
             return None;
         }
-        Some(self.intern(id, uri))
+        self.try_intern_inner(id, uri)
     }
 
     /// Interns `(id, uri)` and returns a stable [`HyperlinkId`], allocating only on cache miss.
     ///
-    /// # Panics
-    ///
-    /// Panics if more than `u32::MAX` distinct hyperlinks are interned in a single pool.
+    /// Returns `HyperlinkId(u32::MAX)` if the pool capacity exceeds `u32::MAX`.
     pub fn intern(&mut self, id: Option<&str>, uri: &str) -> HyperlinkId {
+        self.try_intern_inner(id, uri)
+            .unwrap_or(HyperlinkId(u32::MAX))
+    }
+
+    fn try_intern_inner(&mut self, id: Option<&str>, uri: &str) -> Option<HyperlinkId> {
         if let Some(candidates) = self.by_uri.get(uri) {
             for &hid in candidates {
                 if self
@@ -353,7 +426,7 @@ impl HyperlinkPool {
                     .and_then(Option::as_ref)
                     .is_some_and(|link| link.id.as_deref() == id)
                 {
-                    return hid;
+                    return Some(hid);
                 }
             }
         }
@@ -366,22 +439,35 @@ impl HyperlinkPool {
             self.slots[slot_idx as usize] = Some(entry);
             HyperlinkId(slot_idx)
         } else {
-            let raw_id =
-                u32::try_from(self.slots.len()).expect("hyperlink pool capacity exceeded u32::MAX");
+            let Ok(raw_id) = u32::try_from(self.slots.len()) else {
+                return None;
+            };
+            if raw_id == u32::MAX {
+                return None;
+            }
             self.slots.push(Some(entry));
             HyperlinkId(raw_id)
         };
         self.live_count += 1;
         self.by_uri.entry(uri.to_owned()).or_default().push(hid);
-        hid
+        Some(hid)
+    }
+
+    /// Returns the total number of backing slots currently allocated in the pool.
+    #[cfg(any(test, feature = "hyperlinks"))]
+    #[must_use]
+    pub(crate) fn slots_len(&self) -> usize {
+        self.slots.len()
     }
 
     /// Reclaims any interned hyperlinks not present in `live`.
-    #[cfg(any(test, feature = "hyperlinks"))]
+    #[cfg(test)]
     pub(crate) fn gc_unreferenced(&mut self, live: &HashSet<HyperlinkId>) {
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_some() {
-                let raw = u32::try_from(idx).expect("slot index fits in u32");
+                let Ok(raw) = u32::try_from(idx) else {
+                    break;
+                };
                 let hid = HyperlinkId(raw);
                 if !live.contains(&hid) {
                     *slot = None;
@@ -392,6 +478,37 @@ impl HyperlinkPool {
         }
         self.by_uri.retain(|_, ids| {
             ids.retain(|id| live.contains(id));
+            !ids.is_empty()
+        });
+        if self.live_count == 0 {
+            self.slots.clear();
+            self.free_slots.clear();
+            self.by_uri.clear();
+        }
+    }
+
+    /// Reclaims any interned hyperlinks whose bit index is unset in `live_bits`.
+    #[cfg(any(test, feature = "hyperlinks"))]
+    pub(crate) fn gc_unreferenced_bitset(&mut self, live_bits: &[u64]) {
+        let is_live = |idx: usize| -> bool {
+            live_bits
+                .get(idx / 64)
+                .is_some_and(|word| (word >> (idx % 64)) & 1 != 0)
+        };
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_some() {
+                let Ok(raw) = u32::try_from(idx) else {
+                    break;
+                };
+                if !is_live(idx) {
+                    *slot = None;
+                    self.free_slots.push(raw);
+                    self.live_count = self.live_count.saturating_sub(1);
+                }
+            }
+        }
+        self.by_uri.retain(|_, ids| {
+            ids.retain(|id| is_live(id.index()));
             !ids.is_empty()
         });
         if self.live_count == 0 {
@@ -736,9 +853,84 @@ mod tests {
         assert_serde::<UnderlineStyle>();
         assert_serde::<CellFlags>();
         assert_serde::<Cell>();
+        assert_serde::<TextSizing>();
         assert_serde::<CellExtra>();
         assert_serde::<HyperlinkId>();
         assert_serde::<Hyperlink>();
         assert_serde::<HyperlinkPool>();
+    }
+
+    #[test]
+    fn cell_protected_sized_spacer_and_text_sizing() {
+        assert_eq!(std::mem::size_of::<Cell>(), 20);
+        assert!(!CellFlags::SGR_MASK.contains(CellFlags::PROTECTED));
+        assert!(!CellFlags::SGR_MASK.contains(CellFlags::SIZED_SPACER));
+        assert!(CellFlags::WRITE_ATTR_MASK.contains(CellFlags::SGR_MASK));
+        assert!(CellFlags::WRITE_ATTR_MASK.contains(CellFlags::PROTECTED));
+        assert!(!CellFlags::WRITE_ATTR_MASK.contains(CellFlags::SIZED_SPACER));
+
+        let mut c = Cell::new(
+            ' ',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::PROTECTED,
+        );
+        assert!(c.is_protected());
+        assert!(!c.is_sized_spacer());
+        assert!(!c.is_empty());
+
+        c.flags = CellFlags::SIZED_SPACER;
+        assert!(c.is_sized_spacer());
+        assert!(!c.is_protected());
+        assert!(!c.is_empty());
+
+        let mut extra = CellExtra::default();
+        assert!(extra.is_empty());
+        extra.combining.reserve(32);
+        let retained_cap = extra.combining.capacity();
+        extra.combining.push('\u{0301}');
+        extra.text_sizing = Some(TextSizing {
+            scale: 2,
+            width: 1,
+            frac_num: 1,
+            frac_den: 2,
+            v_align: 0,
+            h_align: 2,
+        });
+        assert!(!extra.is_empty());
+        extra.clear();
+        assert!(extra.is_empty());
+        assert_eq!(extra.combining.capacity(), retained_cap);
+
+        // Excessively large combining buffers shrink to cap.
+        extra.combining = Vec::with_capacity(256);
+        extra.combining.push('\u{0302}');
+        extra.clear();
+        assert!(extra.combining.is_empty());
+        assert!(extra.combining.capacity() <= COMBINING_RETAIN_CAP);
+    }
+
+    #[test]
+    fn hyperlink_pool_bitset_gc_reclaims_only_unreferenced() {
+        let mut pool = HyperlinkPool::new();
+        let mut ids = Vec::new();
+        for i in 0..70 {
+            ids.push(
+                pool.try_intern(None, &format!("https://ex.test/{i}"))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(pool.slots_len(), 70);
+        let mut bits = vec![0_u64; pool.slots_len().div_ceil(64)];
+        for &keep in &[ids[3], ids[65]] {
+            let idx = keep.index();
+            bits[idx / 64] |= 1_u64 << (idx % 64);
+        }
+        pool.gc_unreferenced_bitset(&bits);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.uri(ids[3]), Some("https://ex.test/3"));
+        assert_eq!(pool.uri(ids[65]), Some("https://ex.test/65"));
+        assert!(pool.get(ids[0]).is_none());
+        assert!(pool.get(ids[69]).is_none());
     }
 }

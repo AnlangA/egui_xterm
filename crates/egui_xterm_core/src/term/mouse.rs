@@ -84,10 +84,31 @@ pub struct MouseInputEvent {
     pub modifiers: MouseModifiers,
 }
 
+fn push_u32_dec(out: &mut Vec<u8>, mut val: u32) {
+    let mut buf = [0u8; 10];
+    let mut len = 0usize;
+    loop {
+        buf[len] = b'0' + (val % 10) as u8;
+        len += 1;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    for &b in buf[..len].iter().rev() {
+        out.push(b);
+    }
+}
+
 /// Encodes `ev` into VT mouse reporting bytes according to `modes`, or `None` if suppressed.
 #[must_use]
 pub fn encode_mouse_event(modes: &Modes, ev: MouseInputEvent) -> Option<Vec<u8>> {
-    encode_mouse_event_inner(modes, ev, None)
+    let mut out = Vec::with_capacity(20);
+    if encode_mouse_event_into(modes, ev, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Encodes `ev` into VT mouse reporting bytes according to `modes`, using `(pixel_x, pixel_y)`
@@ -99,57 +120,88 @@ pub fn encode_mouse_event_pixels(
     pixel_x: u32,
     pixel_y: u32,
 ) -> Option<Vec<u8>> {
-    encode_mouse_event_inner(modes, ev, Some((pixel_x, pixel_y)))
+    let mut out = Vec::with_capacity(24);
+    if encode_mouse_event_pixels_into(modes, ev, pixel_x, pixel_y, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
 }
 
-fn encode_mouse_event_inner(
+/// Appends VT mouse reporting bytes for `ev` into `out` without intermediate allocations,
+/// returning `true` if bytes were written or `false` if the event was suppressed.
+pub fn encode_mouse_event_into(modes: &Modes, ev: MouseInputEvent, out: &mut Vec<u8>) -> bool {
+    encode_mouse_event_with_cell_px_into(modes, ev, None, (8, 16), out)
+}
+
+/// Appends VT mouse reporting bytes for `ev` into `out` using `(pixel_x, pixel_y)` when
+/// [`MouseEncoding::SgrPixels`] (`DEC ? 1016`) is active, returning `true` if written.
+pub fn encode_mouse_event_pixels_into(
+    modes: &Modes,
+    ev: MouseInputEvent,
+    pixel_x: u32,
+    pixel_y: u32,
+    out: &mut Vec<u8>,
+) -> bool {
+    encode_mouse_event_with_cell_px_into(modes, ev, Some((pixel_x, pixel_y)), (8, 16), out)
+}
+
+pub(crate) fn encode_mouse_event_with_cell_px_into(
     modes: &Modes,
     ev: MouseInputEvent,
     pixels: Option<(u32, u32)>,
-) -> Option<Vec<u8>> {
+    cell_px: (u16, u16),
+    out: &mut Vec<u8>,
+) -> bool {
     match modes.mouse_protocol {
         MouseProtocol::None => {
             if modes.alt_screen && modes.alt_scroll && ev.kind == MouseEventKind::Press {
-                return match ev.button {
-                    Some(MouseButton::WheelUp) => Some(if modes.app_cursor_keys {
-                        b"\x1bOA".to_vec()
-                    } else {
-                        b"\x1b[A".to_vec()
-                    }),
-                    Some(MouseButton::WheelDown) => Some(if modes.app_cursor_keys {
-                        b"\x1bOB".to_vec()
-                    } else {
-                        b"\x1b[B".to_vec()
-                    }),
-                    _ => None,
-                };
+                match ev.button {
+                    Some(MouseButton::WheelUp) => {
+                        out.extend_from_slice(if modes.app_cursor_keys {
+                            b"\x1bOA"
+                        } else {
+                            b"\x1b[A"
+                        });
+                        return true;
+                    }
+                    Some(MouseButton::WheelDown) => {
+                        out.extend_from_slice(if modes.app_cursor_keys {
+                            b"\x1bOB"
+                        } else {
+                            b"\x1b[B"
+                        });
+                        return true;
+                    }
+                    _ => return false,
+                }
             }
-            return None;
+            return false;
         }
         MouseProtocol::X10 => {
             if ev.kind != MouseEventKind::Press || ev.button.is_none_or(MouseButton::is_wheel) {
-                return None;
+                return false;
             }
         }
         MouseProtocol::Normal => {
             if ev.kind == MouseEventKind::Motion {
-                return None;
+                return false;
             }
             if ev.kind == MouseEventKind::Release && ev.button.is_some_and(MouseButton::is_wheel) {
-                return None;
+                return false;
             }
         }
         MouseProtocol::ButtonEvent => {
             if ev.kind == MouseEventKind::Motion && ev.button.is_none() {
-                return None;
+                return false;
             }
             if ev.kind == MouseEventKind::Release && ev.button.is_some_and(MouseButton::is_wheel) {
-                return None;
+                return false;
             }
         }
         MouseProtocol::AnyEvent => {
             if ev.kind == MouseEventKind::Release && ev.button.is_some_and(MouseButton::is_wheel) {
-                return None;
+                return false;
             }
         }
     }
@@ -186,23 +238,41 @@ fn encode_mouse_event_inner(
     match modes.mouse_encoding {
         MouseEncoding::Sgr => {
             let final_ch = if ev.kind == MouseEventKind::Release {
-                'm'
+                b'm'
             } else {
-                'M'
+                b'M'
             };
-            Some(format!("\x1b[<{cb};{cx};{cy}{final_ch}").into_bytes())
+            out.extend_from_slice(b"\x1b[<");
+            push_u32_dec(out, cb);
+            out.push(b';');
+            push_u32_dec(out, cx);
+            out.push(b';');
+            push_u32_dec(out, cy);
+            out.push(final_ch);
         }
         MouseEncoding::SgrPixels => {
-            let (px, py) = pixels.unwrap_or((cx, cy));
+            let (px, py) = pixels.unwrap_or_else(|| {
+                let cw = u32::from(cell_px.0.max(1));
+                let ch = u32::from(cell_px.1.max(1));
+                (
+                    u32::from(ev.col) * cw + cw / 2,
+                    u32::from(ev.row) * ch + ch / 2,
+                )
+            });
             let final_ch = if ev.kind == MouseEventKind::Release {
-                'm'
+                b'm'
             } else {
-                'M'
+                b'M'
             };
-            Some(format!("\x1b[<{cb};{px};{py}{final_ch}").into_bytes())
+            out.extend_from_slice(b"\x1b[<");
+            push_u32_dec(out, cb);
+            out.push(b';');
+            push_u32_dec(out, px);
+            out.push(b';');
+            push_u32_dec(out, py);
+            out.push(final_ch);
         }
         MouseEncoding::Utf8 => {
-            let mut out = Vec::with_capacity(9);
             out.extend_from_slice(b"\x1b[M");
             let mut buf = [0u8; 4];
             for val in [cb + 32, cx.min(2015) + 32, cy.min(2015) + 32] {
@@ -210,49 +280,62 @@ fn encode_mouse_event_inner(
                     out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 }
             }
-            Some(out)
         }
         MouseEncoding::Default => {
             let button_byte = u8::try_from(cb + 32).unwrap_or(255);
             let col_byte = u8::try_from(cx.min(223) + 32).unwrap_or(255);
             let row_byte = u8::try_from(cy.min(223) + 32).unwrap_or(255);
-            Some(vec![0x1B, b'[', b'M', button_byte, col_byte, row_byte])
+            out.extend_from_slice(&[0x1B, b'[', b'M', button_byte, col_byte, row_byte]);
         }
     }
+    true
 }
 
 /// Formats pasted text for transmission to the backend, wrapping in DEC `?2004` bracketed
 /// paste markers when enabled and sanitizing embedded control/escape/marker sequences.
 #[must_use]
 pub fn format_paste_bytes(modes: &Modes, text: &str) -> Vec<u8> {
+    let extra = if modes.bracketed_paste { 12 } else { 0 };
+    let mut out = Vec::with_capacity(text.len() + extra);
+    format_paste_bytes_into(modes, text, &mut out);
+    out
+}
+
+/// Appends bracketed-paste-formatted and sanitized `text` into `out` without extra heap allocations.
+pub fn format_paste_bytes_into(modes: &Modes, text: &str, out: &mut Vec<u8>) {
     if !modes.bracketed_paste {
-        return text.as_bytes().to_vec();
+        out.extend_from_slice(text.as_bytes());
+        return;
     }
 
-    // Step A: Strip unsafe C0/DEL/C1 controls at char granularity, preserving `\t`, `\n`, `\r`,
-    // and `\x1b` so Step B can still recognize nested bracketed-paste markers.
-    let mut sanitized = String::with_capacity(text.len());
+    // Step A & B: Stream UTF-8 scalars directly into `out` after the opening marker, stripping
+    // unsafe C0/DEL/C1 controls while temporarily preserving `\x1b` so nested `\x1b[200~` and
+    // `\x1b[201~` sequences fold in a single pass.
+    out.extend_from_slice(b"\x1b[200~");
+    let body_start = out.len();
+    let mut utf8_buf = [0u8; 4];
     for ch in text.chars() {
         if matches!(ch, '\t' | '\n' | '\r' | '\x1b') || !ch.is_control() {
-            sanitized.push(ch);
+            out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
+            if out.len() - body_start >= 6
+                && (out.ends_with(b"\x1b[200~") || out.ends_with(b"\x1b[201~"))
+            {
+                out.truncate(out.len() - 6);
+            }
         }
     }
 
-    // Step B: Collapse nested `\x1b[200~` and `\x1b[201~` markers iteratively in one pass.
-    let mut folded = Vec::with_capacity(sanitized.len());
-    for &b in sanitized.as_bytes() {
-        folded.push(b);
-        if folded.ends_with(b"\x1b[200~") || folded.ends_with(b"\x1b[201~") {
-            folded.truncate(folded.len() - 6);
+    // Step C: Strip any remaining ESC (0x1B) bytes in place inside `out[body_start..]`.
+    let mut write_idx = body_start;
+    for read_idx in body_start..out.len() {
+        let b = out[read_idx];
+        if b != 0x1B {
+            out[write_idx] = b;
+            write_idx += 1;
         }
     }
-
-    // Step C: Strip any remaining ESC (0x1B) bytes before wrapping in `\x1b[200~...\x1b[201~`.
-    let mut out = Vec::with_capacity(folded.len() + 12);
-    out.extend_from_slice(b"\x1b[200~");
-    out.extend(folded.into_iter().filter(|&b| b != 0x1B));
+    out.truncate(write_idx);
     out.extend_from_slice(b"\x1b[201~");
-    out
 }
 
 /// Returns the VT focus report bytes (`\x1b[I` / `\x1b[O`) when DEC `?1004` is active.

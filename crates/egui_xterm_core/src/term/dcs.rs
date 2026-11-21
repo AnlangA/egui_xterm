@@ -51,6 +51,18 @@ impl DcsState {
         self.payload.push(byte);
     }
 
+    pub fn push_slice(&mut self, bytes: &[u8]) {
+        if self.kind.is_none() || self.overflowed || bytes.is_empty() {
+            return;
+        }
+        if self.payload.len().saturating_add(bytes.len()) > MAX_DCS_BYTES {
+            self.overflowed = true;
+            self.payload.clear();
+            return;
+        }
+        self.payload.extend_from_slice(bytes);
+    }
+
     pub fn take(&mut self) -> Option<(DcsKind, Vec<u8>)> {
         let kind = self.kind.take()?;
         if self.overflowed {
@@ -190,29 +202,41 @@ fn format_sgr_state(attrs: &CursorAttrs) -> String {
     match attrs.fg {
         PackedColor::Default => {}
         PackedColor::Indexed(idx) => {
-            let _ = write!(out, ";38;5;{idx}");
+            if write!(out, ";38;5;{idx}").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         PackedColor::Rgb(r, g, b) => {
-            let _ = write!(out, ";38;2;{r};{g};{b}");
+            if write!(out, ";38;2;{r};{g};{b}").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
     }
     match attrs.bg {
         PackedColor::Default => {}
         PackedColor::Indexed(idx) => {
-            let _ = write!(out, ";48;5;{idx}");
+            if write!(out, ";48;5;{idx}").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
         PackedColor::Rgb(r, g, b) => {
-            let _ = write!(out, ";48;2;{r};{g};{b}");
+            if write!(out, ";48;2;{r};{g};{b}").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
         }
     }
     if let Some(ul) = attrs.underline_color {
         match ul {
             PackedColor::Default => {}
             PackedColor::Indexed(idx) => {
-                let _ = write!(out, ";58;5;{idx}");
+                if write!(out, ";58;5;{idx}").is_err() {
+                    // `String`'s `fmt::Write` impl is infallible.
+                }
             }
             PackedColor::Rgb(r, g, b) => {
-                let _ = write!(out, ";58;2;{r};{g};{b}");
+                if write!(out, ";58;2;{r};{g};{b}").is_err() {
+                    // `String`'s `fmt::Write` impl is infallible.
+                }
             }
         }
     }
@@ -225,21 +249,27 @@ pub(crate) fn handle_decrqss(payload: &[u8], state: &DecrqssState<'_>, outgoing:
         b"m" => {
             let sgr = format_sgr_state(state.attrs);
             let mut reply = String::with_capacity(12 + sgr.len());
-            let _ = write!(reply, "\x1bP1$r{sgr}m\x1b\\");
+            if write!(reply, "\x1bP1$r{sgr}m\x1b\\").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
             outgoing.extend_from_slice(reply.as_bytes());
         }
         b"r" => {
             let top = state.scroll_top + 1;
             let bottom = state.scroll_bottom + 1;
             let mut reply = String::with_capacity(24);
-            let _ = write!(reply, "\x1bP1$r{top};{bottom}r\x1b\\");
+            if write!(reply, "\x1bP1$r{top};{bottom}r\x1b\\").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
             outgoing.extend_from_slice(reply.as_bytes());
         }
         b"s" if state.left_right_margin_mode => {
             let left = state.scroll_left + 1;
             let right = state.scroll_right + 1;
             let mut reply = String::with_capacity(24);
-            let _ = write!(reply, "\x1bP1$r{left};{right}s\x1b\\");
+            if write!(reply, "\x1bP1$r{left};{right}s\x1b\\").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
             outgoing.extend_from_slice(reply.as_bytes());
         }
         b" q" => {
@@ -252,11 +282,17 @@ pub(crate) fn handle_decrqss(payload: &[u8], state: &DecrqssState<'_>, outgoing:
                 (CursorShape::Bar, false) => 6,
             };
             let mut reply = String::with_capacity(16);
-            let _ = write!(reply, "\x1bP1$r{code} q\x1b\\");
+            if write!(reply, "\x1bP1$r{code} q\x1b\\").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
             outgoing.extend_from_slice(reply.as_bytes());
         }
         b"\"q" => {
-            outgoing.extend_from_slice(b"\x1bP1$r0\"q\x1b\\");
+            if state.attrs.is_protected() {
+                outgoing.extend_from_slice(b"\x1bP1$r1\"q\x1b\\");
+            } else {
+                outgoing.extend_from_slice(b"\x1bP1$r0\"q\x1b\\");
+            }
         }
         _ => {
             outgoing.extend_from_slice(b"\x1bP0$r\x1b\\");

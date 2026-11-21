@@ -17,6 +17,16 @@ pub trait VtHandler {
         }
     }
 
+    /// Fast-path batch for validated UTF-8 text in `Ground` (`C1Policy::Utf8Only`).
+    ///
+    /// Guaranteed free of C0 controls (`0x00..=0x1F`) and `DEL` (`0x7F`).
+    /// The default implementation calls [`Self::print`] for each `char`.
+    fn print_utf8_run(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.print(ch);
+        }
+    }
+
     /// Executes a C0 control (`0x00..=0x1F`) or 8-bit C1 control (`0x80..=0x9F`).
     fn execute(&mut self, byte: u8);
 
@@ -25,6 +35,15 @@ pub trait VtHandler {
 
     /// Delivers one raw payload byte to the active `DCS` handler.
     fn put(&mut self, byte: u8);
+
+    /// Fast-path batch for contiguous `DCS` passthrough payload bytes (free of `0x7F`).
+    ///
+    /// The default implementation calls [`Self::put`] for each byte.
+    fn put_slice(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.put(b);
+        }
+    }
 
     /// Ends the active `DCS` payload stream (`ST`, `ESC`, `CAN`, or `SUB`).
     fn unhook(&mut self);

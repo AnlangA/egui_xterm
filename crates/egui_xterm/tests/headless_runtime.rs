@@ -1,11 +1,9 @@
 //! Headless `egui::Context::run_ui` integration tests for `egui_xterm`.
 
-#[cfg(feature = "hyperlinks")]
-use egui::CursorIcon;
 use egui::{
-    CentralPanel, Context, Event, Frame, ImeEvent, Key, Margin, Modifiers, MouseWheelUnit,
-    OutputCommand, PointerButton, Pos2, RawInput, Rect, Role, Shape, TouchPhase, UiBuilder,
-    ViewportId, pos2, vec2,
+    CentralPanel, Context, CursorIcon, Event, Frame, ImeEvent, Key, Margin, Modifiers,
+    MouseWheelUnit, OutputCommand, PointerButton, Pos2, RawInput, Rect, Role, Shape, TouchPhase,
+    UiBuilder, ViewportId, pos2, vec2,
 };
 use egui_xterm::{
     ChannelInput, CursorShape, RingBufferInput, ScaleMode, TerminalConfig, TerminalEvent,
@@ -6255,7 +6253,7 @@ fn scrollbar_secondary_click_same_frame_move_and_dec_1000_does_not_open_menu() {
     let mut payload = String::new();
     for i in 0..80 {
         use std::fmt::Write as _;
-        let _ = writeln!(payload, "line {i}\r");
+        writeln!(payload, "line {i}\r").expect("String fmt::Write is infallible");
     }
     payload.push_str("\x1b[?1000h\x1b[?1006h");
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(payload.as_bytes()));
@@ -7198,7 +7196,7 @@ fn scrollbar_primary_and_shift_secondary_preserve_focus_under_dec_1004_and_1000(
     let mut payload = String::new();
     for i in 0..80 {
         use std::fmt::Write as _;
-        let _ = writeln!(payload, "line {i}\r");
+        writeln!(payload, "line {i}\r").expect("String fmt::Write is infallible");
     }
     payload.push_str("\x1b[?1004h\x1b[?1000h\x1b[?1006h");
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(payload.as_bytes()));
@@ -7470,7 +7468,7 @@ fn scrollbar_disappearing_mid_hold_preserves_focus_under_dec_1004() {
     let mut payload = String::new();
     for i in 0..80 {
         use std::fmt::Write as _;
-        let _ = writeln!(payload, "line {i}\r");
+        writeln!(payload, "line {i}\r").expect("String fmt::Write is infallible");
     }
     payload.push_str("\x1b[?1004h");
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(payload.as_bytes()));
@@ -7575,7 +7573,7 @@ fn multipane_scrollbar_drag_does_not_steal_focus_from_other_pane_search_bar() {
     let mut payload_a = String::new();
     for i in 0..80 {
         use std::fmt::Write as _;
-        let _ = writeln!(payload_a, "pane a line {i}\r");
+        writeln!(payload_a, "pane a line {i}\r").expect("String fmt::Write is infallible");
     }
     let mut rt_a = TerminalRuntime::new(RingBufferInput::from_bytes(payload_a.as_bytes()));
     let mut rt_b = TerminalRuntime::new(RingBufferInput::from_bytes(b"pane b\r\n"));

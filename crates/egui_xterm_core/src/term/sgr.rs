@@ -160,3 +160,135 @@ pub(crate) fn apply_sgr(params: &CsiParams, attrs: &mut CursorAttrs) {
         idx += 1;
     }
 }
+
+const MAX_SGR_STACK: usize = 10;
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SgrPushMask: u16 {
+        const BOLD          = 1 << 0;
+        const DIM           = 1 << 1;
+        const ITALIC        = 1 << 2;
+        const UNDERLINE     = 1 << 3;
+        const BLINK_SLOW    = 1 << 4;
+        const BLINK_RAPID   = 1 << 5;
+        const INVERSE       = 1 << 6;
+        const HIDDEN        = 1 << 7;
+        const STRIKETHROUGH = 1 << 8;
+        const OVERLINE      = 1 << 9;
+        const FG            = 1 << 10;
+        const BG            = 1 << 11;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SgrFrame {
+    attrs: CursorAttrs,
+    mask: SgrPushMask,
+}
+
+/// Bounded depth-10 stack for `XTPUSHSGR` (`CSI [Pm] # {` / `# p`) and `XTPOPSGR`
+/// (`CSI # }` / `# q`), tracking overflow depth beyond 10 so balanced deep nesting restores
+/// the stored levels intact.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SgrStack {
+    frames: Vec<SgrFrame>,
+    depth: usize,
+}
+
+impl SgrStack {
+    pub(crate) fn clear(&mut self) {
+        self.frames.clear();
+        self.depth = 0;
+    }
+
+    pub(crate) fn push(&mut self, attrs: &CursorAttrs, params: &CsiParams) {
+        let mask = if params.is_empty() {
+            SgrPushMask::all()
+        } else {
+            let mut m = SgrPushMask::empty();
+            for sub in params {
+                let Some(&code) = sub.first() else {
+                    continue;
+                };
+                match code {
+                    0 => {}
+                    1 => m.insert(SgrPushMask::BOLD),
+                    2 => m.insert(SgrPushMask::DIM),
+                    3 => m.insert(SgrPushMask::ITALIC),
+                    4 | 21 => m.insert(SgrPushMask::UNDERLINE),
+                    5 => m.insert(SgrPushMask::BLINK_SLOW),
+                    6 => m.insert(SgrPushMask::BLINK_RAPID),
+                    7 => m.insert(SgrPushMask::INVERSE),
+                    8 => m.insert(SgrPushMask::HIDDEN),
+                    9 => m.insert(SgrPushMask::STRIKETHROUGH),
+                    10 | 30 => m.insert(SgrPushMask::FG),
+                    11 | 31 => m.insert(SgrPushMask::BG),
+                    53 => m.insert(SgrPushMask::OVERLINE),
+                    _ => {}
+                }
+            }
+            m
+        };
+
+        if self.depth < MAX_SGR_STACK {
+            self.frames.push(SgrFrame {
+                attrs: *attrs,
+                mask,
+            });
+        }
+        self.depth = self.depth.saturating_add(1);
+    }
+
+    pub(crate) fn pop(&mut self, attrs: &mut CursorAttrs) {
+        if self.depth == 0 {
+            return;
+        }
+        self.depth -= 1;
+        if self.depth < MAX_SGR_STACK
+            && let Some(frame) = self.frames.pop()
+        {
+            let m = frame.mask;
+            if m == SgrPushMask::all() {
+                let protected = attrs.flags & CellFlags::PROTECTED;
+                let hyperlink = attrs.hyperlink_id;
+                attrs.fg = frame.attrs.fg;
+                attrs.bg = frame.attrs.bg;
+                attrs.flags = (frame.attrs.flags & CellFlags::SGR_MASK) | protected;
+                attrs.underline_color = frame.attrs.underline_color;
+                attrs.hyperlink_id = hyperlink;
+                return;
+            }
+            if m.contains(SgrPushMask::FG) {
+                attrs.fg = frame.attrs.fg;
+            }
+            if m.contains(SgrPushMask::BG) {
+                attrs.bg = frame.attrs.bg;
+            }
+            if m.contains(SgrPushMask::UNDERLINE) {
+                attrs
+                    .flags
+                    .set_underline_style(frame.attrs.flags.underline_style());
+                attrs.underline_color = frame.attrs.underline_color;
+            }
+            let flag_pairs = [
+                (SgrPushMask::BOLD, CellFlags::BOLD),
+                (SgrPushMask::DIM, CellFlags::DIM),
+                (SgrPushMask::ITALIC, CellFlags::ITALIC),
+                (SgrPushMask::BLINK_SLOW, CellFlags::BLINK_SLOW),
+                (SgrPushMask::BLINK_RAPID, CellFlags::BLINK_RAPID),
+                (SgrPushMask::INVERSE, CellFlags::INVERSE),
+                (SgrPushMask::HIDDEN, CellFlags::HIDDEN),
+                (SgrPushMask::STRIKETHROUGH, CellFlags::STRIKETHROUGH),
+                (SgrPushMask::OVERLINE, CellFlags::OVERLINE),
+            ];
+            for (mask_bit, cell_bit) in flag_pairs {
+                if m.contains(mask_bit) {
+                    attrs
+                        .flags
+                        .set(cell_bit, frame.attrs.flags.contains(cell_bit));
+                }
+            }
+        }
+    }
+}

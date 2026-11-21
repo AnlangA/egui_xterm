@@ -19,3 +19,10 @@ egui_xterm_core = { workspace = true, default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 portable-pty = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "pty_transport"
+harness = false

@@ -228,7 +228,9 @@ fn resize_clamping_dedup_and_live_propagation() {
     let (text, found) = poll_until(&mut backend, Duration::from_secs(8), |s, _| {
         s.contains(expected)
     });
-    let _ = backend.write_bytes(b"exit\r");
+    if backend.write_bytes(b"exit\r").is_err() {
+        // Child may have already exited after printing stty size.
+    }
     assert!(found, "expected {expected:?} in {text:?}");
 }
 
@@ -361,5 +363,40 @@ fn extreme_resize_does_not_kill_live_child() {
         backend.try_wait().expect("try_wait after extreme resize"),
         Some(0),
         "live child must exit with status 0 after extreme resize"
+    );
+}
+
+#[test]
+fn non_zero_exit_code_and_drain_before_closed() {
+    #[cfg(windows)]
+    let (shell, args) = (
+        "cmd".to_owned(),
+        vec!["/C".to_owned(), "echo CODE_7 & exit 7".to_owned()],
+    );
+    #[cfg(not(windows))]
+    let (shell, args) = (
+        "sh".to_owned(),
+        vec!["-c".to_owned(), "echo CODE_7; exit 7".to_owned()],
+    );
+
+    let mut backend = PtyBackend::spawn(PtyConfig {
+        shell: Some(shell),
+        args,
+        cwd: None,
+        env: Vec::new(),
+        initial_size: TerminalSize::new(80, 24),
+    })
+    .expect("spawn non-zero exit command");
+
+    let (text, found) = poll_until(&mut backend, Duration::from_secs(6), |s, b| {
+        s.contains("CODE_7") && b.is_closed()
+    });
+    assert!(found, "expected CODE_7 + close, got: {text:?}");
+
+    let mut tail = [0u8; 64];
+    assert_eq!(backend.poll_read(&mut tail), Err(TerminalIoError::Closed));
+    assert_eq!(
+        backend.try_wait().expect("try_wait after non-zero exit"),
+        Some(7)
     );
 }

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use egui::{Ui, Widget};
-use egui_xterm_core::{CoreConfig, MouseProtocol, Terminal, TerminalInput};
+use egui_xterm_core::{CoreConfig, MouseProtocol, Terminal, TerminalInput, TerminalIoError};
 
 use crate::config::{TerminalConfig, TerminalResponse};
 use crate::input_map::{InputMapperState, copy_text_everywhere, try_read_native_clipboard};
@@ -33,6 +33,7 @@ pub struct TerminalRuntime<I: TerminalInput> {
     secondary_press_in_search_bar: bool,
     scrollbar_secondary_press_in_track: bool,
     mouse_cursor_icon: Option<egui::CursorIcon>,
+    last_io_error: Option<TerminalIoError>,
     #[cfg(feature = "search")]
     search_bar: crate::widgets::search_bar::SearchBarState,
 }
@@ -67,6 +68,7 @@ impl<I: TerminalInput> TerminalRuntime<I> {
             secondary_press_in_search_bar: false,
             scrollbar_secondary_press_in_track: false,
             mouse_cursor_icon: None,
+            last_io_error: None,
             #[cfg(feature = "search")]
             search_bar: crate::widgets::search_bar::SearchBarState::default(),
         }
@@ -100,7 +102,7 @@ impl<I: TerminalInput> TerminalRuntime<I> {
         #[cfg(not(feature = "search"))]
         let (search_blocks_focus, prev_search_rect) = (false, None);
 
-        let layout = self.layout_state.layout_and_resize(
+        let mut layout = self.layout_state.layout_and_resize(
             ui,
             self.instance_id,
             config,
@@ -111,6 +113,9 @@ impl<I: TerminalInput> TerminalRuntime<I> {
             search_blocks_focus,
             prev_search_rect,
         );
+        if let Some(err) = layout.io_error.take() {
+            self.last_io_error = Some(err);
+        }
 
         // 2. Bounded non-blocking poll_read -> VT advance -> flush outgoing VT replies.
         let budget = config.read_budget_bytes_per_frame;
@@ -143,7 +148,7 @@ impl<I: TerminalInput> TerminalRuntime<I> {
             }
         }
         if total_read == 0 {
-            let _ = self.terminal.check_sync_timeout(now_secs);
+            self.terminal.check_sync_timeout(now_secs);
         }
         if let Some(deadline) = self.terminal.sync_output_deadline()
             && let Ok(delay) = Duration::try_from_secs_f64((deadline - now_secs).max(0.0))
@@ -152,8 +157,10 @@ impl<I: TerminalInput> TerminalRuntime<I> {
         }
 
         let outgoing = self.terminal.drain_outgoing();
-        if !outgoing.is_empty() {
-            let _ = self.input.write_bytes(&outgoing);
+        if !outgoing.is_empty()
+            && let Err(err) = self.input.write_bytes(&outgoing)
+        {
+            self.last_io_error = Some(err);
         }
 
         // 3. Interact with scrollbar overlay before grid event mapping, and isolate search bar
@@ -245,8 +252,10 @@ impl<I: TerminalInput> TerminalRuntime<I> {
         if input_out.any_user_activity {
             self.renderer.note_input_activity(now_secs);
         }
-        if !input_out.bytes_to_write.is_empty() {
-            let _ = self.input.write_bytes(&input_out.bytes_to_write);
+        if !input_out.bytes_to_write.is_empty()
+            && let Err(err) = self.input.write_bytes(&input_out.bytes_to_write)
+        {
+            self.last_io_error = Some(err);
         }
         #[cfg(feature = "search")]
         if input_out.open_search_requested {
@@ -337,8 +346,10 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                 WidgetAction::PasteClipboard => {
                     if let Some(text) = try_read_native_clipboard() {
                         let formatted = self.terminal.format_paste(&text);
-                        if !formatted.is_empty() {
-                            let _ = self.input.write_bytes(&formatted);
+                        if !formatted.is_empty()
+                            && let Err(err) = self.input.write_bytes(&formatted)
+                        {
+                            self.last_io_error = Some(err);
                         }
                     } else {
                         ui.ctx()
@@ -354,7 +365,7 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                 }
                 #[cfg(feature = "shell-integration")]
                 WidgetAction::JumpPrompt(delta) => {
-                    let _ = self.terminal.jump_to_prompt(delta);
+                    self.terminal.jump_to_prompt(delta);
                 }
             }
         }
@@ -445,8 +456,10 @@ impl<I: TerminalInput> TerminalRuntime<I> {
             final_has_focus,
             &mut focus_bytes,
         );
-        if !focus_bytes.is_empty() {
-            let _ = self.input.write_bytes(&focus_bytes);
+        if !focus_bytes.is_empty()
+            && let Err(err) = self.input.write_bytes(&focus_bytes)
+        {
+            self.last_io_error = Some(err);
         }
         if !final_search_bar_focused && ui.memory(|m| m.owns_ime_events(layout.response.id)) {
             let to_global = ui
@@ -528,6 +541,17 @@ impl<I: TerminalInput> TerminalRuntime<I> {
     #[cfg(feature = "search")]
     pub fn search_bar_mut(&mut self) -> &mut crate::widgets::search_bar::SearchBarState {
         &mut self.search_bar
+    }
+
+    /// Returns the most recent non-fatal backend `write_bytes` or `resize` I/O error, if any.
+    #[must_use]
+    pub const fn last_io_error(&self) -> Option<&TerminalIoError> {
+        self.last_io_error.as_ref()
+    }
+
+    /// Takes and clears the most recent non-fatal backend `write_bytes` or `resize` I/O error.
+    pub fn take_io_error(&mut self) -> Option<TerminalIoError> {
+        self.last_io_error.take()
     }
 }
 
@@ -625,5 +649,103 @@ fn map_mouse_shape(shape: &str) -> Option<egui::CursorIcon> {
         "ew-resize" | "col-resize" => Some(egui::CursorIcon::ResizeHorizontal),
         "ns-resize" | "row-resize" => Some(egui::CursorIcon::ResizeVertical),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Context, RawInput, Rect, pos2, vec2};
+    use egui_xterm_core::TerminalSize;
+
+    #[derive(Default)]
+    struct FailingBackend {
+        fail_resize: bool,
+        fail_write: bool,
+        pending_read: Vec<u8>,
+    }
+
+    impl TerminalInput for FailingBackend {
+        fn poll_read(&mut self, buf: &mut [u8]) -> Result<usize, TerminalIoError> {
+            if self.pending_read.is_empty() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.pending_read.len());
+            buf[..n].copy_from_slice(&self.pending_read[..n]);
+            self.pending_read.drain(..n);
+            Ok(n)
+        }
+
+        fn write_bytes(&mut self, _bytes: &[u8]) -> Result<(), TerminalIoError> {
+            if self.fail_write {
+                Err(TerminalIoError::message("write failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn resize(&mut self, _size: TerminalSize) -> Result<(), TerminalIoError> {
+            if self.fail_resize {
+                Err(TerminalIoError::message("resize failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn runtime_records_and_takes_non_fatal_resize_and_write_io_errors() {
+        let ctx = Context::default();
+        let backend = FailingBackend {
+            fail_resize: true,
+            fail_write: false,
+            pending_read: b"\x1b[5n".to_vec(),
+        };
+        let mut rt = TerminalRuntime::new(backend);
+        assert!(rt.last_io_error().is_none());
+
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 480.0))),
+            time: Some(0.1),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| {
+            drop(rt.show(ui));
+        });
+        out.drop_without_applying_deltas();
+
+        assert_eq!(
+            rt.last_io_error().map(ToString::to_string).as_deref(),
+            Some("resize failed")
+        );
+        assert_eq!(
+            rt.take_io_error().map(|e| e.to_string()).as_deref(),
+            Some("resize failed")
+        );
+        assert!(rt.last_io_error().is_none());
+
+        rt.input_mut().fail_resize = false;
+        rt.input_mut().fail_write = true;
+        rt.input_mut().pending_read.extend_from_slice(b"\x1b[5n");
+
+        let raw2 = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 480.0))),
+            time: Some(0.2),
+            ..Default::default()
+        };
+        let out2 = ctx.run_ui(raw2, |ui| {
+            drop(rt.show(ui));
+        });
+        out2.drop_without_applying_deltas();
+
+        assert_eq!(
+            rt.take_io_error().map(|e| e.to_string()).as_deref(),
+            Some("write failed")
+        );
+        assert!(rt.last_io_error().is_none());
     }
 }

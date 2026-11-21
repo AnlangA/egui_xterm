@@ -177,7 +177,7 @@ impl SixelDecoder {
 
     fn handle_repeat(&mut self, byte: u8) {
         if byte.is_ascii_digit() {
-            let _ = self.push_param_byte(byte);
+            self.push_param_byte(byte); // ignores overflow past 16 params
             return;
         }
         let count = usize::try_from(self.params[0].max(1)).unwrap_or(1);

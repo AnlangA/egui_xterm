@@ -11,6 +11,7 @@ use crate::color::PackedColor;
 
 pub use self::extras::CellExtraTable;
 pub use self::reflow::{ReflowAnchors, ReflowResult};
+pub(crate) use self::row::EraseProtection;
 pub use self::row::Row;
 
 /// Maximum number of evicted rows retained in the primary screen's free-list pool.
@@ -155,6 +156,8 @@ pub struct Grid {
     damage_epoch: u64,
     content_epoch: u64,
     dirty: DirtyTracker,
+    #[cfg(any(test, feature = "hyperlinks", feature = "search"))]
+    dirty_abs_start: Option<AbsLine>,
 }
 
 impl Grid {
@@ -192,6 +195,8 @@ impl Grid {
             damage_epoch: initial_epoch,
             content_epoch: initial_epoch,
             dirty: DirtyTracker::new(viewport_rows),
+            #[cfg(any(test, feature = "hyperlinks", feature = "search"))]
+            dirty_abs_start: None,
         }
     }
 
@@ -341,6 +346,25 @@ impl Grid {
         self.rows.get(top + screen_y)
     }
 
+    /// Returns the two contiguous slices covering the visible viewport (`0..viewport_rows`)
+    /// accounting for `display_offset`, without allocating.
+    #[must_use]
+    pub fn visible_slices(&self) -> (&[Row], &[Row]) {
+        let top = self.history_len().saturating_sub(self.display_offset);
+        let end = (top + self.viewport_rows).min(self.rows.len());
+        if top >= end {
+            return (&[], &[]);
+        }
+        let (head, tail) = self.rows.as_slices();
+        if end <= head.len() {
+            (&head[top..end], &[])
+        } else if top >= head.len() {
+            (&tail[(top - head.len())..(end - head.len())], &[])
+        } else {
+            (&head[top..], &tail[..(end - head.len())])
+        }
+    }
+
     /// Returns the live viewport row at `vp_row` (`0..viewport_rows`), ignoring `display_offset`.
     #[must_use]
     pub fn viewport_row(&self, vp_row: usize) -> Option<&Row> {
@@ -396,13 +420,6 @@ impl Grid {
             .find(|&idx| !self.rows[idx].is_completely_empty())
     }
 
-    /// Returns a read-only reference to the internal row ring buffer.
-    #[cfg(feature = "hyperlinks")]
-    #[must_use]
-    pub(crate) const fn rows_deque(&self) -> &VecDeque<Row> {
-        &self.rows
-    }
-
     /// Returns the per-row [`DirtyTracker`].
     #[must_use]
     pub const fn dirty(&self) -> &DirtyTracker {
@@ -412,6 +429,33 @@ impl Grid {
     /// Clears the [`DirtyTracker`] flags.
     pub fn clear_dirty(&mut self) {
         self.dirty.clear();
+    }
+
+    /// Records `abs` as mutated so incremental scanners (e.g. `ImplicitLinkStore`) can
+    /// start from `min(prev, abs)`.
+    #[cfg(any(test, feature = "hyperlinks", feature = "search"))]
+    pub(crate) fn mark_dirty_abs(&mut self, abs: AbsLine) {
+        self.dirty_abs_start = Some(match self.dirty_abs_start {
+            Some(prev) => prev.min(abs),
+            None => abs,
+        });
+    }
+
+    /// No-op when `hyperlinks`, `search`, and `test` are all disabled.
+    #[cfg(not(any(test, feature = "hyperlinks", feature = "search")))]
+    pub(crate) const fn mark_dirty_abs(&mut self, _abs: AbsLine) {}
+
+    /// Returns the earliest [`AbsLine`] mutated since the last [`take_dirty_abs_start`](Self::take_dirty_abs_start).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn min_dirty_abs(&self) -> Option<AbsLine> {
+        self.dirty_abs_start
+    }
+
+    /// Returns and clears the earliest mutated [`AbsLine`] marker.
+    #[cfg(any(test, feature = "hyperlinks", feature = "search"))]
+    pub(crate) fn take_dirty_abs_start(&mut self) -> Option<AbsLine> {
+        self.dirty_abs_start.take()
     }
 
     /// Increments and returns the monotonic `damage_epoch`.
@@ -462,30 +506,21 @@ impl Grid {
             return;
         }
         let hist = self.history_len();
-        let cols = self.cols;
         self.damage_epoch += 1;
         self.content_epoch += 1;
         let epoch = self.damage_epoch;
-        let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(col, bg, &mut self.extras);
-        if row.may_have_extras() && row.cells()[col].extra_id != 0 {
-            self.extras.free(row.cells()[col].extra_id);
-        }
 
         if let Some(ext) = extra.filter(|e| !e.is_empty()) {
             cell.extra_id = self.extras.insert(ext);
-            row.mark_has_extras();
         } else {
             cell.extra_id = 0;
         }
 
-        row.cells_mut()[col] = cell;
-        if col + 1 == cols && !cell.is_wrap_spacer() {
-            row.set_soft_wrapped(false);
-        }
+        let row = &mut self.rows[hist + vp_row];
+        row.write_single_cell(col, cell, bg, &mut self.extras);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Writes a 2-column wide character at `(vp_row, col)` and its `WIDE_SPACER` at `col + 1`.
@@ -502,39 +537,21 @@ impl Grid {
             return;
         }
         let hist = self.history_len();
-        let cols = self.cols;
         self.damage_epoch += 1;
         self.content_epoch += 1;
         let epoch = self.damage_epoch;
-        let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(col, bg, &mut self.extras);
-        row.clear_wide_overlap_at(col + 1, bg, &mut self.extras);
-
-        if row.may_have_extras() {
-            if row.cells()[col].extra_id != 0 {
-                self.extras.free(row.cells()[col].extra_id);
-            }
-            if row.cells()[col + 1].extra_id != 0 {
-                self.extras.free(row.cells()[col + 1].extra_id);
-            }
-        }
 
         if let Some(ext) = extra.filter(|e| !e.is_empty()) {
             lead.extra_id = self.extras.insert(ext);
-            row.mark_has_extras();
         } else {
             lead.extra_id = 0;
         }
 
-        let cells = row.cells_mut();
-        cells[col] = lead;
-        cells[col + 1] = spacer;
-        if col + 2 == cols {
-            row.set_soft_wrapped(false);
-        }
+        let row = &mut self.rows[hist + vp_row];
+        row.write_wide_pair(col, lead, spacer, bg, &mut self.extras);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Fast-path batch write for contiguous printable ASCII bytes on a single row (`extra_id == 0`).
@@ -550,37 +567,16 @@ impl Grid {
         if bytes.is_empty() || vp_row >= self.viewport_rows || start_col >= self.cols {
             return;
         }
-        let end_col = (start_col + bytes.len()).min(self.cols);
         let hist = self.history_len();
-        let cols = self.cols;
         self.damage_epoch += 1;
         self.content_epoch += 1;
         let epoch = self.damage_epoch;
+        let clean_flags = flags & CellFlags::WRITE_ATTR_MASK;
         let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(start_col, bg, &mut self.extras);
-        if end_col > start_col + 1 {
-            row.clear_wide_overlap_at(end_col - 1, bg, &mut self.extras);
-        }
-
-        if row.may_have_extras() {
-            for cell in &mut row.cells_mut()[start_col..end_col] {
-                if cell.extra_id != 0 {
-                    self.extras.free(cell.extra_id);
-                }
-            }
-        }
-
-        let clean_flags = flags & CellFlags::SGR_MASK;
-        for (dst, &b) in row.cells_mut()[start_col..end_col].iter_mut().zip(bytes) {
-            *dst = Cell::new(char::from(b), fg, bg, clean_flags);
-        }
-
-        if end_col == cols {
-            row.set_soft_wrapped(false);
-        }
+        row.write_ascii_run(start_col, bytes, fg, bg, clean_flags, &mut self.extras);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Marks `vp_row` as soft-wrapped (`soft_wrapped = wrapped`) and bumps its generation.
@@ -596,6 +592,7 @@ impl Grid {
         row.set_soft_wrapped(wrapped);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Places a `WRAP_SPACER` at `(vp_row, cols - 1)` and sets `soft_wrapped = true`.
@@ -608,21 +605,18 @@ impl Grid {
         self.damage_epoch += 1;
         self.content_epoch += 1;
         let epoch = self.damage_epoch;
-        let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(last_col, bg, &mut self.extras);
-        if row.may_have_extras() && row.cells()[last_col].extra_id != 0 {
-            self.extras.free(row.cells()[last_col].extra_id);
-        }
-        row.cells_mut()[last_col] = Cell::new(
+        let spacer = Cell::new(
             ' ',
             PackedColor::Default,
             PackedColor::Default,
             CellFlags::WRAP_SPACER,
         );
+        let row = &mut self.rows[hist + vp_row];
+        row.write_single_cell(last_col, spacer, bg, &mut self.extras);
         row.set_soft_wrapped(true);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Appends a combining/ZWJ/VS scalar to an existing cell at `(vp_row, col)`, returning the
@@ -637,11 +631,15 @@ impl Grid {
         let epoch = self.damage_epoch;
         let row = &mut self.rows[hist + vp_row];
         let cell = &mut row.cells_mut()[col];
-        let extra = self.extras.ensure_for_cell(cell);
-        extra.push_combining(ch);
+        if !self.extras.push_combining_for_cell(cell, ch) {
+            row.refresh_trimmed_len();
+            return false;
+        }
         row.mark_has_extras();
+        row.refresh_trimmed_len();
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
         true
     }
 
@@ -662,10 +660,12 @@ impl Grid {
         }
         let cells = row.cells_mut();
         cells[col].flags.insert(CellFlags::WIDE_LEAD);
-        let spacer_flags = CellFlags::WIDE_SPACER | (cells[col].flags & CellFlags::SGR_MASK);
+        let spacer_flags = CellFlags::WIDE_SPACER | (cells[col].flags & CellFlags::WRITE_ATTR_MASK);
         cells[col + 1] = Cell::new(' ', cells[col].fg, cells[col].bg, spacer_flags);
+        row.refresh_trimmed_len();
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Demotes a 2-column cell at `(vp_row, col)` back to 1 column and clears its `WIDE_SPACER`.
@@ -683,8 +683,10 @@ impl Grid {
         if cells[col + 1].is_wide_spacer() {
             cells[col + 1].reset(bg);
         }
+        row.refresh_trimmed_len();
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Replaces `(vp_row, col)` with a `WRAP_SPACER` (`soft_wrapped = true`) and returns the
@@ -712,15 +714,17 @@ impl Grid {
             None
         };
         moved.flags.insert(CellFlags::WIDE_LEAD);
-        row.cells_mut()[col] = Cell::new(
+        let wrap_spacer = Cell::new(
             ' ',
             PackedColor::Default,
             PackedColor::Default,
             CellFlags::WRAP_SPACER,
         );
+        row.write_single_cell(col, wrap_spacer, PackedColor::Default, &mut self.extras);
         row.set_soft_wrapped(true);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
         Some((moved, extra))
     }
 
@@ -751,7 +755,7 @@ impl Grid {
             ' ',
             moved.fg,
             moved.bg,
-            CellFlags::WIDE_SPACER | (moved.flags & CellFlags::SGR_MASK),
+            CellFlags::WIDE_SPACER | (moved.flags & CellFlags::WRITE_ATTR_MASK),
         );
 
         // Put WRAP_SPACER at src_col (replacing the moved cell without freeing its extra_id).
@@ -764,6 +768,7 @@ impl Grid {
                 CellFlags::WRAP_SPACER,
             );
             srow.set_soft_wrapped(true);
+            srow.refresh_trimmed_len();
             srow.set_generation(epoch);
         }
 
@@ -772,21 +777,7 @@ impl Grid {
         let epoch2 = self.damage_epoch;
         {
             let drow = &mut self.rows[hist + dst_row];
-            drow.clear_wide_overlap_at(0, bg, &mut self.extras);
-            drow.clear_wide_overlap_at(1, bg, &mut self.extras);
-            if drow.may_have_extras() {
-                if drow.cells()[0].extra_id != 0 {
-                    self.extras.free(drow.cells()[0].extra_id);
-                }
-                if drow.cells()[1].extra_id != 0 {
-                    self.extras.free(drow.cells()[1].extra_id);
-                }
-            }
-            if moved.has_extra() {
-                drow.mark_has_extras();
-            }
-            drow.cells_mut()[0] = moved;
-            drow.cells_mut()[1] = spacer;
+            drow.write_wide_pair(0, moved, spacer, bg, &mut self.extras);
             if self.cols == 2 {
                 drow.set_soft_wrapped(false);
             }
@@ -795,6 +786,7 @@ impl Grid {
 
         self.dirty.mark_row(src_row);
         self.dirty.mark_row(dst_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(src_row.min(dst_row)));
     }
 
     /// Scrolls lines `[top..=bottom]` up by `count` rows.
@@ -827,10 +819,9 @@ impl Grid {
                         self.damage_epoch += 1;
                         let epoch = self.damage_epoch;
                         if self.scrollback_limit == 0 {
-                            let mut front = self
-                                .rows
-                                .pop_front()
-                                .expect("grid always holds at least viewport_rows");
+                            let Some(mut front) = self.rows.pop_front() else {
+                                break;
+                            };
                             self.total_evicted += 1;
                             front.reset_for_reuse(self.cols, fill, epoch, &mut self.extras);
                             self.rows.push_back(front);
@@ -842,10 +833,9 @@ impl Grid {
                                     (self.display_offset + 1).min(self.history_len());
                             }
                         } else {
-                            let mut front = self
-                                .rows
-                                .pop_front()
-                                .expect("grid always holds at least viewport_rows");
+                            let Some(mut front) = self.rows.pop_front() else {
+                                break;
+                            };
                             self.total_evicted += 1;
                             front.reset_for_reuse(self.cols, fill, epoch, &mut self.extras);
                             self.rows.push_back(front);
@@ -856,16 +846,17 @@ impl Grid {
                         }
                     }
                     self.dirty.mark_all();
+                    // Only the live viewport (not older scrollback) changed/received blank lines.
+                    self.mark_dirty_abs(self.live_viewport_to_abs(0));
                     return;
                 }
                 ScreenKind::Alternate => {
                     for _ in 0..n {
                         self.damage_epoch += 1;
                         let epoch = self.damage_epoch;
-                        let mut front = self
-                            .rows
-                            .pop_front()
-                            .expect("alt grid always holds viewport_rows");
+                        let Some(mut front) = self.rows.pop_front() else {
+                            break;
+                        };
                         front.reset_for_reuse(self.cols, fill, epoch, &mut self.extras);
                         self.rows.push_back(front);
                     }
@@ -875,6 +866,7 @@ impl Grid {
                         row.set_generation(shift_epoch);
                     }
                     self.dirty.mark_all();
+                    self.mark_dirty_abs(self.live_viewport_to_abs(0));
                     return;
                 }
             }
@@ -884,10 +876,9 @@ impl Grid {
         for _ in 0..n {
             self.damage_epoch += 1;
             let epoch = self.damage_epoch;
-            let mut row = self
-                .rows
-                .remove(hist + top)
-                .expect("scroll region index within grid");
+            let Some(mut row) = self.rows.remove(hist + top) else {
+                break;
+            };
             row.reset_for_reuse(self.cols, fill, epoch, &mut self.extras);
             self.rows.insert(hist + bottom, row);
         }
@@ -903,6 +894,7 @@ impl Grid {
                 self.dirty.mark_row(r);
             }
         }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
     }
 
     /// Scrolls lines `[top..=bottom]` down by `count` rows, inserting blank BCE rows at `top`.
@@ -927,10 +919,9 @@ impl Grid {
         for _ in 0..n {
             self.damage_epoch += 1;
             let epoch = self.damage_epoch;
-            let mut row = self
-                .rows
-                .remove(hist + bottom)
-                .expect("scroll region index within grid");
+            let Some(mut row) = self.rows.remove(hist + bottom) else {
+                break;
+            };
             row.reset_for_reuse(self.cols, fill, epoch, &mut self.extras);
             self.rows.insert(hist + top, row);
         }
@@ -947,6 +938,7 @@ impl Grid {
                 self.dirty.mark_row(r);
             }
         }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
     }
 
     /// Scrolls the rectangular box `[top..=bottom] x [left..=right]` up by `count` rows.
@@ -980,20 +972,30 @@ impl Grid {
                 self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
                 self.rows[src_idx].clear_wide_overlap_at(left, bg, &mut self.extras);
                 self.rows[src_idx].clear_wide_overlap_at(right, bg, &mut self.extras);
+                let mut dst_has_extra = false;
                 for col in left..=right {
                     let cell = self.rows[src_idx].cells()[col];
+                    if cell.has_extra() {
+                        dst_has_extra = true;
+                    }
                     self.rows[src_idx].cells_mut()[col] = blank;
                     self.rows[dst_idx].cells_mut()[col] = cell;
                 }
+                if dst_has_extra {
+                    self.rows[dst_idx].mark_has_extras();
+                }
                 self.rows[src_idx].set_soft_wrapped(false);
+                self.rows[src_idx].refresh_trimmed_len();
                 self.rows[src_idx].set_generation(epoch);
             } else {
                 self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
             }
             self.rows[dst_idx].set_soft_wrapped(false);
+            self.rows[dst_idx].refresh_trimmed_len();
             self.rows[dst_idx].set_generation(epoch);
             self.dirty.mark_row(top + offset);
         }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
     }
 
     /// Scrolls the rectangular box `[top..=bottom] x [left..=right]` down by `count` rows.
@@ -1027,20 +1029,90 @@ impl Grid {
                 self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
                 self.rows[src_idx].clear_wide_overlap_at(left, bg, &mut self.extras);
                 self.rows[src_idx].clear_wide_overlap_at(right, bg, &mut self.extras);
+                let mut dst_has_extra = false;
                 for col in left..=right {
                     let cell = self.rows[src_idx].cells()[col];
+                    if cell.has_extra() {
+                        dst_has_extra = true;
+                    }
                     self.rows[src_idx].cells_mut()[col] = blank;
                     self.rows[dst_idx].cells_mut()[col] = cell;
                 }
+                if dst_has_extra {
+                    self.rows[dst_idx].mark_has_extras();
+                }
                 self.rows[src_idx].set_soft_wrapped(false);
+                self.rows[src_idx].refresh_trimmed_len();
                 self.rows[src_idx].set_generation(epoch);
             } else {
                 self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
             }
             self.rows[dst_idx].set_soft_wrapped(false);
+            self.rows[dst_idx].refresh_trimmed_len();
             self.rows[dst_idx].set_generation(epoch);
             self.dirty.mark_row(top + offset);
         }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
+    }
+
+    /// Shifts cells left by `count` columns within `[top..=bottom] x [left..=right]` (`SL`).
+    pub(crate) fn shift_left_box(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+        count: usize,
+        bg: PackedColor,
+    ) {
+        let top = top.min(self.viewport_rows.saturating_sub(1));
+        let bottom = bottom.min(self.viewport_rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || count == 0 {
+            return;
+        }
+        self.content_epoch += 1;
+        let hist = self.history_len();
+        for r in top..=bottom {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let row = &mut self.rows[hist + r];
+            row.shift_left_in_range(left, right, count, bg, &mut self.extras);
+            row.set_soft_wrapped(false);
+            row.set_generation(epoch);
+            self.dirty.mark_row(r);
+        }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
+    }
+
+    /// Shifts cells right by `count` columns within `[top..=bottom] x [left..=right]` (`SR`).
+    pub(crate) fn shift_right_box(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+        count: usize,
+        bg: PackedColor,
+    ) {
+        let top = top.min(self.viewport_rows.saturating_sub(1));
+        let bottom = bottom.min(self.viewport_rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || count == 0 {
+            return;
+        }
+        self.content_epoch += 1;
+        let hist = self.history_len();
+        for r in top..=bottom {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let row = &mut self.rows[hist + r];
+            row.shift_right_in_range(left, right, count, bg, &mut self.extras);
+            row.set_soft_wrapped(false);
+            row.set_generation(epoch);
+            self.dirty.mark_row(r);
+        }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
     }
 
     /// Inserts `count` blank cells (`ICH`) at `(vp_row, col)`, shifting remaining cells right
@@ -1057,34 +1129,16 @@ impl Grid {
         if vp_row >= self.viewport_rows || col > right || count == 0 {
             return;
         }
-        let end = right + 1;
-        let n = count.min(end - col);
         let hist = self.history_len();
         self.damage_epoch += 1;
         self.content_epoch += 1;
         let epoch = self.damage_epoch;
         let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(col, bg, &mut self.extras);
-        let shift_end = end - n;
-        if shift_end > col && row.cells()[shift_end - 1].is_wide_lead() {
-            row.clear_wide_overlap_at(shift_end - 1, bg, &mut self.extras);
-        }
-        if row.may_have_extras() {
-            for cell in &mut row.cells_mut()[shift_end..end] {
-                if cell.extra_id != 0 {
-                    self.extras.free(cell.extra_id);
-                    cell.extra_id = 0;
-                }
-            }
-        }
-
-        row.cells_mut().copy_within(col..shift_end, col + n);
-        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
-        row.cells_mut()[col..col + n].fill(blank);
+        row.shift_right_in_range(col, right, count, bg, &mut self.extras);
         row.set_soft_wrapped(false);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Deletes `count` cells (`DCH`) at `(vp_row, col)`, shifting remaining cells left
@@ -1101,34 +1155,16 @@ impl Grid {
         if vp_row >= self.viewport_rows || col > right || count == 0 {
             return;
         }
-        let end = right + 1;
-        let n = count.min(end - col);
         let hist = self.history_len();
         self.damage_epoch += 1;
         self.content_epoch += 1;
         let epoch = self.damage_epoch;
         let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(col, bg, &mut self.extras);
-        row.clear_wide_overlap_at(col + n - 1, bg, &mut self.extras);
-        if row.may_have_extras() {
-            for cell in &mut row.cells_mut()[col..col + n] {
-                if cell.extra_id != 0 {
-                    self.extras.free(cell.extra_id);
-                    cell.extra_id = 0;
-                }
-            }
-        }
-
-        if end == self.cols && end > 0 && row.cells()[end - 1].is_wrap_spacer() {
-            row.cells_mut()[end - 1] = Cell::BLANK;
-        }
-        row.cells_mut().copy_within(col + n..end, col);
-        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
-        row.cells_mut()[end - n..end].fill(blank);
+        row.shift_left_in_range(col, right, count, bg, &mut self.extras);
         row.set_soft_wrapped(false);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Inserts `count` blank cells (`ICH`) at `(vp_row, col)`, shifting remaining cells right.
@@ -1142,34 +1178,7 @@ impl Grid {
         if vp_row >= self.viewport_rows || col >= self.cols || count == 0 {
             return;
         }
-        let cols = self.cols;
-        let n = count.min(cols - col);
-        let hist = self.history_len();
-        self.damage_epoch += 1;
-        self.content_epoch += 1;
-        let epoch = self.damage_epoch;
-        let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(col, bg, &mut self.extras);
-        let shift_end = cols - n;
-        if shift_end > 0 && row.cells()[shift_end - 1].is_wide_lead() {
-            row.clear_wide_overlap_at(shift_end - 1, bg, &mut self.extras);
-        }
-        if row.may_have_extras() {
-            for cell in &mut row.cells_mut()[shift_end..cols] {
-                if cell.extra_id != 0 {
-                    self.extras.free(cell.extra_id);
-                    cell.extra_id = 0;
-                }
-            }
-        }
-
-        row.cells_mut().copy_within(col..shift_end, col + n);
-        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
-        row.cells_mut()[col..col + n].fill(blank);
-        row.set_soft_wrapped(false);
-        row.set_generation(epoch);
-        self.dirty.mark_row(vp_row);
+        self.insert_cells_in_margin(vp_row, col, self.cols - 1, count, bg);
     }
 
     /// Deletes `count` cells (`DCH`) at `(vp_row, col)`, shifting remaining cells left.
@@ -1183,34 +1192,7 @@ impl Grid {
         if vp_row >= self.viewport_rows || col >= self.cols || count == 0 {
             return;
         }
-        let cols = self.cols;
-        let n = count.min(cols - col);
-        let hist = self.history_len();
-        self.damage_epoch += 1;
-        self.content_epoch += 1;
-        let epoch = self.damage_epoch;
-        let row = &mut self.rows[hist + vp_row];
-
-        row.clear_wide_overlap_at(col, bg, &mut self.extras);
-        row.clear_wide_overlap_at(col + n - 1, bg, &mut self.extras);
-        if row.may_have_extras() {
-            for cell in &mut row.cells_mut()[col..col + n] {
-                if cell.extra_id != 0 {
-                    self.extras.free(cell.extra_id);
-                    cell.extra_id = 0;
-                }
-            }
-        }
-
-        if cols > 0 && row.cells()[cols - 1].is_wrap_spacer() {
-            row.cells_mut()[cols - 1] = Cell::BLANK;
-        }
-        row.cells_mut().copy_within(col + n..cols, col);
-        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
-        row.cells_mut()[cols - n..cols].fill(blank);
-        row.set_soft_wrapped(false);
-        row.set_generation(epoch);
-        self.dirty.mark_row(vp_row);
+        self.delete_cells_in_margin(vp_row, col, self.cols - 1, count, bg);
     }
 
     /// Erases `count` cells (`ECH`) starting at `(vp_row, col)` without shifting.
@@ -1227,6 +1209,7 @@ impl Grid {
         row.clear_range(col..end, bg, &mut self.extras);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Erases within `vp_row` according to `EL` mode (`0`: cursor..end, `1`: start..=cursor, `2`: whole row).
@@ -1249,6 +1232,42 @@ impl Grid {
         row.clear_range(range, bg, &mut self.extras);
         row.set_generation(epoch);
         self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
+    }
+
+    /// Selectively erases unprotected cells within `vp_row` (`DECSEL`, `CSI ? Ps K`), preserving
+    /// visual SGR attributes and `DECSCA`-protected cells.
+    pub(crate) fn erase_in_line_selective(
+        &mut self,
+        vp_row: usize,
+        col: usize,
+        mode: u16,
+        bg: PackedColor,
+    ) {
+        if vp_row >= self.viewport_rows {
+            return;
+        }
+        let cols = self.cols;
+        let range = match mode {
+            0 => col.min(cols)..cols,
+            1 => 0..col.saturating_add(1).min(cols),
+            2 => 0..cols,
+            _ => return,
+        };
+        let hist = self.history_len();
+        self.damage_epoch += 1;
+        self.content_epoch += 1;
+        let epoch = self.damage_epoch;
+        let row = &mut self.rows[hist + vp_row];
+        row.clear_range_with_protection(
+            range,
+            bg,
+            EraseProtection::UnprotectedOnly,
+            &mut self.extras,
+        );
+        row.set_generation(epoch);
+        self.dirty.mark_row(vp_row);
+        self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
     }
 
     /// Erases display cells according to `ED` mode (`0`, `1`, `2`, `3`).
@@ -1273,6 +1292,7 @@ impl Grid {
                     self.rows[hist + r].reset_for_reuse(cols, fill, epoch, &mut self.extras);
                     self.dirty.mark_row(r);
                 }
+                self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
             }
             1 => {
                 for r in 0..vp_row.min(vrows) {
@@ -1282,11 +1302,297 @@ impl Grid {
                     self.dirty.mark_row(r);
                 }
                 self.erase_in_line(vp_row, col, 1, bg);
+                self.mark_dirty_abs(self.live_viewport_to_abs(0));
             }
             2 => self.clear_visible(bg),
             3 => self.clear_history(),
             _ => {}
         }
+    }
+
+    /// Selectively erases unprotected cells across the display (`DECSED`, `CSI ? Ps J`, modes `0..=3`).
+    ///
+    /// Modes `0..=2` operate on the live viewport; mode `3` selectively erases unprotected cells
+    /// in scrollback history while keeping `DECSCA`-protected cells and visual SGR attributes intact.
+    pub(crate) fn erase_in_display_selective(
+        &mut self,
+        vp_row: usize,
+        col: usize,
+        mode: u16,
+        bg: PackedColor,
+    ) {
+        let vrows = self.viewport_rows;
+        let cols = self.cols;
+        let hist = self.history_len();
+
+        match mode {
+            0 => {
+                self.erase_in_line_selective(vp_row, col, 0, bg);
+                for r in (vp_row + 1)..vrows {
+                    self.damage_epoch += 1;
+                    let epoch = self.damage_epoch;
+                    self.rows[hist + r].clear_range_with_protection(
+                        0..cols,
+                        bg,
+                        EraseProtection::UnprotectedOnly,
+                        &mut self.extras,
+                    );
+                    self.rows[hist + r].set_generation(epoch);
+                    self.dirty.mark_row(r);
+                }
+                self.mark_dirty_abs(self.live_viewport_to_abs(vp_row));
+            }
+            1 => {
+                for r in 0..vp_row.min(vrows) {
+                    self.damage_epoch += 1;
+                    let epoch = self.damage_epoch;
+                    self.rows[hist + r].clear_range_with_protection(
+                        0..cols,
+                        bg,
+                        EraseProtection::UnprotectedOnly,
+                        &mut self.extras,
+                    );
+                    self.rows[hist + r].set_generation(epoch);
+                    self.dirty.mark_row(r);
+                }
+                self.erase_in_line_selective(vp_row, col, 1, bg);
+                self.mark_dirty_abs(self.live_viewport_to_abs(0));
+            }
+            2 => {
+                self.content_epoch += 1;
+                for r in 0..vrows {
+                    self.damage_epoch += 1;
+                    let epoch = self.damage_epoch;
+                    self.rows[hist + r].clear_range_with_protection(
+                        0..cols,
+                        bg,
+                        EraseProtection::UnprotectedOnly,
+                        &mut self.extras,
+                    );
+                    self.rows[hist + r].set_generation(epoch);
+                }
+                self.dirty.mark_all();
+                self.mark_dirty_abs(self.live_viewport_to_abs(0));
+            }
+            3 if hist > 0 => {
+                self.content_epoch += 1;
+                for idx in 0..hist {
+                    self.damage_epoch += 1;
+                    let epoch = self.damage_epoch;
+                    self.rows[idx].clear_range_with_protection(
+                        0..cols,
+                        bg,
+                        EraseProtection::UnprotectedOnly,
+                        &mut self.extras,
+                    );
+                    self.rows[idx].set_generation(epoch);
+                }
+                if self.display_offset > 0 {
+                    self.dirty.mark_all();
+                }
+                self.mark_dirty_abs(self.oldest_abs_line());
+            }
+            _ => {}
+        }
+    }
+
+    /// Copies the rectangular block `[src_top..=src_bottom] x [src_left..=src_right]` to
+    /// `(dst_top, dst_left)` safely under overlap (`DECCRA`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "VT420 DECCRA rectangular copy parameters"
+    )]
+    pub(crate) fn copy_rect(
+        &mut self,
+        src_top: usize,
+        src_left: usize,
+        src_bottom: usize,
+        src_right: usize,
+        dst_top: usize,
+        dst_left: usize,
+        bg: PackedColor,
+    ) {
+        if src_top > src_bottom
+            || src_left > src_right
+            || src_top >= self.viewport_rows
+            || src_left >= self.cols
+            || dst_top >= self.viewport_rows
+            || dst_left >= self.cols
+        {
+            return;
+        }
+        let src_bottom = src_bottom.min(self.viewport_rows - 1);
+        let src_right = src_right.min(self.cols - 1);
+        let copy_h = (src_bottom - src_top + 1).min(self.viewport_rows - dst_top);
+        let copy_w = (src_right - src_left + 1).min(self.cols - dst_left);
+        if copy_h == 0 || copy_w == 0 {
+            return;
+        }
+
+        let hist = self.history_len();
+        let mut snapshot: Vec<(Cell, Option<CellExtra>)> = Vec::with_capacity(copy_h * copy_w);
+        for dy in 0..copy_h {
+            let srow = &self.rows[hist + src_top + dy];
+            let scells = srow.cells();
+            for dx in 0..copy_w {
+                let mut cell = scells[src_left + dx];
+                let split_left = dx == 0 && cell.is_wide_spacer();
+                let split_right = dx + 1 == copy_w && cell.is_wide_lead();
+                if cell.is_wrap_spacer() || split_left || split_right {
+                    cell = Cell::new(
+                        ' ',
+                        cell.fg,
+                        cell.bg,
+                        cell.flags & CellFlags::WRITE_ATTR_MASK,
+                    );
+                    snapshot.push((cell, None));
+                } else {
+                    let ext = if cell.extra_id != 0 {
+                        self.extras.get(cell.extra_id).cloned()
+                    } else {
+                        None
+                    };
+                    cell.extra_id = 0;
+                    snapshot.push((cell, ext));
+                }
+            }
+        }
+
+        self.content_epoch += 1;
+        for dy in 0..copy_h {
+            let dst_vp = dst_top + dy;
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let drow = &mut self.rows[hist + dst_vp];
+
+            drow.clear_wide_overlap_at(dst_left, bg, &mut self.extras);
+            if copy_w > 1 {
+                drow.clear_wide_overlap_at(dst_left + copy_w - 1, bg, &mut self.extras);
+            }
+            if drow.may_have_extras() {
+                for c in dst_left..(dst_left + copy_w) {
+                    let eid = drow.cells()[c].extra_id;
+                    if eid != 0 {
+                        self.extras.free(eid);
+                    }
+                }
+            }
+
+            let mut wrote_extra = false;
+            {
+                let dcells = drow.cells_mut();
+                for dx in 0..copy_w {
+                    let entry = &mut snapshot[dy * copy_w + dx];
+                    let mut cell = entry.0;
+                    if let Some(ext) = entry.1.take().filter(|e| !e.is_empty()) {
+                        let new_id = self.extras.insert(ext);
+                        cell.extra_id = new_id;
+                        if new_id != 0 {
+                            wrote_extra = true;
+                        }
+                    } else {
+                        cell.extra_id = 0;
+                    }
+                    dcells[dst_left + dx] = cell;
+                }
+            }
+            if wrote_extra {
+                drow.mark_has_extras();
+            }
+            if dst_left + copy_w == self.cols {
+                drow.set_soft_wrapped(false);
+            }
+            drow.refresh_trimmed_len();
+            drow.set_generation(epoch);
+            self.dirty.mark_row(dst_vp);
+        }
+        self.mark_dirty_abs(self.live_viewport_to_abs(dst_top));
+    }
+
+    /// Erases cells in the rectangle `[top..=bottom] x [left..=right]` (`DECERA` / `DECSERA`).
+    pub(crate) fn erase_rect(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        bg: PackedColor,
+        protection: EraseProtection,
+    ) {
+        if top > bottom || left > right || top >= self.viewport_rows || left >= self.cols {
+            return;
+        }
+        let bottom = bottom.min(self.viewport_rows - 1);
+        let right = right.min(self.cols - 1);
+        let hist = self.history_len();
+        self.content_epoch += 1;
+
+        for r in top..=bottom {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let row = &mut self.rows[hist + r];
+            row.clear_range_with_protection(left..(right + 1), bg, protection, &mut self.extras);
+            row.set_generation(epoch);
+            self.dirty.mark_row(r);
+        }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
+    }
+
+    /// Fills `[top..=bottom] x [left..=right]` with `ch` and `fg`/`bg`/`flags` (`DECFRA`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "VT420 DECFRA rectangular fill parameters"
+    )]
+    pub(crate) fn fill_rect(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        ch: char,
+        fg: PackedColor,
+        bg: PackedColor,
+        flags: CellFlags,
+    ) {
+        if top > bottom || left > right || top >= self.viewport_rows || left >= self.cols {
+            return;
+        }
+        let bottom = bottom.min(self.viewport_rows - 1);
+        let right = right.min(self.cols - 1);
+        let clean_flags = flags & CellFlags::WRITE_ATTR_MASK;
+        let fill = Cell::new(ch, fg, bg, clean_flags);
+        let hist = self.history_len();
+        self.content_epoch += 1;
+
+        for r in top..=bottom {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let row = &mut self.rows[hist + r];
+            row.fill_range(left..(right + 1), fill, &mut self.extras);
+            row.set_generation(epoch);
+            self.dirty.mark_row(r);
+        }
+        self.mark_dirty_abs(self.live_viewport_to_abs(top));
+    }
+
+    /// Fills all visible viewport rows with `'E'` using default attributes (`DECALN`, `ESC # 8`).
+    pub(crate) fn fill_alignment_pattern(&mut self) {
+        let hist = self.history_len();
+        let cols = self.cols;
+        let fill = Cell::new(
+            'E',
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::empty(),
+        );
+        self.content_epoch += 1;
+        for r in 0..self.viewport_rows {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            self.rows[hist + r].reset_for_reuse(cols, fill, epoch, &mut self.extras);
+        }
+        self.dirty.mark_all();
+        self.mark_dirty_abs(self.live_viewport_to_abs(0));
     }
 
     /// Clears all visible viewport rows with BCE `bg` without touching scrollback history.
@@ -1301,6 +1607,7 @@ impl Grid {
             self.rows[hist + r].reset_for_reuse(cols, fill, epoch, &mut self.extras);
         }
         self.dirty.mark_all();
+        self.mark_dirty_abs(self.live_viewport_to_abs(0));
     }
 
     /// Clears all scrollback history above the live viewport (`ED 3`), reclaiming extras and
@@ -1323,6 +1630,7 @@ impl Grid {
             self.bump_damage_epoch();
             self.dirty.mark_all();
         }
+        self.mark_dirty_abs(self.oldest_abs_line());
     }
 
     /// Resets the entire grid (including scrollback, extras, and row pool) for `RIS` (`ESC c`).
@@ -1338,30 +1646,41 @@ impl Grid {
             self.rows.push_back(Row::new(self.cols, epoch));
         }
         self.dirty.mark_all();
+        self.mark_dirty_abs(self.oldest_abs_line());
+    }
+
+    /// Clones visible viewport rows and all referenced `CellExtra`s into caller-provided buffers,
+    /// reusing their existing heap allocations.
+    pub fn clone_visible_snapshot_into(
+        &self,
+        rows: &mut Vec<Row>,
+        extras: &mut Vec<(u32, CellExtra)>,
+    ) {
+        rows.clear();
+        extras.clear();
+        let (s0, s1) = self.visible_slices();
+        for row in s0.iter().chain(s1.iter()) {
+            rows.push(row.clone());
+            if row.may_have_extras() {
+                for cell in row.cells() {
+                    if cell.extra_id != 0
+                        && let Some(ext) = self.extras.get(cell.extra_id)
+                    {
+                        extras.push((cell.extra_id, ext.clone()));
+                    }
+                }
+            }
+        }
+        extras.sort_unstable_by_key(|(id, _)| *id);
     }
 
     /// Clones visible viewport rows and all referenced `CellExtra`s for a DEC Mode 2026
     /// synchronized snapshot.
     #[must_use]
     pub fn clone_visible_snapshot(&self) -> (Vec<Row>, Vec<(u32, CellExtra)>) {
-        let top = self.history_len().saturating_sub(self.display_offset);
         let mut rows = Vec::with_capacity(self.viewport_rows);
         let mut extras = Vec::new();
-        for y in 0..self.viewport_rows {
-            if let Some(row) = self.rows.get(top + y) {
-                rows.push(row.clone());
-                if row.may_have_extras() {
-                    for cell in row.cells() {
-                        if cell.extra_id != 0
-                            && let Some(ext) = self.extras.get(cell.extra_id)
-                        {
-                            extras.push((cell.extra_id, ext.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        extras.sort_unstable_by_key(|(id, _)| *id);
+        self.clone_visible_snapshot_into(&mut rows, &mut extras);
         (rows, extras)
     }
 
@@ -1432,8 +1751,9 @@ impl Grid {
                 if cell.is_wrap_spacer() {
                     let is_last = c + 1 == cols;
                     if is_last && soft_wrapped {
-                        cell.flags
-                            .remove(CellFlags::WIDE_LEAD | CellFlags::WIDE_SPACER);
+                        cell.flags.remove(
+                            CellFlags::WIDE_LEAD | CellFlags::WIDE_SPACER | CellFlags::SIZED_SPACER,
+                        );
                         cell.extra_id = 0;
                     } else {
                         cell.flags.remove(CellFlags::WRAP_SPACER);
@@ -1441,16 +1761,16 @@ impl Grid {
                 }
             }
 
-            // Pass 2: sanitize mutually-exclusive WIDE_LEAD / WIDE_SPACER flags and rebuild extras.
+            // Pass 2: sanitize mutually-exclusive WIDE_LEAD / WIDE_SPACER / SIZED_SPACER flags and rebuild extras.
             for c in 0..cols {
                 if cells[c].is_wrap_spacer() {
                     continue;
                 }
                 if cells[c].is_wide_spacer() {
                     if c > 0 && cells[c - 1].is_wide_lead() {
-                        cells[c]
-                            .flags
-                            .remove(CellFlags::WIDE_LEAD | CellFlags::WRAP_SPACER);
+                        cells[c].flags.remove(
+                            CellFlags::WIDE_LEAD | CellFlags::WRAP_SPACER | CellFlags::SIZED_SPACER,
+                        );
                         cells[c].extra_id = 0;
                         continue;
                     }
@@ -1461,10 +1781,15 @@ impl Grid {
                     if is_last || !cells[c + 1].is_wide_spacer() {
                         cells[c].flags.remove(CellFlags::WIDE_LEAD);
                     } else {
-                        cells[c]
-                            .flags
-                            .remove(CellFlags::WIDE_SPACER | CellFlags::WRAP_SPACER);
+                        cells[c].flags.remove(
+                            CellFlags::WIDE_SPACER
+                                | CellFlags::WRAP_SPACER
+                                | CellFlags::SIZED_SPACER,
+                        );
                     }
+                }
+                if cells[c].is_sized_spacer() {
+                    cells[c].extra_id = 0;
                 }
                 if cells[c].extra_id != 0 {
                     if let Some(mut ext) = snap.extras.get(cells[c].extra_id).cloned() {
@@ -1507,6 +1832,8 @@ impl Grid {
             damage_epoch,
             content_epoch,
             dirty: DirtyTracker::new(viewport_rows),
+            #[cfg(any(test, feature = "hyperlinks", feature = "search"))]
+            dirty_abs_start: Some(AbsLine(total_evicted)),
         }
     }
 
@@ -1553,7 +1880,7 @@ impl Grid {
         );
     }
 
-    /// Verifies structural `WIDE_LEAD`/`WIDE_SPACER`/`WRAP_SPACER` invariants on every row.
+    /// Verifies structural `WIDE_LEAD`/`WIDE_SPACER`/`WRAP_SPACER`/`SIZED_SPACER` invariants on every row.
     #[cfg(test)]
     pub(crate) fn debug_verify_wide_invariants(&self) {
         for (r_idx, row) in self.rows.iter().enumerate() {
@@ -1562,7 +1889,8 @@ impl Grid {
             for (c_idx, cell) in cells.iter().enumerate() {
                 let structural_count = usize::from(cell.is_wide_lead())
                     + usize::from(cell.is_wide_spacer())
-                    + usize::from(cell.is_wrap_spacer());
+                    + usize::from(cell.is_wrap_spacer())
+                    + usize::from(cell.is_sized_spacer());
                 assert!(
                     structural_count <= 1,
                     "row {r_idx} col {c_idx}: mutually exclusive structural flags {:?}",
@@ -1586,7 +1914,291 @@ impl Grid {
                     assert!(row.soft_wrapped(), "WRAP_SPACER without soft_wrapped");
                     assert_eq!(cell.extra_id, 0, "WRAP_SPACER must not have extra_id");
                 }
+                if cell.is_sized_spacer() {
+                    assert_eq!(cell.extra_id, 0, "SIZED_SPACER must not have extra_id");
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_ascii_row(grid: &mut Grid, vp_row: usize, text: &str, flags: CellFlags) {
+        grid.write_ascii_slice(
+            vp_row,
+            0,
+            text.as_bytes(),
+            PackedColor::Default,
+            PackedColor::Default,
+            flags,
+        );
+    }
+
+    #[test]
+    fn visible_slices_and_snapshot_into_cover_wraparound_and_reuse_capacity() {
+        let mut grid = Grid::new(ScreenKind::Primary, 8, 3, 5);
+        for i in 0..7 {
+            write_ascii_row(&mut grid, 2, &format!("row{i}"), CellFlags::empty());
+            grid.scroll_up_region(0, 2, 1, PackedColor::Default, true);
+        }
+        grid.set_display_offset(2);
+        let (s0, s1) = grid.visible_slices();
+        assert_eq!(s0.len() + s1.len(), 3);
+        for (y, row) in s0.iter().chain(s1.iter()).enumerate() {
+            assert_eq!(row, grid.visible_row(y).unwrap());
+        }
+
+        let mut rows_buf = Vec::with_capacity(16);
+        let mut extras_buf = Vec::with_capacity(8);
+        let rows_cap = rows_buf.capacity();
+        let extras_cap = extras_buf.capacity();
+        grid.clone_visible_snapshot_into(&mut rows_buf, &mut extras_buf);
+        assert_eq!(rows_buf.len(), 3);
+        assert_eq!(rows_buf.capacity(), rows_cap);
+        assert_eq!(extras_buf.capacity(), extras_cap);
+    }
+
+    #[test]
+    fn dirty_abs_start_tracks_scroll_and_mutations_precisely() {
+        let mut grid = Grid::new(ScreenKind::Primary, 10, 4, 10);
+        assert_eq!(grid.min_dirty_abs(), None);
+
+        // Multiple unconsumed scroll_up_region calls retain the minimum dirtied
+        // live_viewport_to_abs(0) (AbsLine(1) from the first scroll, not oldest_abs_line()).
+        for _ in 0..2 {
+            grid.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+        }
+        assert_eq!(grid.history_len(), 2);
+        assert_eq!(grid.min_dirty_abs(), Some(AbsLine(1)));
+        assert_ne!(grid.min_dirty_abs(), Some(grid.oldest_abs_line()));
+        assert_eq!(grid.take_dirty_abs_start(), Some(AbsLine(1)));
+        assert_eq!(grid.min_dirty_abs(), None);
+
+        // Primary scroll_up_region with n < viewport_rows dirties live_viewport_to_abs(0), NOT oldest_abs_line().
+        grid.scroll_up_region(0, 3, 1, PackedColor::Default, true);
+        assert_eq!(grid.history_len(), 3);
+        assert_eq!(grid.min_dirty_abs(), Some(grid.live_viewport_to_abs(0)));
+        assert_ne!(grid.min_dirty_abs(), Some(grid.oldest_abs_line()));
+        assert_eq!(
+            grid.take_dirty_abs_start(),
+            Some(grid.live_viewport_to_abs(0))
+        );
+        assert_eq!(grid.min_dirty_abs(), None);
+
+        write_ascii_row(&mut grid, 2, "hello", CellFlags::empty());
+        assert_eq!(grid.min_dirty_abs(), Some(grid.live_viewport_to_abs(2)));
+        write_ascii_row(&mut grid, 1, "world", CellFlags::empty());
+        assert_eq!(grid.min_dirty_abs(), Some(grid.live_viewport_to_abs(1)));
+    }
+
+    #[test]
+    fn shift_left_right_box_preserves_margins_and_wide_invariants() {
+        let mut grid = Grid::new(ScreenKind::Primary, 10, 3, 10);
+        write_ascii_row(&mut grid, 0, "ABCDEFGHIJ", CellFlags::empty());
+        write_ascii_row(&mut grid, 1, "0123456789", CellFlags::empty());
+
+        grid.shift_left_box(0, 1, 2, 7, 2, PackedColor::indexed(1));
+        assert_eq!(
+            grid.viewport_row(0).unwrap().text(grid.extras()),
+            "ABEFGH  IJ"
+        );
+        assert_eq!(
+            grid.viewport_row(1).unwrap().text(grid.extras()),
+            "014567  89"
+        );
+        assert_eq!(
+            grid.viewport_row(0).unwrap().cells()[6].bg,
+            PackedColor::indexed(1)
+        );
+
+        grid.shift_right_box(0, 0, 2, 7, 1, PackedColor::indexed(2));
+        assert_eq!(
+            grid.viewport_row(0).unwrap().text(grid.extras()),
+            "AB EFGH IJ"
+        );
+        assert_eq!(
+            grid.viewport_row(0).unwrap().cells()[2].bg,
+            PackedColor::indexed(2)
+        );
+
+        // Wide character straddling box boundary is cleaned without orphan spacers.
+        grid.write_wide_cell(
+            2,
+            1,
+            Cell::new(
+                '中',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::WIDE_LEAD,
+            ),
+            Cell::new(
+                ' ',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::WIDE_SPACER,
+            ),
+            None,
+            PackedColor::Default,
+        );
+        grid.shift_left_box(2, 2, 2, 6, 1, PackedColor::Default);
+        grid.debug_verify_wide_invariants();
+        grid.debug_verify_extra_invariants();
+    }
+
+    #[test]
+    fn selective_erase_line_and_display_respect_protected_and_scrollback() {
+        let mut grid = Grid::new(ScreenKind::Primary, 8, 2, 4);
+        // Push one row into scrollback with protected + unprotected cells.
+        grid.write_ascii_slice(
+            0,
+            0,
+            b"PROT",
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::PROTECTED,
+        );
+        grid.write_ascii_slice(
+            0,
+            4,
+            b"free",
+            PackedColor::indexed(3),
+            PackedColor::indexed(4),
+            CellFlags::BOLD,
+        );
+        grid.scroll_up_region(0, 1, 1, PackedColor::Default, true);
+        grid.scroll_up_region(0, 1, 1, PackedColor::Default, true);
+        assert_eq!(grid.history_len(), 2);
+
+        // Viewport row 0: protected "AA", unprotected styled "BB", protected "CC", unprotected "DD".
+        grid.write_ascii_slice(
+            0,
+            0,
+            b"AA",
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::PROTECTED,
+        );
+        grid.write_ascii_slice(
+            0,
+            2,
+            b"BB",
+            PackedColor::indexed(1),
+            PackedColor::indexed(2),
+            CellFlags::BOLD,
+        );
+        grid.write_ascii_slice(
+            0,
+            4,
+            b"CC",
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::PROTECTED,
+        );
+        grid.write_ascii_slice(
+            0,
+            6,
+            b"DD",
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::empty(),
+        );
+
+        grid.erase_in_line_selective(0, 2, 0, PackedColor::Default);
+        assert_eq!(grid.viewport_row(0).unwrap().text(grid.extras()), "AA  CC");
+        let erased = grid.viewport_row(0).unwrap().cells()[2];
+        assert_eq!(erased.codepoint, ' ');
+        assert_eq!(erased.fg, PackedColor::indexed(1));
+        assert_eq!(erased.bg, PackedColor::indexed(2));
+        assert!(erased.flags.contains(CellFlags::BOLD));
+
+        // Mode 3 selectively erases scrollback without touching protected "PROT".
+        grid.erase_in_display_selective(0, 0, 3, PackedColor::Default);
+        let sb_row = grid.row_by_buf(0).unwrap();
+        assert_eq!(sb_row.text(grid.extras()), "PROT    ");
+        assert_eq!(sb_row.cells()[5].bg, PackedColor::indexed(4));
+        grid.debug_verify_extra_invariants();
+        grid.debug_verify_wide_invariants();
+    }
+
+    #[test]
+    fn copy_erase_fill_rect_and_alignment_pattern() {
+        let mut grid = Grid::new(ScreenKind::Primary, 8, 4, 4);
+        write_ascii_row(&mut grid, 0, "ABCD1234", CellFlags::empty());
+        write_ascii_row(&mut grid, 1, "EFGH5678", CellFlags::empty());
+        write_ascii_row(&mut grid, 2, "IJKL9012", CellFlags::empty());
+        grid.write_wide_cell(
+            0,
+            1,
+            Cell::new(
+                '中',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::WIDE_LEAD,
+            ),
+            Cell::new(
+                ' ',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::WIDE_SPACER,
+            ),
+            Some(CellExtra {
+                combining: vec!['\u{0301}'],
+                underline_color: Some(PackedColor::rgb(255, 0, 0)),
+                hyperlink_id: None,
+                text_sizing: None,
+            }),
+            PackedColor::Default,
+        );
+
+        // Overlapping copy (0..=1, 0..=3) -> (1, 1) duplicates extra and normalizes wide edges.
+        grid.copy_rect(0, 0, 1, 3, 1, 1, PackedColor::Default);
+        grid.debug_verify_extra_invariants();
+        grid.debug_verify_wide_invariants();
+        assert_eq!(grid.extras().live_count(), 2);
+
+        // DECFRA fill_rect and DECERA / DECSERA erase_rect.
+        grid.fill_rect(
+            2,
+            2,
+            3,
+            5,
+            '#',
+            PackedColor::indexed(5),
+            PackedColor::Default,
+            CellFlags::PROTECTED,
+        );
+        assert_eq!(grid.viewport_row(2).unwrap().cells()[3].codepoint, '#');
+        assert!(grid.viewport_row(2).unwrap().cells()[3].is_protected());
+
+        // Selective erase_rect leaves protected '#'.
+        grid.erase_rect(
+            2,
+            2,
+            3,
+            5,
+            PackedColor::Default,
+            EraseProtection::UnprotectedOnly,
+        );
+        assert_eq!(grid.viewport_row(2).unwrap().cells()[3].codepoint, '#');
+
+        // Full erase_rect clears protected '#'.
+        grid.erase_rect(2, 2, 3, 5, PackedColor::Default, EraseProtection::All);
+        assert_eq!(grid.viewport_row(2).unwrap().cells()[3].codepoint, ' ');
+        assert!(!grid.viewport_row(2).unwrap().cells()[3].is_protected());
+
+        // DECALN fills viewport with 'E'.
+        grid.fill_alignment_pattern();
+        for r in 0..4 {
+            assert_eq!(
+                grid.viewport_row(r).unwrap().text(grid.extras()),
+                "EEEEEEEE"
+            );
+        }
+        assert_eq!(grid.extras().live_count(), 0);
+        grid.debug_verify_extra_invariants();
+        grid.debug_verify_wide_invariants();
     }
 }

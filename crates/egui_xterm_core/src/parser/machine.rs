@@ -28,6 +28,93 @@ fn scan_printable_ascii_prefix(bytes: &[u8]) -> usize {
     i
 }
 
+/// Returns `true` if any byte in `w` is a C0 control (`< 0x20`) or `DEL` (`0x7F`).
+#[inline]
+const fn word_has_c0_or_del(w: u64) -> bool {
+    const HI_BITS: u64 = 0x8080_8080_8080_8080;
+    const LO_MASK: u64 = 0x2020_2020_2020_2020;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const DEL_MASK: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
+    let c0 = (!w & HI_BITS) & w.wrapping_sub(LO_MASK);
+    let xor_del = w ^ DEL_MASK;
+    let del = xor_del.wrapping_sub(ONES) & !xor_del & HI_BITS;
+    (c0 | del) != 0
+}
+
+/// Returns the byte length of the longest prefix in `bytes` free of C0 (`< 0x20`) and `DEL` (`0x7F`).
+#[inline]
+fn scan_ground_utf8_bytes(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    for &chunk in bytes.as_chunks::<8>().0 {
+        if word_has_c0_or_del(u64::from_ne_bytes(chunk)) {
+            break;
+        }
+        i += 8;
+    }
+    while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] != 0x7F {
+        i += 1;
+    }
+    i
+}
+
+/// Returns `true` if `bytes` contains any C0 control (`< 0x20`) or `DEL` (`0x7F`).
+#[inline]
+fn has_c0_or_del(bytes: &[u8]) -> bool {
+    let (chunks, tail) = bytes.as_chunks::<8>();
+    for &chunk in chunks {
+        if word_has_c0_or_del(u64::from_ne_bytes(chunk)) {
+            return true;
+        }
+    }
+    tail.iter().any(|&b| b < 0x20 || b == 0x7F)
+}
+
+/// Splits a clean `OSC` payload on `;` without copying and dispatches to `handler`.
+fn dispatch_osc_slice(payload: &[u8], terminator: OscTerminator, handler: &mut impl VtHandler) {
+    if payload.is_empty() {
+        handler.osc_dispatch(&[], terminator);
+        return;
+    }
+
+    let mut stack: [&[u8]; 16] = [&[]; 16];
+    let mut count = 0usize;
+    let mut overflow: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
+
+    for semi in memchr::memchr_iter(b';', payload) {
+        let part = &payload[start..semi];
+        if overflow.is_empty() {
+            if count < stack.len() {
+                stack[count] = part;
+                count += 1;
+            } else {
+                overflow.extend_from_slice(&stack);
+                overflow.push(part);
+            }
+        } else {
+            overflow.push(part);
+        }
+        start = semi + 1;
+    }
+
+    let last = &payload[start..];
+    if overflow.is_empty() {
+        if count < stack.len() {
+            stack[count] = last;
+            count += 1;
+            handler.osc_dispatch(&stack[..count], terminator);
+        } else {
+            overflow.extend_from_slice(&stack);
+            overflow.push(last);
+            handler.osc_dispatch(&overflow, terminator);
+        }
+    } else {
+        overflow.push(last);
+        handler.osc_dispatch(&overflow, terminator);
+    }
+}
+
 /// Stateful, streaming DEC VT500 / ANSI control-sequence parser.
 #[derive(Debug)]
 pub struct Parser {
@@ -120,7 +207,7 @@ impl Parser {
     pub fn advance(&mut self, bytes: &[u8], handler: &mut impl VtHandler) {
         let mut pos = 0usize;
         while pos < bytes.len() {
-            // Fast-path 1: contiguous printable ASCII in Ground when UTF-8 decoder is idle.
+            // Fast-path 1: contiguous printable ASCII or UTF-8 in Ground when UTF-8 decoder is idle.
             if self.state == State::Ground && self.utf8.is_idle() {
                 let run_len = scan_printable_ascii_prefix(&bytes[pos..]);
                 if run_len > 0 {
@@ -128,24 +215,83 @@ impl Parser {
                     pos += run_len;
                     continue;
                 }
+                if self.c1_policy == C1Policy::Utf8Only && bytes[pos] >= 0x80 {
+                    let utf8_span = scan_ground_utf8_bytes(&bytes[pos..]);
+                    let run = &bytes[pos..pos + utf8_span];
+                    match std::str::from_utf8(run) {
+                        Ok(text) => {
+                            handler.print_utf8_run(text);
+                            pos += text.len();
+                            continue;
+                        }
+                        Err(err) => {
+                            let valid = err.valid_up_to();
+                            if valid > 0 {
+                                if let Ok(prefix) = std::str::from_utf8(&run[..valid]) {
+                                    handler.print_utf8_run(prefix);
+                                }
+                                pos += valid;
+                            }
+                            if err.error_len().is_none() {
+                                let tail_end = pos + (utf8_span - valid);
+                                while pos < tail_end {
+                                    let byte = bytes[pos];
+                                    pos += 1;
+                                    self.step(byte, handler);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
 
-            // Fast-path 2: SIMD memchr skip in bulk DCS/ignore states under Utf8Only.
+            // Fast-path 2: SIMD memchr skip in bulk OSC/DCS/APC/ignore states under Utf8Only.
             if self.c1_policy == C1Policy::Utf8Only {
                 match self.state {
+                    State::OscString => {
+                        let rest = &bytes[pos..];
+                        let stop_bel_esc_can =
+                            memchr::memchr3(0x07, 0x1B, 0x18, rest).unwrap_or(rest.len());
+                        let stop = memchr::memchr(0x1A, &rest[..stop_bel_esc_can])
+                            .unwrap_or(stop_bel_esc_can);
+                        let chunk = &rest[..stop];
+                        if self.osc_buf.is_empty()
+                            && !self.osc_overflow
+                            && stop < rest.len()
+                            && matches!(rest[stop], 0x07 | 0x1B)
+                            && chunk.len() <= self.max_osc_bytes
+                            && !has_c0_or_del(chunk)
+                        {
+                            let terminator = if rest[stop] == 0x07 {
+                                self.state = State::Ground;
+                                OscTerminator::Bel
+                            } else {
+                                self.clear_sequence();
+                                self.state = State::Escape;
+                                OscTerminator::St
+                            };
+                            dispatch_osc_slice(chunk, terminator, handler);
+                            pos += stop + 1;
+                            continue;
+                        }
+                        if stop > 0 {
+                            self.osc_put_slice(chunk);
+                            pos += stop;
+                            continue;
+                        }
+                    }
                     State::DcsPassthrough => {
                         let rest = &bytes[pos..];
                         let stop = memchr::memchr3(0x1B, 0x18, 0x1A, rest).unwrap_or(rest.len());
                         if stop > 0 {
                             let chunk = &rest[..stop];
                             if memchr::memchr(0x7F, chunk).is_none() {
-                                for &b in chunk {
-                                    handler.put(b);
-                                }
+                                handler.put_slice(chunk);
                             } else {
-                                for &b in chunk {
-                                    if b != 0x7F {
-                                        handler.put(b);
+                                for part in chunk.split(|&b| b == 0x7F) {
+                                    if !part.is_empty() {
+                                        handler.put_slice(part);
                                     }
                                 }
                             }
@@ -157,17 +303,7 @@ impl Parser {
                         let rest = &bytes[pos..];
                         let stop = memchr::memchr3(0x1B, 0x18, 0x1A, rest).unwrap_or(rest.len());
                         if stop > 0 {
-                            if !self.apc_overflow {
-                                let chunk = &rest[..stop];
-                                for &b in chunk {
-                                    if b >= 0x20 && b != 0x7F {
-                                        self.apc_put(b);
-                                        if self.apc_overflow {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                            self.apc_put_slice(&rest[..stop]);
                             pos += stop;
                             continue;
                         }
@@ -184,10 +320,80 @@ impl Parser {
                 }
             }
 
+            // Fast-path 3: inline CSI parameter digits, `;`/`:` separators, and final dispatch.
+            if matches!(self.state, State::CsiEntry | State::CsiParam) {
+                let consumed = self.parse_csi_fast(&bytes[pos..], handler);
+                if consumed > 0 {
+                    pos += consumed;
+                    continue;
+                }
+            }
+
             let byte = bytes[pos];
             pos += 1;
             self.step(byte, handler);
         }
+    }
+
+    #[inline]
+    fn parse_csi_fast(&mut self, rest: &[u8], handler: &mut impl VtHandler) -> usize {
+        let mut i = 0usize;
+        if self.state == State::CsiEntry
+            && let Some(&b) = rest.first()
+            && matches!(b, 0x3C..=0x3F)
+        {
+            if self.collect_intermediate(b) {
+                self.state = State::CsiParam;
+                i = 1;
+            } else {
+                self.state = State::CsiIgnore;
+                return 1;
+            }
+        }
+
+        while i < rest.len() {
+            let b = rest[i];
+            match b {
+                b'0'..=b'9' => {
+                    self.state = State::CsiParam;
+                    if !self.params.is_truncated() {
+                        let mut val = self.params.start_or_resume_param();
+                        val = val.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                        i += 1;
+                        while i < rest.len() && rest[i].is_ascii_digit() {
+                            val = val
+                                .saturating_mul(10)
+                                .saturating_add(u16::from(rest[i] - b'0'));
+                            i += 1;
+                        }
+                        self.params.set_active_param(val);
+                    } else {
+                        i += 1;
+                        while i < rest.len() && rest[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+                b';' => {
+                    self.params.next_param();
+                    self.state = State::CsiParam;
+                    i += 1;
+                }
+                b':' => {
+                    self.params.next_subparam();
+                    self.state = State::CsiParam;
+                    i += 1;
+                }
+                0x40..=0x7E => {
+                    self.params.finish();
+                    handler.csi_dispatch(&self.params, self.intermediates(), b);
+                    self.state = State::Ground;
+                    return i + 1;
+                }
+                _ => break,
+            }
+        }
+        i
     }
 
     fn clear_sequence(&mut self) {
@@ -224,6 +430,31 @@ impl Parser {
             } else {
                 self.osc_overflow = true;
                 self.osc_buf.clear();
+            }
+        }
+    }
+
+    fn osc_put_slice(&mut self, chunk: &[u8]) {
+        if self.osc_overflow {
+            return;
+        }
+        if !has_c0_or_del(chunk) {
+            if let Some(new_len) = self.osc_buf.len().checked_add(chunk.len())
+                && new_len <= self.max_osc_bytes
+            {
+                self.osc_buf.extend_from_slice(chunk);
+            } else {
+                self.osc_overflow = true;
+                self.osc_buf.clear();
+            }
+            return;
+        }
+        for &b in chunk {
+            if b >= 0x20 && b != 0x7F {
+                self.osc_put(b);
+                if self.osc_overflow {
+                    break;
+                }
             }
         }
     }
@@ -285,6 +516,31 @@ impl Parser {
             } else {
                 self.apc_overflow = true;
                 self.apc_buf.clear();
+            }
+        }
+    }
+
+    fn apc_put_slice(&mut self, chunk: &[u8]) {
+        if self.apc_overflow {
+            return;
+        }
+        if !has_c0_or_del(chunk) {
+            if let Some(new_len) = self.apc_buf.len().checked_add(chunk.len())
+                && new_len <= self.max_apc_bytes
+            {
+                self.apc_buf.extend_from_slice(chunk);
+            } else {
+                self.apc_overflow = true;
+                self.apc_buf.clear();
+            }
+            return;
+        }
+        for &b in chunk {
+            if b >= 0x20 && b != 0x7F {
+                self.apc_put(b);
+                if self.apc_overflow {
+                    break;
+                }
             }
         }
     }
@@ -440,7 +696,7 @@ impl Parser {
             State::Escape => match byte {
                 0x00..=0x17 | 0x19 | 0x1C..=0x1F => handler.execute(byte),
                 0x20..=0x2F => {
-                    let _ = self.collect_intermediate(byte);
+                    self.collect_intermediate(byte); // overflow recorded in `intermediate_overflow`
                     self.state = State::EscapeIntermediate;
                 }
                 0x50 => {
@@ -472,7 +728,7 @@ impl Parser {
             State::EscapeIntermediate => match byte {
                 0x00..=0x17 | 0x19 | 0x1C..=0x1F => handler.execute(byte),
                 0x20..=0x2F => {
-                    let _ = self.collect_intermediate(byte);
+                    self.collect_intermediate(byte); // overflow recorded in `intermediate_overflow`
                 }
                 0x30..=0x7E => {
                     if !self.intermediate_overflow {
@@ -1410,5 +1666,379 @@ mod tests {
         rec.events.clear();
         p8.advance(b"\x9Fhello\x9C", &mut rec);
         assert_eq!(rec.events, vec![Event::Apc(b"hello".to_vec())]);
+    }
+
+    #[derive(Default)]
+    struct BatchTrackingRecorder {
+        inner: Recorder,
+        utf8_runs: Vec<String>,
+        put_slices: Vec<Vec<u8>>,
+    }
+
+    impl VtHandler for BatchTrackingRecorder {
+        fn print(&mut self, ch: char) {
+            self.inner.print(ch);
+        }
+
+        fn print_ascii_run(&mut self, bytes: &[u8]) {
+            self.inner.print_ascii_run(bytes);
+        }
+
+        fn print_utf8_run(&mut self, text: &str) {
+            self.utf8_runs.push(text.to_owned());
+            for ch in text.chars() {
+                self.inner.print(ch);
+            }
+        }
+
+        fn execute(&mut self, byte: u8) {
+            self.inner.execute(byte);
+        }
+
+        fn hook(&mut self, params: &CsiParams, intermediates: &[u8], action: u8) {
+            self.inner.hook(params, intermediates, action);
+        }
+
+        fn put(&mut self, byte: u8) {
+            self.inner.put(byte);
+        }
+
+        fn put_slice(&mut self, bytes: &[u8]) {
+            self.put_slices.push(bytes.to_vec());
+            for &b in bytes {
+                self.inner.put(b);
+            }
+        }
+
+        fn unhook(&mut self) {
+            self.inner.unhook();
+        }
+
+        fn osc_dispatch(&mut self, params: &[&[u8]], terminator: OscTerminator) {
+            self.inner.osc_dispatch(params, terminator);
+        }
+
+        fn csi_dispatch(&mut self, params: &CsiParams, intermediates: &[u8], action: u8) {
+            self.inner.csi_dispatch(params, intermediates, action);
+        }
+
+        fn esc_dispatch(&mut self, intermediates: &[u8], action: u8) {
+            self.inner.esc_dispatch(intermediates, action);
+        }
+
+        fn apc_dispatch(&mut self, data: &[u8]) {
+            self.inner.apc_dispatch(data);
+        }
+    }
+
+    fn parse_byte_by_byte(policy: C1Policy, max_osc: usize, bytes: &[u8]) -> Vec<Event> {
+        parse_byte_by_byte_with_limits(policy, max_osc, DEFAULT_MAX_APC_BYTES, bytes)
+    }
+
+    fn parse_byte_by_byte_with_limits(
+        policy: C1Policy,
+        max_osc: usize,
+        max_apc: usize,
+        bytes: &[u8],
+    ) -> Vec<Event> {
+        let mut p = Parser::with_c1_policy(policy)
+            .with_max_osc_bytes(max_osc)
+            .with_max_apc_bytes(max_apc);
+        let mut rec = Recorder::default();
+        for &b in bytes {
+            p.advance(&[b], &mut rec);
+        }
+        rec.events
+    }
+
+    #[test]
+    fn swar_c0_del_exhaustive_lane_check() {
+        for lane in 0..8 {
+            for b in 0u8..=255 {
+                let mut buf = [0x41u8; 8];
+                buf[lane] = b;
+                let expected = b < 0x20 || b == 0x7F;
+                assert_eq!(
+                    has_c0_or_del(&buf),
+                    expected,
+                    "has_c0_or_del mismatch at lane={lane}, byte={b:#04x}"
+                );
+                let scan_expected = if expected { lane } else { 8 };
+                assert_eq!(
+                    scan_ground_utf8_bytes(&buf),
+                    scan_expected,
+                    "scan_ground_utf8_bytes mismatch at lane={lane}, byte={b:#04x}"
+                );
+            }
+        }
+        // Tail bytes (< 8 bytes).
+        assert!(!has_c0_or_del("中文😀abc".as_bytes()));
+        assert!(has_c0_or_del(b"abc\x7f"));
+        assert!(has_c0_or_del(b"abc\x00"));
+        assert!(has_c0_or_del(b"abc\x1f"));
+    }
+
+    #[test]
+    fn ground_utf8_batch_fast_path_and_invalid_parity() {
+        // Pure UTF-8 + mixed UTF-8/ASCII invokes `print_utf8_run` directly.
+        let mut parser = Parser::new();
+        let mut tracker = BatchTrackingRecorder::default();
+        parser.advance("中文🚀€Ü mixed ascii\n😀".as_bytes(), &mut tracker);
+        assert_eq!(
+            tracker.utf8_runs,
+            vec!["中文🚀€Ü mixed ascii".to_owned(), "😀".to_owned()]
+        );
+
+        // Complex invalid UTF-8 maximal-subpart + valid prefixes + C0/ESC/DEL interrupts.
+        let mut corpus = Vec::new();
+        corpus.extend_from_slice("αβγ".as_bytes());
+        corpus.extend_from_slice(&[0xFF, 0xFE]); // invalid single bytes
+        corpus.extend_from_slice("中文".as_bytes());
+        corpus.extend_from_slice(&[0xC0, 0x80]); // overlong
+        corpus.extend_from_slice(&[0xE2, 0x82, b' ', 0xE2, 0xC3, 0xA4]); // truncated + ASCII + truncated + valid
+        corpus.extend_from_slice(&[0xED, 0xA0, 0x80]); // surrogate
+        corpus.extend_from_slice(&[0xF0, 0x9F, 0x9A]); // truncated 4-byte interrupted by C0/ESC
+        corpus.extend_from_slice(b"\x1b[31m");
+        corpus.extend_from_slice("🚀".as_bytes());
+        corpus.extend_from_slice(&[0xE2, 0x82, 0x7F]); // truncated interrupted by DEL
+        corpus.extend_from_slice("Ü".as_bytes());
+        corpus.extend_from_slice(&[0xF4, 0x90, 0x80, 0x80]); // > U+10FFFF
+        corpus.extend_from_slice("end".as_bytes());
+
+        let expected = parse_byte_by_byte(C1Policy::Utf8Only, DEFAULT_MAX_OSC_BYTES, &corpus);
+        for chunk_len in [1, 2, 3, 4, 5, 7, 13, 64, corpus.len()] {
+            let mut p = Parser::new();
+            let mut rec = BatchTrackingRecorder::default();
+            for chunk in corpus.chunks(chunk_len) {
+                p.advance(chunk, &mut rec);
+            }
+            assert_eq!(
+                rec.inner.events, expected,
+                "UTF-8 parity mismatch for chunk_len={chunk_len}"
+            );
+        }
+
+        // Default `VtHandler::print_utf8_run` and `put_slice` fall back to `print`/`put`.
+        let mut p_def = Parser::new();
+        let mut rec_def = Recorder::default();
+        p_def.advance("中文🚀\x1bPqhi\x1b\\".as_bytes(), &mut rec_def);
+        assert_eq!(
+            rec_def.events,
+            vec![
+                Event::Print('中'),
+                Event::Print('文'),
+                Event::Print('🚀'),
+                Event::Hook {
+                    params: Vec::new(),
+                    intermediates: Vec::new(),
+                    action: b'q',
+                },
+                Event::Put(b'h'),
+                Event::Put(b'i'),
+                Event::Unhook,
+                Event::Esc {
+                    intermediates: Vec::new(),
+                    action: b'\\',
+                },
+            ]
+        );
+
+        // Split multi-byte UTF-8 across chunk boundary resumes batching cleanly afterwards.
+        let mut p = Parser::new();
+        let mut rec = BatchTrackingRecorder::default();
+        let emoji = "🚀中文";
+        let eb = emoji.as_bytes();
+        p.advance(&eb[..2], &mut rec);
+        assert!(!p.utf8.is_idle());
+        p.advance(&eb[2..], &mut rec);
+        assert!(p.utf8.is_idle());
+        assert_eq!(
+            rec.inner.events,
+            vec![Event::Print('🚀'), Event::Print('中'), Event::Print('文')]
+        );
+        assert_eq!(rec.utf8_runs, vec!["中文".to_owned()]);
+    }
+
+    #[test]
+    fn osc_zero_copy_and_buffered_parity() {
+        // Zero-copy single-chunk BEL and ST dispatch never allocates `osc_buf`.
+        let mut parser = Parser::new();
+        let mut rec = Recorder::default();
+        parser.advance(b"\x1b]2;ZeroCopyTitle\x07", &mut rec);
+        assert_eq!(parser.osc_buf.capacity(), 0);
+        assert_eq!(parser.osc_ranges.capacity(), 0);
+        assert_eq!(
+            rec.events,
+            vec![Event::Osc {
+                params: vec![b"2".to_vec(), b"ZeroCopyTitle".to_vec()],
+                terminator: OscTerminator::Bel,
+            }]
+        );
+
+        // Zero-copy ST (`ESC \`) preserves `esc_dispatch(&[], b'\\')`.
+        rec.events.clear();
+        parser.advance(b"\x1b]8;id=1;https://example.com\x1b\\", &mut rec);
+        assert_eq!(parser.osc_buf.capacity(), 0);
+        assert_eq!(
+            rec.events,
+            vec![
+                Event::Osc {
+                    params: vec![
+                        b"8".to_vec(),
+                        b"id=1".to_vec(),
+                        b"https://example.com".to_vec(),
+                    ],
+                    terminator: OscTerminator::St,
+                },
+                Event::Esc {
+                    intermediates: Vec::new(),
+                    action: b'\\',
+                },
+            ]
+        );
+
+        // Empty OSC (`\x1b]\x07` and `\x1b]\x1b\\`) dispatches `&[]`.
+        rec.events.clear();
+        parser.advance(b"\x1b]\x07\x1b]\x1b\\", &mut rec);
+        assert_eq!(parser.osc_buf.capacity(), 0);
+        assert_eq!(
+            rec.events,
+            vec![
+                Event::Osc {
+                    params: Vec::new(),
+                    terminator: OscTerminator::Bel,
+                },
+                Event::Osc {
+                    params: Vec::new(),
+                    terminator: OscTerminator::St,
+                },
+                Event::Esc {
+                    intermediates: Vec::new(),
+                    action: b'\\',
+                },
+            ]
+        );
+
+        // > 16 params in zero-copy OSC uses Vec fallback cleanly without allocating `osc_buf`.
+        rec.events.clear();
+        let many = format!(
+            "\x1b]{}\x07",
+            (0..25).map(|i| i.to_string()).collect::<Vec<_>>().join(";")
+        );
+        parser.advance(many.as_bytes(), &mut rec);
+        assert_eq!(parser.osc_buf.capacity(), 0);
+        assert!(matches!(
+            rec.events.as_slice(),
+            [Event::Osc { params, terminator: OscTerminator::Bel }] if params.len() == 25
+        ));
+
+        // Parity corpus with clean OSC, C0/DEL-filtered OSC, overflow OSC, CAN/SUB abort, and ESC mid-OSC.
+        let mut corpus = Vec::new();
+        corpus.extend_from_slice(b"\x1b]0;hello\x07");
+        corpus.extend_from_slice(b"\x1b]2;a\x01b\x7fc\x1b\\");
+        corpus.extend_from_slice(b"\x1b]2;aborted\x18after");
+        corpus.extend_from_slice(b"\x1b]2;subbed\x1aok");
+        corpus.extend_from_slice(b"\x1b]2;1234567890123456789012345\x07done");
+        corpus.extend_from_slice(b"\x1b]2;\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01abc\x07");
+        corpus.extend_from_slice(b"\x1b]7;file://host/path\x1b[31mred");
+
+        let expected = parse_byte_by_byte(C1Policy::Utf8Only, 16, &corpus);
+        for chunk_len in [1, 2, 3, 5, 8, 16, corpus.len()] {
+            let mut p = Parser::new().with_max_osc_bytes(16);
+            let mut rec = Recorder::default();
+            for chunk in corpus.chunks(chunk_len) {
+                p.advance(chunk, &mut rec);
+            }
+            assert_eq!(
+                rec.events, expected,
+                "OSC parity mismatch for chunk_len={chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcs_put_slice_and_apc_put_slice_parity() {
+        let mut parser = Parser::new().with_max_apc_bytes(32);
+        let mut tracker = BatchTrackingRecorder::default();
+        parser.advance(b"\x1bPqhello_dcs_payload\x1b\\", &mut tracker);
+        assert_eq!(tracker.put_slices, vec![b"hello_dcs_payload".to_vec()]);
+
+        // DCS with 0x7F interspersed + APC with C0/DEL and overflow.
+        let mut corpus = Vec::new();
+        corpus.extend_from_slice(b"\x1bP1$q\x7faaa\x7f\x7fbbb\nccc\x1b\\");
+        corpus.extend_from_slice(b"\x1b_Gi=1;a\x01b\x7fc\x1b\\");
+        corpus.extend_from_slice(b"\x1b_012345678901234567890123456789012345\x1b\\ok");
+
+        let expected =
+            parse_byte_by_byte_with_limits(C1Policy::Utf8Only, DEFAULT_MAX_OSC_BYTES, 32, &corpus);
+        for chunk_len in [1, 2, 4, 7, 15, corpus.len()] {
+            let mut p = Parser::new().with_max_apc_bytes(32);
+            let mut rec = BatchTrackingRecorder::default();
+            for chunk in corpus.chunks(chunk_len) {
+                p.advance(chunk, &mut rec);
+            }
+            assert_eq!(
+                rec.inner.events, expected,
+                "DCS/APC parity mismatch for chunk_len={chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_fast_path_parity_edge_cases() {
+        let mut corpus = Vec::new();
+        corpus.extend_from_slice(b"\x1b[m");
+        corpus.extend_from_slice(b"\x1b[38;2;255;128;0;48:2::10:20:30m");
+        corpus.extend_from_slice(b"\x1b[?2026h\x1b[>4;2m\x1b[=1u\x1b[<0;10;20M");
+        corpus.extend_from_slice(b"\x1b[??1m"); // CsiIgnore on second private byte
+        corpus.extend_from_slice(b"\x1b[12?3m"); // CsiIgnore on mid-param private byte
+        corpus.extend_from_slice(b"\x1b[31\n;32m"); // C0 interrupt mid-CSI
+        corpus.extend_from_slice(b"\x1b[31\x1b[33m"); // ESC abort mid-CSI
+        corpus.extend_from_slice(b"\x1b[12 $q"); // intermediate after params
+        corpus.extend_from_slice(b"\x1b[\n?25h"); // C0 before private marker in CsiEntry
+        corpus.extend_from_slice(b"\x1b[999999m"); // u16 saturation
+
+        // > MAX_CSI_SLOTS truncation parity.
+        corpus.extend_from_slice(b"\x1b[");
+        for i in 0..80 {
+            if i > 0 {
+                corpus.push(b';');
+            }
+            corpus.extend_from_slice(i.to_string().as_bytes());
+        }
+        corpus.push(b'm');
+
+        let expected = parse_byte_by_byte(C1Policy::Utf8Only, DEFAULT_MAX_OSC_BYTES, &corpus);
+        for chunk_len in [1, 2, 3, 4, 5, 7, 11, 32, corpus.len()] {
+            let mut p = Parser::new();
+            let mut rec = Recorder::default();
+            for chunk in corpus.chunks(chunk_len) {
+                p.advance(chunk, &mut rec);
+            }
+            assert_eq!(
+                rec.events, expected,
+                "CSI parity mismatch for chunk_len={chunk_len}"
+            );
+        }
+
+        // Also verify Vt500EightBit parity with 8-bit CSI 0x9B.
+        let mut c8 = vec![0x9B];
+        c8.extend_from_slice(b"?25;1h");
+        c8.push(0x9B);
+        c8.extend_from_slice(b"38;2;1;2;3m");
+        c8.push(0x9B);
+        c8.extend_from_slice(b"12\x90qdata\x9C");
+        let expected8 = parse_byte_by_byte(C1Policy::Vt500EightBit, DEFAULT_MAX_OSC_BYTES, &c8);
+        for chunk_len in [1, 2, 3, 5, c8.len()] {
+            let mut p8 = Parser::with_c1_policy(C1Policy::Vt500EightBit);
+            let mut rec = Recorder::default();
+            for chunk in c8.chunks(chunk_len) {
+                p8.advance(chunk, &mut rec);
+            }
+            assert_eq!(
+                rec.events, expected8,
+                "Vt500EightBit CSI parity mismatch for chunk_len={chunk_len}"
+            );
+        }
     }
 }
