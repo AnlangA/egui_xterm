@@ -26,7 +26,10 @@ use crate::features::hyperlinks::{
     HyperlinkInfo, HyperlinkSpan, ImplicitLinkStore, explicit_visible_spans,
 };
 #[cfg(feature = "kitty-graphics")]
-use crate::features::inline_images::kitty::handle_kitty_apc;
+use crate::features::inline_images::kitty::{
+    KITTY_PLACEHOLDER_CHAR, KittyApcContext, KittyFileMediumPolicy, KittyShmReader,
+    KittyTransportPolicy, diacritic_index, handle_kitty_apc_with_context,
+};
 #[cfg(feature = "sixel")]
 use crate::features::inline_images::sixel::SixelDecoder;
 #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
@@ -103,6 +106,11 @@ pub struct CoreConfig {
     /// Policy gating `OSC 52 ; Pc ; ?` clipboard read requests (default: [`Osc52ReadPolicy::Deny`]).
     #[cfg_attr(feature = "serde", serde(default))]
     pub osc52_read_policy: Osc52ReadPolicy,
+    /// Policy gating Kitty graphics file-path (`t=f`) and temporary-file (`t=t`) loading
+    /// (default: [`KittyFileMediumPolicy::LocalFiles`]).
+    #[cfg(feature = "kitty-graphics")]
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub kitty_file_medium_policy: KittyFileMediumPolicy,
     /// Delimiter characters used to bound tokens during word selection.
     pub word_separators: String,
     /// Maximum `OSC` payload byte budget passed to [`Parser`] (default: `4 MiB`).
@@ -120,6 +128,8 @@ impl Default for CoreConfig {
             sync_output_timeout_secs: 0.250,
             allow_osc52_read: false,
             osc52_read_policy: Osc52ReadPolicy::Deny,
+            #[cfg(feature = "kitty-graphics")]
+            kitty_file_medium_policy: KittyFileMediumPolicy::LocalFiles,
             word_separators: " \t\r\n\"'`()[]{}<>|;:,=*+-/\\".to_owned(),
             max_osc_bytes: DEFAULT_MAX_OSC_BYTES,
         }
@@ -509,6 +519,33 @@ impl RenderSnapshot<'_> {
     pub fn image_data(&self, id: u32) -> Option<&StoredImage> {
         self.image_store.get_image(id)
     }
+
+    /// Looks up a virtual (`U=1`) inline image placement matching `(image_id, placement_id)`
+    /// on the active screen for Unicode placeholder resolution.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn virtual_placement(&self, image_id: u32, placement_id: u32) -> Option<ImagePlacement> {
+        let screen = if self.is_alt_screen {
+            ScreenKind::Alternate
+        } else {
+            ScreenKind::Primary
+        };
+        self.image_store
+            .virtual_placement_on(screen, image_id, placement_id)
+    }
+}
+
+#[cfg(feature = "kitty-graphics")]
+#[derive(Default)]
+struct ShmReaderSlot(Option<Box<dyn KittyShmReader + Send + Sync>>);
+
+#[cfg(feature = "kitty-graphics")]
+impl std::fmt::Debug for ShmReaderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ShmReaderSlot")
+            .field(&self.0.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -709,8 +746,12 @@ pub struct TerminalState {
     kitty_keyboard: KittyKeyboardState,
     #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
     image_store: ImageStore,
+    #[cfg(feature = "kitty-graphics")]
+    kitty_shm_reader: ShmReaderSlot,
     #[cfg(feature = "sixel")]
     active_sixel: Option<SixelDecoder>,
+    #[cfg(feature = "sixel")]
+    sixel_shared_palette: Vec<[u8; 4]>,
     #[cfg(feature = "metrics")]
     metrics: TerminalMetrics,
 }
@@ -875,8 +916,12 @@ impl TerminalState {
             kitty_keyboard: KittyKeyboardState::default(),
             #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
             image_store: ImageStore::default(),
+            #[cfg(feature = "kitty-graphics")]
+            kitty_shm_reader: ShmReaderSlot::default(),
             #[cfg(feature = "sixel")]
             active_sixel: None,
+            #[cfg(feature = "sixel")]
+            sixel_shared_palette: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics: TerminalMetrics::new(),
         }
@@ -960,6 +1005,23 @@ impl TerminalState {
         #[cfg(not(feature = "shell-integration"))]
         let (shell_extra_points, shell_pending_wrap_idx): (Vec<GridPoint>, Option<usize>) =
             (Vec::new(), None);
+        #[cfg(feature = "shell-integration")]
+        let shell_point_count = shell_extra_points.len();
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        let (pri_extra_points, pri_img_start, pri_img_count, alt_extra_points, alt_img_count) = {
+            let mut pri_pts = shell_extra_points;
+            let img_start = pri_pts.len();
+            let pri_cnt = self
+                .image_store
+                .collect_reflow_points(ScreenKind::Primary, &mut pri_pts);
+            let mut alt_pts = Vec::new();
+            let alt_cnt = self
+                .image_store
+                .collect_reflow_points(ScreenKind::Alternate, &mut alt_pts);
+            (pri_pts, img_start, pri_cnt, alt_pts, alt_cnt)
+        };
+        #[cfg(not(any(feature = "kitty-graphics", feature = "sixel")))]
+        let (pri_extra_points, alt_extra_points) = (shell_extra_points, Vec::<GridPoint>::new());
 
         let sel_input = self.selection.map(|s| SelectionReflowInput {
             anchor: s.anchor,
@@ -979,13 +1041,13 @@ impl TerminalState {
             },
         });
 
-        let (sel_res, pri_extra_mapped, pri_extra_pw) = if self.modes.alt_screen {
+        let (sel_res, pri_extra_mapped, pri_extra_pw, alt_extra_mapped) = if self.modes.alt_screen {
             let alt_anchors = ReflowAnchors {
                 cursor_row: self.cursor.row,
                 cursor_col: self.cursor.col,
                 pending_wrap: self.cursor.pending_wrap,
                 selection: None,
-                extra_points: Vec::new(),
+                extra_points: alt_extra_points,
             };
             let (alt_res, alt_sel_res, _) = self.alternate.resize_with_selection(
                 new_cols,
@@ -1004,7 +1066,7 @@ impl TerminalState {
                     cursor_col: pri_cur.col,
                     pending_wrap: pri_cur.pending_wrap,
                     selection: None,
-                    extra_points: shell_extra_points,
+                    extra_points: pri_extra_points,
                 };
                 let (pri_res, pri_sel, pri_pw) = self.primary.resize_with_selection(
                     new_cols,
@@ -1019,7 +1081,7 @@ impl TerminalState {
                 (pri_res, pri_sel, pri_pw)
             } else {
                 let pri_anchors = ReflowAnchors {
-                    extra_points: shell_extra_points,
+                    extra_points: pri_extra_points,
                     ..ReflowAnchors::default()
                 };
                 self.primary.resize_with_selection(
@@ -1030,14 +1092,19 @@ impl TerminalState {
                     shell_pending_wrap_idx,
                 )
             };
-            (alt_sel_res, pri_res.extra_points, pri_pw)
+            (
+                alt_sel_res,
+                pri_res.extra_points,
+                pri_pw,
+                alt_res.extra_points,
+            )
         } else {
             let anchors = ReflowAnchors {
                 cursor_row: self.cursor.row,
                 cursor_col: self.cursor.col,
                 pending_wrap: self.cursor.pending_wrap,
                 selection: None,
-                extra_points: shell_extra_points,
+                extra_points: pri_extra_points,
             };
             let (res, pri_sel_res, pri_pw) = self.primary.resize_with_selection(
                 new_cols,
@@ -1049,14 +1116,14 @@ impl TerminalState {
             self.cursor.row = res.cursor_row;
             self.cursor.col = res.cursor_col;
             self.cursor.pending_wrap = res.pending_wrap;
-            drop(self.alternate.resize_with_selection(
-                new_cols,
-                new_rows,
-                ReflowAnchors::default(),
-                None,
-                None,
-            )); // alternate screen has no scrollback or shell-integration anchors
-            (pri_sel_res, res.extra_points, pri_pw)
+            let alt_anchors = ReflowAnchors {
+                extra_points: alt_extra_points,
+                ..ReflowAnchors::default()
+            };
+            let (alt_res, _, _) =
+                self.alternate
+                    .resize_with_selection(new_cols, new_rows, alt_anchors, None, None);
+            (pri_sel_res, res.extra_points, pri_pw, alt_res.extra_points)
         };
 
         #[cfg(feature = "shell-integration")]
@@ -1070,15 +1137,35 @@ impl TerminalState {
             };
             self.shell_integration.apply_reflow_points(
                 &self.primary,
-                &pri_extra_mapped,
+                &pri_extra_mapped[..shell_point_count],
                 pri_extra_pw,
                 post_pri_cur,
                 shell_tracking_cursor,
                 self.config.scrollback_limit,
             );
         }
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        {
+            self.image_store.apply_reflow_points(
+                ScreenKind::Primary,
+                &pri_extra_mapped[pri_img_start..pri_img_start + pri_img_count],
+                true,
+            );
+            self.image_store.apply_reflow_points(
+                ScreenKind::Alternate,
+                &alt_extra_mapped[..alt_img_count],
+                true,
+            );
+        }
         #[cfg(not(feature = "shell-integration"))]
-        let (_unused_pri_extra_mapped, _unused_pri_extra_pw) = (pri_extra_mapped, pri_extra_pw);
+        let _unused_pri_extra_pw = pri_extra_pw;
+        #[cfg(all(
+            not(feature = "shell-integration"),
+            not(any(feature = "kitty-graphics", feature = "sixel"))
+        ))]
+        let _unused_pri_extra_mapped = pri_extra_mapped;
+        #[cfg(not(any(feature = "kitty-graphics", feature = "sixel")))]
+        let _unused_alt_extra_mapped = alt_extra_mapped;
 
         if let Some(sr) = sel_res {
             if let Some(sel) = &mut self.selection {
@@ -1885,6 +1972,44 @@ impl TerminalState {
         self.image_store.get_image(id)
     }
 
+    /// Configures the Kitty file-medium (`t=f`/`t=t`) access policy at runtime.
+    #[cfg(feature = "kitty-graphics")]
+    pub fn set_kitty_file_medium_policy(&mut self, policy: KittyFileMediumPolicy) {
+        self.config.kitty_file_medium_policy = policy;
+    }
+
+    /// Returns the active Kitty file-medium (`t=f`/`t=t`) access policy.
+    #[cfg(feature = "kitty-graphics")]
+    #[must_use]
+    pub const fn kitty_file_medium_policy(&self) -> KittyFileMediumPolicy {
+        self.config.kitty_file_medium_policy
+    }
+
+    /// Installs or clears a custom [`KittyShmReader`] for `t=s` shared-memory image transfers.
+    #[cfg(feature = "kitty-graphics")]
+    pub fn set_kitty_shm_reader(&mut self, reader: Option<Box<dyn KittyShmReader + Send + Sync>>) {
+        self.kitty_shm_reader.0 = reader;
+    }
+
+    /// Advances all playing Kitty graphics animations to `now_secs`, marking dirty rows if any
+    /// displayed animation frame changed.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    pub fn tick_animations(&mut self, now_secs: f64) -> bool {
+        let changed = self.image_store.tick_animations(now_secs);
+        if changed {
+            self.active_grid_mut().bump_damage_epoch();
+            self.active_grid_mut().mark_all_dirty();
+        }
+        changed
+    }
+
+    /// Returns the earliest timestamp (`now_secs`) when any active animation needs its next frame.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn next_animation_deadline(&self) -> Option<f64> {
+        self.image_store.next_animation_deadline()
+    }
+
     /// Encodes a grid-relative [`MouseInputEvent`] according to active mouse modes, using
     /// [`Self::cell_pixel_size`] as fallback when `DEC ? 1016` SGR-Pixels is active.
     #[must_use]
@@ -2579,8 +2704,12 @@ impl TerminalState {
             kitty_keyboard,
             #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
             image_store: ImageStore::default(),
+            #[cfg(feature = "kitty-graphics")]
+            kitty_shm_reader: ShmReaderSlot::default(),
             #[cfg(feature = "sixel")]
             active_sixel: None,
+            #[cfg(feature = "sixel")]
+            sixel_shared_palette: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics: TerminalMetrics::new(),
         };
@@ -2947,6 +3076,93 @@ impl TerminalState {
         self.scroll_left > 0 || self.scroll_right + 1 < cols
     }
 
+    fn sync_images_after_scroll_up(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        count: usize,
+        push_to_history: bool,
+    ) {
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        {
+            if bottom < top {
+                return;
+            }
+            let rows = self.active_grid().viewport_rows();
+            let is_history_scroll =
+                push_to_history && !self.modes.alt_screen && top == 0 && bottom + 1 == rows;
+            if is_history_scroll {
+                self.image_store
+                    .prune_before(ScreenKind::Primary, self.primary.oldest_abs_line());
+            } else {
+                let len = bottom - top + 1;
+                let shift = count.min(len);
+                if shift > 0 {
+                    let screen = if self.modes.alt_screen {
+                        ScreenKind::Alternate
+                    } else {
+                        ScreenKind::Primary
+                    };
+                    let top_abs = self.active_grid().live_viewport_to_abs(top);
+                    let bottom_abs = self.active_grid().live_viewport_to_abs(bottom);
+                    let delta = -isize::try_from(shift).unwrap_or(isize::MAX);
+                    self.image_store
+                        .shift_placements_in_region(screen, top_abs, bottom_abs, delta, true);
+                }
+            }
+        }
+        #[cfg(not(any(feature = "kitty-graphics", feature = "sixel")))]
+        let _unused = (top, bottom, count, push_to_history);
+    }
+
+    fn sync_images_after_scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        {
+            if bottom < top {
+                return;
+            }
+            let len = bottom - top + 1;
+            let shift = count.min(len);
+            if shift > 0 {
+                let screen = if self.modes.alt_screen {
+                    ScreenKind::Alternate
+                } else {
+                    ScreenKind::Primary
+                };
+                let top_abs = self.active_grid().live_viewport_to_abs(top);
+                let bottom_abs = self.active_grid().live_viewport_to_abs(bottom);
+                let delta = isize::try_from(shift).unwrap_or(isize::MAX);
+                self.image_store
+                    .shift_placements_in_region(screen, top_abs, bottom_abs, delta, true);
+            }
+        }
+        #[cfg(not(any(feature = "kitty-graphics", feature = "sixel")))]
+        let _unused = (top, bottom, count);
+    }
+
+    fn clear_active_viewport_placements(&mut self) {
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        {
+            let screen = if self.modes.alt_screen {
+                ScreenKind::Alternate
+            } else {
+                ScreenKind::Primary
+            };
+            let top_abs = self.active_grid().live_viewport_to_abs(0);
+            let vp_rows = u16::try_from(self.active_grid().viewport_rows()).unwrap_or(u16::MAX);
+            self.image_store
+                .clear_viewport_placements(screen, top_abs, vp_rows, true);
+        }
+    }
+
+    fn notify_shell_rows_mutated(&mut self, start_row: usize, end_row: usize) {
+        #[cfg(feature = "shell-integration")]
+        self.shell_integration
+            .on_primary_rows_mutated(&self.primary, start_row, end_row);
+        #[cfg(not(feature = "shell-integration"))]
+        let _unused = (start_row, end_row);
+    }
+
     fn scroll_up_in_margins(
         &mut self,
         top: usize,
@@ -2970,6 +3186,7 @@ impl TerminalState {
             let rows = self.active_grid().viewport_rows();
             self.active_grid_mut()
                 .scroll_up_region(top, bottom, count, bg, push_to_history);
+            self.sync_images_after_scroll_up(top, bottom, count, push_to_history);
             #[cfg(feature = "shell-integration")]
             if !self.modes.alt_screen {
                 if push_to_history {
@@ -2996,6 +3213,7 @@ impl TerminalState {
         } else {
             self.active_grid_mut()
                 .scroll_down_region(top, bottom, count, bg);
+            self.sync_images_after_scroll_down(top, bottom, count);
         }
         #[cfg(feature = "shell-integration")]
         if !self.modes.alt_screen {
@@ -3070,12 +3288,27 @@ impl TerminalState {
 
     fn print_scalar(&mut self, raw_ch: char) {
         let ch = self.cursor.charsets.translate(raw_ch);
+        #[cfg(feature = "kitty-graphics")]
+        let ch_width = if ch == KITTY_PLACEHOLDER_CHAR {
+            1
+        } else {
+            UnicodeWidthChar::width(ch).unwrap_or(0)
+        };
+        #[cfg(not(feature = "kitty-graphics"))]
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        #[cfg(feature = "kitty-graphics")]
+        let is_kitty_diacritic = diacritic_index(ch).is_some();
+        #[cfg(not(feature = "kitty-graphics"))]
+        let is_kitty_diacritic = false;
         let is_ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch);
         let is_skin_tone = ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch);
 
         if let Some(lw) = self.last_written
-            && (ch_width == 0 || lw.ended_with_zwj || is_skin_tone || (is_ri && lw.is_unpaired_ri))
+            && (ch_width == 0
+                || is_kitty_diacritic
+                || lw.ended_with_zwj
+                || is_skin_tone
+                || (is_ri && lw.is_unpaired_ri))
         {
             let cols = self.active_grid().cols();
             let rows = self.active_grid().viewport_rows();
@@ -3090,6 +3323,38 @@ impl TerminalState {
                 self.write_new_cell(ch, ch_width, is_ri);
                 return;
             };
+
+            #[cfg(feature = "kitty-graphics")]
+            if is_kitty_diacritic && prev_cell.codepoint == KITTY_PLACEHOLDER_CHAR {
+                let too_many = prev_cell.extra_id != 0
+                    && self
+                        .active_grid()
+                        .cell_extra(prev_cell.extra_id)
+                        .is_some_and(|ext| ext.combining.len() >= MAX_COMBINING_PER_CELL);
+                if !too_many {
+                    self.active_grid_mut()
+                        .append_combining_scalar(lw.row, lw.col, ch);
+                    if let Some(ref mut lg) = self.last_graphic {
+                        lg.combining.push(ch);
+                    }
+                    self.last_written = Some(LastWrittenCell {
+                        row: lw.row,
+                        col: lw.col,
+                        ended_with_zwj: false,
+                        is_unpaired_ri: false,
+                    });
+                }
+                return;
+            }
+            if is_kitty_diacritic
+                && ch_width > 0
+                && !lw.ended_with_zwj
+                && !is_skin_tone
+                && !(is_ri && lw.is_unpaired_ri)
+            {
+                self.write_new_cell(ch, ch_width, is_ri);
+                return;
+            }
 
             let mut too_many_combining = false;
             let mut scratch = std::mem::take(&mut self.grapheme_scratch);
@@ -3174,6 +3439,7 @@ impl TerminalState {
                                     );
                                     self.active_grid_mut()
                                         .scroll_up_region(top, bottom, 1, bg, true);
+                                    self.sync_images_after_scroll_up(top, bottom, 1, true);
                                     #[cfg(feature = "shell-integration")]
                                     if !self.modes.alt_screen {
                                         self.shell_integration.on_primary_scroll_up(
@@ -3212,6 +3478,7 @@ impl TerminalState {
                             }
                             self.active_grid_mut()
                                 .scroll_up_region(top, bottom, 1, bg, true);
+                            self.sync_images_after_scroll_up(top, bottom, 1, true);
                             #[cfg(feature = "shell-integration")]
                             if !self.modes.alt_screen {
                                 self.shell_integration.on_primary_scroll_up(
@@ -3405,6 +3672,7 @@ impl TerminalState {
                 let bg = self.cursor.attrs.bg;
                 let rows = self.active_grid().viewport_rows();
                 self.active_grid_mut().clear_visible(bg);
+                self.clear_active_viewport_placements();
                 #[cfg(feature = "shell-integration")]
                 if !self.modes.alt_screen && rows > 0 {
                     self.shell_integration
@@ -3418,11 +3686,9 @@ impl TerminalState {
                 self.cursor.col = 0;
                 self.cursor.pending_wrap = false;
             }
-            5 => {
-                if self.modes.reverse_video != enable {
-                    self.modes.reverse_video = enable;
-                    self.active_grid_mut().mark_all_dirty();
-                }
+            5 if self.modes.reverse_video != enable => {
+                self.modes.reverse_video = enable;
+                self.active_grid_mut().mark_all_dirty();
             }
             6 => {
                 self.modes.origin_mode = enable;
@@ -3528,6 +3794,7 @@ impl TerminalState {
                     self.exit_alt_screen(false, true);
                 }
             }
+            1070 => self.modes.sixel_private_color_registers = enable,
             2004 => self.modes.bracketed_paste = enable,
             2026 => {
                 if enable {
@@ -3538,6 +3805,7 @@ impl TerminalState {
             }
             2027 => self.modes.grapheme_clustering = enable,
             2031 => self.modes.color_scheme_updates = enable,
+            8452 => self.modes.sixel_cursor_right = enable,
             _ => {}
         }
     }
@@ -3573,6 +3841,8 @@ impl TerminalState {
         self.cursor.pending_wrap = false;
         self.primary_saved_cursor = None;
         self.alt_saved_cursor = None;
+        #[cfg(feature = "sixel")]
+        self.sixel_shared_palette.clear();
         self.last_written = None;
         self.last_graphic = None;
     }
@@ -3957,6 +4227,7 @@ impl TerminalState {
         #[cfg(feature = "sixel")]
         {
             self.active_sixel = None;
+            self.sixel_shared_palette.clear();
         }
         #[cfg(feature = "kitty-keyboard")]
         self.kitty_keyboard.reset_all();
@@ -4138,10 +4409,22 @@ impl VtHandler for TerminalState {
         let mut last_scalar_ch: Option<char> = None;
 
         for ch in text.chars() {
+            #[cfg(feature = "kitty-graphics")]
+            let ch_width = if ch == KITTY_PLACEHOLDER_CHAR {
+                1
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            };
+            #[cfg(not(feature = "kitty-graphics"))]
             let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            #[cfg(feature = "kitty-graphics")]
+            let is_kitty_diacritic = diacritic_index(ch).is_some();
+            #[cfg(not(feature = "kitty-graphics"))]
+            let is_kitty_diacritic = false;
             let is_ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch);
             let is_skin_tone = ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch);
             let needs_scalar = ch_width == 0
+                || is_kitty_diacritic
                 || is_ri
                 || is_skin_tone
                 || self.last_written.is_some_and(|lw| lw.ended_with_zwj);
@@ -4285,7 +4568,13 @@ impl VtHandler for TerminalState {
         self.last_graphic = None;
         #[cfg(feature = "sixel")]
         if action == b'q' && intermediates.is_empty() {
-            self.active_sixel = Some(SixelDecoder::new(params));
+            let decoder = if self.modes.sixel_private_color_registers {
+                SixelDecoder::new(params)
+            } else {
+                let palette = std::mem::take(&mut self.sixel_shared_palette);
+                SixelDecoder::with_shared_palette(params, palette)
+            };
+            self.active_sixel = Some(decoder);
             return;
         }
         self.dcs_state.start(params, intermediates, action);
@@ -4314,62 +4603,91 @@ impl VtHandler for TerminalState {
     fn unhook(&mut self) {
         #[cfg(feature = "sixel")]
         if let Some(dec) = self.active_sixel.take() {
-            if let Some((w, h, rgba)) = dec.finish() {
-                let screen = if self.modes.alt_screen {
-                    ScreenKind::Alternate
-                } else {
-                    ScreenKind::Primary
-                };
-                let id = self.image_store.allocate_id();
-                let stored = StoredImage {
-                    id,
-                    width: w,
-                    height: h,
-                    format: crate::features::inline_images::ImageFormat::Rgba8,
-                    rgba,
-                    revision: 0,
-                };
-                if self.image_store.insert_image(stored) {
-                    let (place_row, place_col) = if self.modes.sixel_display_mode {
-                        (0, 0)
-                    } else {
-                        (self.cursor.row, self.cursor.col)
-                    };
-                    let abs_line = self.grid().live_viewport_to_abs(place_row);
-                    let (cw, ch) = self.effective_cell_pixel_size();
-                    let cols = u16::try_from(w.div_ceil(u32::from(cw))).unwrap_or(u16::MAX);
-                    let rows = u16::try_from(h.div_ceil(u32::from(ch))).unwrap_or(u16::MAX);
-                    self.image_store.add_placement(
-                        screen,
-                        ImagePlacement {
-                            image_id: id,
-                            placement_id: 0,
-                            abs_line,
-                            col: u16::try_from(place_col).unwrap_or(u16::MAX),
-                            cols,
-                            rows,
-                            src_x: 0,
-                            src_y: 0,
-                            src_w: 0,
-                            src_h: 0,
-                            z_index: 0,
-                            is_virtual: false,
-                            sub_x: 0,
-                            sub_y: 0,
-                            parent_image_id: 0,
-                            parent_placement_id: 0,
-                            offset_cols: 0,
-                            offset_rows: 0,
-                        },
-                    );
-                    if !self.modes.sixel_display_mode {
-                        for _ in 0..rows {
-                            self.linefeed_internal(false);
-                        }
-                        self.cursor.col = 0;
-                        self.cursor.pending_wrap = false;
+            match dec.finish_sixel_or_palette() {
+                Ok(img) => {
+                    if !self.modes.sixel_private_color_registers {
+                        self.sixel_shared_palette = img.palette;
                     }
-                    self.active_grid_mut().mark_all_dirty();
+                    let screen = if self.modes.alt_screen {
+                        ScreenKind::Alternate
+                    } else {
+                        ScreenKind::Primary
+                    };
+                    let id = self.image_store.allocate_id();
+                    let w = img.width;
+                    let h = img.height;
+                    let pan = u64::from(img.pan.max(1));
+                    let pad = u64::from(img.pad.max(1));
+                    let stored = StoredImage {
+                        id,
+                        width: w,
+                        height: h,
+                        format: crate::features::inline_images::ImageFormat::Rgba8,
+                        rgba: img.rgba,
+                        revision: 0,
+                    };
+                    if self.image_store.insert_image(stored) {
+                        let (place_row, place_col) = if self.modes.sixel_display_mode {
+                            (0, 0)
+                        } else {
+                            (self.cursor.row, self.cursor.col)
+                        };
+                        let abs_line = self.grid().live_viewport_to_abs(place_row);
+                        let (cw, ch) = self.effective_cell_pixel_size();
+                        let cols =
+                            u16::try_from(w.div_ceil(u32::from(cw.max(1)))).unwrap_or(u16::MAX);
+                        let rows = u16::try_from(
+                            (u64::from(h) * pan).div_ceil(pad * u64::from(ch.max(1))),
+                        )
+                        .unwrap_or(u16::MAX);
+                        self.image_store.add_placement(
+                            screen,
+                            ImagePlacement {
+                                image_id: id,
+                                placement_id: 0,
+                                abs_line,
+                                col: u16::try_from(place_col).unwrap_or(u16::MAX),
+                                cols,
+                                rows,
+                                src_x: 0,
+                                src_y: 0,
+                                src_w: 0,
+                                src_h: 0,
+                                z_index: 0,
+                                is_virtual: false,
+                                sub_x: 0,
+                                sub_y: 0,
+                                parent_image_id: 0,
+                                parent_placement_id: 0,
+                                offset_cols: 0,
+                                offset_rows: 0,
+                            },
+                        );
+                        if !self.modes.sixel_display_mode {
+                            if self.modes.sixel_cursor_right {
+                                for _ in 0..rows.saturating_sub(1) {
+                                    self.linefeed_internal(false);
+                                }
+                                let grid_cols = self.active_grid().cols();
+                                self.cursor.col = place_col
+                                    .saturating_add(usize::from(cols))
+                                    .min(grid_cols.saturating_sub(1));
+                                self.cursor.pending_wrap = false;
+                            } else {
+                                for _ in 0..rows {
+                                    self.linefeed_internal(false);
+                                }
+                                self.cursor.col = 0;
+                                self.cursor.pending_wrap = false;
+                            }
+                        }
+                        self.active_grid_mut().mark_all_dirty();
+                    }
+                }
+                Err(palette) => {
+                    if !self.modes.sixel_private_color_registers {
+                        self.sixel_shared_palette = palette;
+                    }
                 }
             }
             return;
@@ -4405,16 +4723,33 @@ impl VtHandler for TerminalState {
             } else {
                 ScreenKind::Primary
             };
-            let cursor_abs_line = self.grid().live_viewport_to_abs(self.cursor.row);
+            let grid = self.grid();
+            let viewport_top_abs_line = grid.live_viewport_to_abs(0);
+            let viewport_rows = u16::try_from(grid.viewport_rows()).unwrap_or(u16::MAX);
+            let cursor_abs_line = grid.live_viewport_to_abs(self.cursor.row);
             let cursor_col = u16::try_from(self.cursor.col).unwrap_or(u16::MAX);
             let cell_px = self.effective_cell_pixel_size();
-            let outcome = handle_kitty_apc(
+            let policy = KittyTransportPolicy {
+                file_policy: self.config.kitty_file_medium_policy,
+                shm_reader: self
+                    .kitty_shm_reader
+                    .0
+                    .as_deref()
+                    .map(|r| r as &dyn KittyShmReader),
+                ..KittyTransportPolicy::default()
+            };
+            let outcome = handle_kitty_apc_with_context(
                 &mut self.image_store,
                 data,
-                screen,
-                cursor_abs_line,
-                cursor_col,
-                cell_px,
+                KittyApcContext {
+                    screen,
+                    viewport_top_abs_line,
+                    viewport_rows,
+                    cursor_abs_line,
+                    cursor_col,
+                    cell_px,
+                    policy,
+                },
                 &mut self.outgoing,
             );
             if outcome.move_cursor {
@@ -4662,43 +4997,39 @@ impl VtHandler for TerminalState {
                     }
                     self.cursor.pending_wrap = false;
                 }
-                b'L' => {
-                    if self.cursor.row >= self.scroll_top
-                        && self.cursor.row <= self.scroll_bottom
-                        && (!self.has_horizontal_margins()
-                            || (self.cursor.col >= self.scroll_left
-                                && self.cursor.col <= self.scroll_right))
-                    {
-                        let n = usize::from(params.get_nonzero_or(0, 1));
-                        let r = self.cursor.row;
-                        let bottom = self.scroll_bottom;
-                        self.scroll_down_in_margins(r, bottom, n);
-                        self.cursor.col = if self.has_horizontal_margins() {
-                            self.scroll_left
-                        } else {
-                            0
-                        };
-                        self.cursor.pending_wrap = false;
-                    }
+                b'L' if self.cursor.row >= self.scroll_top
+                    && self.cursor.row <= self.scroll_bottom
+                    && (!self.has_horizontal_margins()
+                        || (self.cursor.col >= self.scroll_left
+                            && self.cursor.col <= self.scroll_right)) =>
+                {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let r = self.cursor.row;
+                    let bottom = self.scroll_bottom;
+                    self.scroll_down_in_margins(r, bottom, n);
+                    self.cursor.col = if self.has_horizontal_margins() {
+                        self.scroll_left
+                    } else {
+                        0
+                    };
+                    self.cursor.pending_wrap = false;
                 }
-                b'M' => {
-                    if self.cursor.row >= self.scroll_top
-                        && self.cursor.row <= self.scroll_bottom
-                        && (!self.has_horizontal_margins()
-                            || (self.cursor.col >= self.scroll_left
-                                && self.cursor.col <= self.scroll_right))
-                    {
-                        let n = usize::from(params.get_nonzero_or(0, 1));
-                        let r = self.cursor.row;
-                        let bottom = self.scroll_bottom;
-                        self.scroll_up_in_margins(r, bottom, n, false);
-                        self.cursor.col = if self.has_horizontal_margins() {
-                            self.scroll_left
-                        } else {
-                            0
-                        };
-                        self.cursor.pending_wrap = false;
-                    }
+                b'M' if self.cursor.row >= self.scroll_top
+                    && self.cursor.row <= self.scroll_bottom
+                    && (!self.has_horizontal_margins()
+                        || (self.cursor.col >= self.scroll_left
+                            && self.cursor.col <= self.scroll_right)) =>
+                {
+                    let n = usize::from(params.get_nonzero_or(0, 1));
+                    let r = self.cursor.row;
+                    let bottom = self.scroll_bottom;
+                    self.scroll_up_in_margins(r, bottom, n, false);
+                    self.cursor.col = if self.has_horizontal_margins() {
+                        self.scroll_left
+                    } else {
+                        0
+                    };
+                    self.cursor.pending_wrap = false;
                 }
                 b'K' => {
                     let mode = params.get_or(0, 0);
@@ -4719,14 +5050,7 @@ impl VtHandler for TerminalState {
                     self.active_grid_mut().erase_in_display(r, c, mode, bg);
                     #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
                     match mode {
-                        2 => {
-                            let screen = if self.modes.alt_screen {
-                                ScreenKind::Alternate
-                            } else {
-                                ScreenKind::Primary
-                            };
-                            self.image_store.clear_screen(screen);
-                        }
+                        2 => self.clear_active_viewport_placements(),
                         3 if !self.modes.alt_screen => {
                             let top = self.primary.live_viewport_to_abs(0);
                             self.image_store.prune_before(ScreenKind::Primary, top);
@@ -4735,39 +5059,9 @@ impl VtHandler for TerminalState {
                     }
                     if !self.modes.alt_screen {
                         match mode {
-                            0 =>
-                            {
-                                #[cfg(feature = "shell-integration")]
-                                if rows > 0 {
-                                    self.shell_integration.on_primary_rows_mutated(
-                                        &self.primary,
-                                        r,
-                                        rows - 1,
-                                    );
-                                }
-                            }
-                            1 =>
-                            {
-                                #[cfg(feature = "shell-integration")]
-                                if rows > 0 {
-                                    self.shell_integration.on_primary_rows_mutated(
-                                        &self.primary,
-                                        0,
-                                        r.min(rows - 1),
-                                    );
-                                }
-                            }
-                            2 =>
-                            {
-                                #[cfg(feature = "shell-integration")]
-                                if rows > 0 {
-                                    self.shell_integration.on_primary_rows_mutated(
-                                        &self.primary,
-                                        0,
-                                        rows - 1,
-                                    );
-                                }
-                            }
+                            0 if rows > 0 => self.notify_shell_rows_mutated(r, rows - 1),
+                            1 if rows > 0 => self.notify_shell_rows_mutated(0, r.min(rows - 1)),
+                            2 if rows > 0 => self.notify_shell_rows_mutated(0, rows - 1),
                             3 => {
                                 self.selection = None;
                                 #[cfg(feature = "shell-integration")]
@@ -4905,10 +5199,8 @@ impl VtHandler for TerminalState {
                 }
                 b't' => self.handle_xtwinops(params, cols, rows),
                 b'u' => self.restore_cursor(),
-                b'c' => {
-                    if params.get_or(0, 0) == 0 {
-                        self.outgoing.extend_from_slice(b"\x1b[?62;4;22c");
-                    }
+                b'c' if params.get_or(0, 0) == 0 => {
+                    self.outgoing.extend_from_slice(b"\x1b[?62;4;22c");
                 }
                 b'n' => match params.get_or(0, 0) {
                     5 => self.outgoing.extend_from_slice(b"\x1b[0n"),
@@ -5775,6 +6067,39 @@ impl Terminal {
     #[must_use]
     pub fn image_data(&self, id: u32) -> Option<&StoredImage> {
         self.state.image_data(id)
+    }
+
+    /// Configures the Kitty file-medium (`t=f`/`t=t`) access policy at runtime.
+    #[cfg(feature = "kitty-graphics")]
+    pub fn set_kitty_file_medium_policy(&mut self, policy: KittyFileMediumPolicy) {
+        self.state.set_kitty_file_medium_policy(policy);
+    }
+
+    /// Returns the active Kitty file-medium (`t=f`/`t=t`) access policy.
+    #[cfg(feature = "kitty-graphics")]
+    #[must_use]
+    pub const fn kitty_file_medium_policy(&self) -> KittyFileMediumPolicy {
+        self.state.kitty_file_medium_policy()
+    }
+
+    /// Installs or clears a custom [`KittyShmReader`] for `t=s` shared-memory image transfers.
+    #[cfg(feature = "kitty-graphics")]
+    pub fn set_kitty_shm_reader(&mut self, reader: Option<Box<dyn KittyShmReader + Send + Sync>>) {
+        self.state.set_kitty_shm_reader(reader);
+    }
+
+    /// Advances all playing Kitty graphics animations to `now_secs`, marking dirty rows if any
+    /// displayed animation frame changed.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    pub fn tick_animations(&mut self, now_secs: f64) -> bool {
+        self.state.tick_animations(now_secs)
+    }
+
+    /// Returns the earliest timestamp (`now_secs`) when any active animation needs its next frame.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn next_animation_deadline(&self) -> Option<f64> {
+        self.state.next_animation_deadline()
     }
 
     /// Encodes a [`MouseInputEvent`] according to the active mouse tracking protocol/encoding.

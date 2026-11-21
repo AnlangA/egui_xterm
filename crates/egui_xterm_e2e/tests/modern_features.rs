@@ -98,7 +98,14 @@ mod kitty_graphics_e2e {
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(kind);
             out.extend_from_slice(data);
-            out.extend_from_slice(&0u32.to_be_bytes());
+            let mut crc = !0u32;
+            for &b in kind.iter().chain(data.iter()) {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            out.extend_from_slice(&(!crc).to_be_bytes());
         }
 
         let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -234,7 +241,7 @@ fn sixel_raster_colors_repeat_and_decsdm_e2e() {
         .expect("sixel image stored");
     assert_eq!((img.width, img.height), (4, 12));
     assert_eq!(&img.rgba[0..4], &[255, 0, 0, 255]);
-    assert_eq!(&img.rgba[12..16], &[0, 0, 0, 0]);
+    assert_eq!(&img.rgba[12..16], &[0, 0, 0, 255]);
     let row6 = 6 * 4 * 4;
     assert_eq!(&img.rgba[row6..row6 + 4], &[0, 255, 0, 255]);
 

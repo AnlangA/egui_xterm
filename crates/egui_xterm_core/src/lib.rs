@@ -26,6 +26,11 @@ pub use crate::features::hyperlinks::{HyperlinkInfo, HyperlinkSpan};
 pub use crate::features::inline_images::{
     DEFAULT_IMAGE_MEMORY_BUDGET, ImageFormat, ImagePlacement, ImageStore, StoredImage,
 };
+#[cfg(feature = "kitty-graphics")]
+pub use crate::features::inline_images::{
+    KITTY_DIACRITICS, KITTY_PLACEHOLDER_CHAR, KittyFileMediumPolicy, KittyPlaceholderCell,
+    KittyShmReader, KittyTransportPolicy, decode_placeholder_cell, diacritic_index,
+};
 #[cfg(feature = "kitty-keyboard")]
 pub use crate::features::kitty_keyboard::{
     KITTY_STACK_CAP, KittyEventType, KittyKey, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers,

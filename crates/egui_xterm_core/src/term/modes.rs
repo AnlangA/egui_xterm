@@ -1,5 +1,10 @@
 //! Terminal ANSI/DEC modes, cursor style, and mouse protocol/encoding state.
 
+#[cfg(feature = "serde")]
+const fn default_true() -> bool {
+    true
+}
+
 /// Visual cursor geometry configured by `DECSCUSR` or [`CoreConfig`](super::CoreConfig).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -92,6 +97,12 @@ pub struct Modes {
     pub cursor_visible: bool,
     /// DEC `DECSDM` (`CSI ? 80 h/l`): sixel display mode (disables sixel scrolling when set).
     pub sixel_display_mode: bool,
+    /// DEC `?1070`: private color registers per Sixel image (default: `true`).
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+    pub sixel_private_color_registers: bool,
+    /// DEC `?8452`: position cursor to the right of the last Sixel row instead of next line.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sixel_cursor_right: bool,
     /// Active alternate screen buffer (`?47`, `?1047`, `?1049`).
     pub alt_screen: bool,
     /// Active mouse reporting protocol (`?9`, `?1000`, `?1002`, `?1003`).
@@ -140,6 +151,8 @@ impl Modes {
             cursor_blink: default_blink,
             cursor_visible: true,
             sixel_display_mode: false,
+            sixel_private_color_registers: true,
+            sixel_cursor_right: false,
             alt_screen: false,
             mouse_protocol: MouseProtocol::None,
             mouse_encoding: MouseEncoding::Default,
@@ -165,6 +178,9 @@ impl Modes {
         self.auto_wrap = true;
         self.cursor_blink = default_blink;
         self.cursor_visible = true;
+        self.sixel_display_mode = false;
+        self.sixel_private_color_registers = true;
+        self.sixel_cursor_right = false;
         self.sync_output = false;
         self.left_right_margin_mode = false;
         self.grapheme_clustering = true;
@@ -197,10 +213,12 @@ impl Modes {
             1007 => self.alt_scroll,
             1016 => matches!(self.mouse_encoding, MouseEncoding::SgrPixels),
             1048 => return 2,
+            1070 => self.sixel_private_color_registers,
             2004 => self.bracketed_paste,
             2026 => self.sync_output,
             2027 => self.grapheme_clustering,
             2031 => self.color_scheme_updates,
+            8452 => self.sixel_cursor_right,
             _ => return 0,
         };
         if is_set { 1 } else { 2 }

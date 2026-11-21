@@ -31,9 +31,15 @@ impl TabStops {
         let new_cols = new_cols.max(1);
         let old_cols = self.stops.len();
         self.stops.resize(new_cols, false);
-        for c in old_cols..new_cols {
+        for (c, slot) in self
+            .stops
+            .iter_mut()
+            .enumerate()
+            .take(new_cols)
+            .skip(old_cols)
+        {
             if c > 0 && c % 8 == 0 {
-                self.stops[c] = true;
+                *slot = true;
             }
         }
     }

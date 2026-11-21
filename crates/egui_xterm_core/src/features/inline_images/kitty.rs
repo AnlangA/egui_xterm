@@ -1474,33 +1474,6 @@ fn blit_rect(dst: &mut [u8], dst_canvas_w: u32, src: &[u8], src_canvas_w: u32, r
     }
 }
 
-/// Processes a Kitty Graphics Protocol `APC` payload (`G...`) using default transport policy and
-/// `viewport_top_abs_line = AbsLine(0)`.
-pub(crate) fn handle_kitty_apc(
-    store: &mut ImageStore,
-    data: &[u8],
-    screen: ScreenKind,
-    cursor_abs_line: AbsLine,
-    cursor_col: u16,
-    cell_px: (u16, u16),
-    outgoing: &mut Vec<u8>,
-) -> KittyOutcome {
-    handle_kitty_apc_with_context(
-        store,
-        data,
-        KittyApcContext {
-            screen,
-            viewport_top_abs_line: AbsLine(0),
-            viewport_rows: 0,
-            cursor_abs_line,
-            cursor_col,
-            cell_px,
-            policy: KittyTransportPolicy::default(),
-        },
-        outgoing,
-    )
-}
-
 /// Processes a Kitty Graphics Protocol `APC` payload (`G...`) with explicit viewport and
 /// transport policy context.
 pub fn handle_kitty_apc_with_context(
