@@ -22,6 +22,40 @@ const MAX_KITTY_PENDING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_KITTY_PENDING_TRANSFERS: usize = 16;
 
 /// Private-use Unicode scalar value used as the base cell for Kitty Unicode placeholders.
+///
+/// # Examples
+///
+/// Create a Kitty virtual placement (`U=1`) and decode a placeholder cell written
+/// with `U+10EEEE` and [`KITTY_DIACRITICS`]:
+///
+/// ```
+/// use egui_xterm_core::{
+///     CoreConfig, KITTY_DIACRITICS, KITTY_PLACEHOLDER_CHAR, Terminal, decode_placeholder_cell,
+/// };
+///
+/// let mut term = Terminal::new(20, 4, CoreConfig::default());
+/// term.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=42,p=7,U=1,c=2,r=1,q=2;/wAA/w==\x1b\\");
+///
+/// let seq = format!(
+///     "\x1b[38;5;42m\x1b[58;5;7m{KITTY_PLACEHOLDER_CHAR}{}{}",
+///     KITTY_DIACRITICS[0], KITTY_DIACRITICS[1]
+/// );
+/// term.advance(seq.as_bytes());
+///
+/// let snap = term.active_snapshot();
+/// let vp = snap
+///     .virtual_placement(42, 7)
+///     .ok_or("expected virtual placement")?;
+/// assert_eq!((vp.cols, vp.rows), (2, 1));
+///
+/// let row = snap.visible_rows.get(0).ok_or("expected row 0")?;
+/// let cell = row.cells().first().ok_or("expected col 0")?;
+/// let decoded = decode_placeholder_cell(cell, snap.cell_extra(cell.extra_id))
+///     .ok_or("expected decoded Kitty placeholder cell")?;
+/// assert_eq!((decoded.image_id, decoded.placement_id), (42, 7));
+/// assert_eq!((decoded.row, decoded.col), (Some(0), Some(1)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub const KITTY_PLACEHOLDER_CHAR: char = '\u{10EEEE}';
 
 /// Canonical ordered table of 297 combining diacritics used by Kitty Unicode placeholders to
@@ -407,6 +441,40 @@ const fn color_to_id24(color: PackedColor) -> Option<u32> {
 ///
 /// Returns `None` if `cell.codepoint != KITTY_PLACEHOLDER_CHAR` or `cell.fg` is
 /// [`PackedColor::Default`].
+///
+/// # Examples
+///
+/// ```
+/// use egui_xterm_core::{
+///     Cell, CellExtra, CellFlags, KITTY_DIACRITICS, KITTY_PLACEHOLDER_CHAR, PackedColor,
+///     decode_placeholder_cell,
+/// };
+///
+/// let mut first_extra = CellExtra::default();
+/// first_extra.underline_color = Some(PackedColor::indexed(3));
+/// first_extra.push_combining(KITTY_DIACRITICS[0]); // row 0
+/// first_extra.push_combining(KITTY_DIACRITICS[0]); // col 0
+///
+/// let first_cell = Cell::new(
+///     KITTY_PLACEHOLDER_CHAR,
+///     PackedColor::rgb(0, 0, 42),
+///     PackedColor::Default,
+///     CellFlags::empty(),
+/// );
+/// let first = decode_placeholder_cell(&first_cell, Some(&first_extra))
+///     .ok_or("expected valid first placeholder")?;
+/// assert_eq!((first.image_id, first.placement_id), (42, 3));
+/// assert_eq!((first.row, first.col), (Some(0), Some(0)));
+///
+/// // A trailing cell on the same row can omit diacritics and inherit `(row, col + 1)`.
+/// let mut trailing_extra = CellExtra::default();
+/// trailing_extra.underline_color = Some(PackedColor::indexed(3));
+/// let trailing = decode_placeholder_cell(&first_cell, Some(&trailing_extra))
+///     .ok_or("expected valid trailing placeholder")?
+///     .resolve_with_left(Some(first));
+/// assert_eq!((trailing.row, trailing.col), (Some(0), Some(1)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[must_use]
 pub fn decode_placeholder_cell(
     cell: &Cell,
@@ -443,6 +511,35 @@ pub fn decode_placeholder_cell(
 }
 
 /// Policy governing local filesystem and shared-memory Kitty Graphics mediums (`t=f`, `t=t`, `t=s`).
+///
+/// # Examples
+///
+/// Restrict or disable filesystem/temp-file Kitty uploads at construction or runtime:
+///
+/// ```
+/// use egui_xterm_core::{CoreConfig, KittyFileMediumPolicy, Terminal};
+///
+/// let cfg = CoreConfig {
+///     kitty_file_medium_policy: KittyFileMediumPolicy::Disabled,
+///     ..CoreConfig::default()
+/// };
+/// let mut term = Terminal::new(40, 4, cfg);
+/// assert_eq!(term.kitty_file_medium_policy(), KittyFileMediumPolicy::Disabled);
+///
+/// // Direct file (`t=f`) uploads are rejected with EBADF under Disabled.
+/// term.advance(b"\x1b_Ga=t,t=f,i=1,s=1,v=1,f=32;L3RtcC9pbWcucmdi\x1b\\");
+/// let reply = String::from_utf8(term.drain_outgoing())?;
+/// assert!(reply.starts_with("\x1b_Gi=1;EBADF:"));
+/// assert!(term.image_data(1).is_none());
+///
+/// // TempOnly still rejects temp-file (`t=t`) paths outside `"tty-graphics-protocol"`.
+/// term.set_kitty_file_medium_policy(KittyFileMediumPolicy::TempOnly);
+/// assert_eq!(term.kitty_file_medium_policy(), KittyFileMediumPolicy::TempOnly);
+/// term.advance(b"\x1b_Ga=t,t=t,i=2,s=1,v=1,f=32;L3RtcC9pbWcucmdi\x1b\\");
+/// let reply2 = String::from_utf8(term.drain_outgoing())?;
+/// assert!(reply2.starts_with("\x1b_Gi=2;EBADF:"));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum KittyFileMediumPolicy {

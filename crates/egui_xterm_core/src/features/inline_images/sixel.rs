@@ -34,6 +34,48 @@ pub struct SixelImage {
 }
 
 /// Streaming Sixel graphics decoder driven by `DCS ... q` `hook`/`put`/`unhook`.
+///
+/// # Examples
+///
+/// Decode a Sixel `DCS` payload and persist color registers across images (`DEC ?1070l`):
+///
+/// ```
+/// use egui_xterm_core::CsiParams;
+/// use egui_xterm_core::features::inline_images::sixel::SixelDecoder;
+///
+/// let params = CsiParams::new();
+/// let mut decoder = SixelDecoder::new(&params);
+/// for &byte in b"\"1;1;2;6#1;2;100;0;0#1!2~" {
+///     decoder.put(byte);
+/// }
+///
+/// let image = decoder
+///     .finish_sixel()
+///     .ok_or("expected non-empty Sixel image")?;
+/// assert_eq!((image.width, image.height), (2, 6));
+/// assert_eq!((image.pan, image.pad), (1, 1));
+/// assert_eq!(&image.rgba[..4], &[255, 0, 0, 255]);
+///
+/// // A palette-only DCS stream updates color registers and returns `Err(palette)`.
+/// let mut palette_only = SixelDecoder::with_shared_palette(&params, image.palette);
+/// for &byte in b"#7;2;0;100;0" {
+///     palette_only.put(byte);
+/// }
+/// let shared_palette = palette_only
+///     .finish_sixel_or_palette()
+///     .err()
+///     .ok_or("palette-only stream emits no image")?;
+///
+/// let mut next = SixelDecoder::with_shared_palette(&params, shared_palette);
+/// for &byte in b"#7@" {
+///     next.put(byte);
+/// }
+/// let reused = next
+///     .finish_sixel()
+///     .ok_or("expected Sixel image using shared register 7")?;
+/// assert_eq!(reused.rgba, vec![0, 255, 0, 255]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug)]
 pub struct SixelDecoder {
     state: SixelState,

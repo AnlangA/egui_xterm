@@ -45,7 +45,8 @@ const CRC32_TABLE: [u32; 256] = {
 };
 
 /// Decoded RGBA8 image produced by [`decode_png`].
-pub(crate) struct DecodedPng {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPng {
     /// Image width in pixels.
     pub width: u32,
     /// Image height in pixels.
@@ -56,7 +57,7 @@ pub(crate) struct DecodedPng {
 
 /// Errors returned by [`decode_png`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PngError {
+pub enum PngError {
     /// Input does not begin with the 8-byte PNG signature.
     InvalidSignature,
     /// Input ended before completing a chunk or before `IEND`.
@@ -90,6 +91,32 @@ pub(crate) enum PngError {
     /// Image dimensions or decoded RGBA buffer exceeded configured limits.
     DimensionLimitExceeded,
 }
+
+impl std::fmt::Display for PngError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            Self::InvalidSignature => "invalid PNG signature",
+            Self::UnexpectedEof => "unexpected end of PNG input",
+            Self::InvalidCrc => "invalid PNG chunk CRC-32",
+            Self::InvalidChunk => "malformed PNG chunk framing",
+            Self::InvalidChunkOrder => "invalid PNG chunk ordering",
+            Self::UnsupportedCriticalChunk => "unsupported critical PNG chunk",
+            Self::MissingIhdr => "missing PNG IHDR chunk",
+            Self::InvalidIhdr => "invalid PNG IHDR chunk",
+            Self::UnsupportedFormat => "unsupported PNG format",
+            Self::InvalidPalette => "invalid PNG palette",
+            Self::InvalidTransparency => "invalid PNG transparency chunk",
+            Self::MissingIdat => "missing PNG IDAT chunk",
+            Self::IdatLimitExceeded => "PNG IDAT payload exceeds size limit",
+            Self::DecompressFailed => "PNG zlib decompression failed",
+            Self::InvalidFilter => "invalid PNG scanline filter",
+            Self::DimensionLimitExceeded => "PNG dimensions exceed configured budget",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for PngError {}
 
 impl From<InflateError> for PngError {
     fn from(_: InflateError) -> Self {
@@ -661,7 +688,53 @@ fn decode_scanline_into_rgba(
 
 /// Decodes a PNG byte slice (non-interlaced or Adam7 interlaced) into `Rgba8` pixels,
 /// validating chunk CRCs, chunk ordering, and enforcing `max_rgba_bytes`.
-pub(crate) fn decode_png(input: &[u8], max_rgba_bytes: usize) -> Result<DecodedPng, PngError> {
+///
+/// # Errors
+///
+/// Returns a [`PngError`] when the signature, chunk framing, IEEE 802.3 CRC-32, chunk
+/// ordering, zlib stream, scanline filter, or `max_rgba_bytes` budget check fails.
+///
+/// # Examples
+///
+/// Decode a valid `1x1` RGBA8 PNG and reject corrupted CRCs, truncated streams,
+/// invalid signatures, and oversized pixel budgets:
+///
+/// ```
+/// use egui_xterm_core::features::inline_images::png::{PngError, decode_png};
+///
+/// // Minimal valid 1x1 RGBA8 PNG with pixel [10, 20, 30, 255].
+/// let valid_png: [u8; 70] = [
+///     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+///     0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+///     0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+///     0x9C, 0x63, 0xE0, 0x12, 0x91, 0xFB, 0x0F, 0x00, 0x01, 0xA4, 0x01, 0x3C, 0x93, 0x8B,
+///     0x0E, 0xB7, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+/// ];
+///
+/// let decoded = decode_png(&valid_png, 1024)?;
+/// assert_eq!((decoded.width, decoded.height), (1, 1));
+/// assert_eq!(decoded.rgba, [10, 20, 30, 255]);
+///
+/// // Corrupting a byte inside IHDR's IEEE 802.3 CRC-32 fails with InvalidCrc.
+/// let mut bad_crc = valid_png;
+/// bad_crc[29] ^= 0x01;
+/// assert_eq!(decode_png(&bad_crc, 1024), Err(PngError::InvalidCrc));
+///
+/// // Truncating before IEND completes fails with UnexpectedEof.
+/// assert_eq!(
+///     decode_png(&valid_png[..valid_png.len() - 4], 1024),
+///     Err(PngError::UnexpectedEof)
+/// );
+///
+/// // Enforcing max_rgba_bytes rejects images whose RGBA8 buffer exceeds the cap.
+/// assert_eq!(
+///     decode_png(&valid_png, 3),
+///     Err(PngError::DimensionLimitExceeded)
+/// );
+/// assert_eq!(decode_png(b"not a png", 1024), Err(PngError::InvalidSignature));
+/// # Ok::<(), PngError>(())
+/// ```
+pub fn decode_png(input: &[u8], max_rgba_bytes: usize) -> Result<DecodedPng, PngError> {
     let ParsedChunks {
         ihdr,
         palette,

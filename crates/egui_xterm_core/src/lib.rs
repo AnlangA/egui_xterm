@@ -2,8 +2,76 @@
 //!
 //! `egui_xterm_core` provides the [`TerminalInput`] stream abstraction, compact
 //! [`Cell`] and [`PackedColor`] data model, clean-room VT500 / ANSI [`Parser`],
-//! scrollback ring buffer [`Grid`] with lossless resize reflow, and the full
-//! [`Terminal`] state machine.
+//! scrollback ring buffer [`Grid`] with lossless resize reflow, split
+//! [`TerminalState`] + [`RenderSnapshot`] view, and the full [`Terminal`]
+//! state machine.
+//!
+//! # Examples
+//!
+//! Drive a split [`Parser`] and [`TerminalState`] directly and inspect the
+//! zero-allocation [`RenderSnapshot`]:
+//!
+//! ```
+//! use egui_xterm_core::{CoreConfig, Parser, TerminalEvent, TerminalState};
+//!
+//! let mut parser = Parser::new();
+//! let mut state = TerminalState::new(40, 4, CoreConfig::default());
+//!
+//! // Combine SGR styling with OSC 5 (special colors), OSC 6 (document URI),
+//! // OSC 9;4 (progress), and OSC 22 (pointer cursor shape).
+//! let stream = b"\x1b]5;0;rgb:ff/80/00\x07\
+//!                \x1b]6;file:///workspace/lib.rs\x07\
+//!                \x1b]9;4;1;60\x07\
+//!                \x1b]22;pointer\x07\
+//!                \x1b[1;32mready\x1b[0m\r\n";
+//! parser.advance(stream, &mut state);
+//! state.post_advance();
+//!
+//! let snap = state.active_snapshot();
+//! assert_eq!((snap.cols, snap.rows), (40, 4));
+//! assert_eq!(snap.visible_rows.len(), 4);
+//! assert_eq!(snap.line_text(0).as_deref(), Some("ready"));
+//! assert_eq!((snap.cursor.col, snap.cursor.row), (0, 1));
+//! assert_eq!(snap.special_colors[0], Some([0xFF, 0x80, 0x00]));
+//! assert!(snap.palette_epoch >= 1);
+//! assert_eq!(state.document_uri(), Some("file:///workspace/lib.rs"));
+//!
+//! let events = state.drain_events();
+//! assert!(events.contains(&TerminalEvent::Progress {
+//!     state: 1,
+//!     progress: 60,
+//! }));
+//! assert!(events.contains(&TerminalEvent::MouseShape("pointer".to_owned())));
+//! ```
+//!
+//! Use [`Terminal`] with DEC Mode 2026 synchronized output latching and
+//! [`Osc52ReadPolicy`]:
+//!
+//! ```
+//! use egui_xterm_core::{
+//!     ClipboardSelection, CoreConfig, Osc52ReadPolicy, Terminal, TerminalEvent,
+//! };
+//!
+//! let cfg = CoreConfig {
+//!     osc52_read_policy: Osc52ReadPolicy::Prompt,
+//!     ..CoreConfig::default()
+//! };
+//! let mut term = Terminal::new(40, 4, cfg);
+//! term.advance_with_time(b"frame-0", 1.0);
+//!
+//! // While DEC ?2026h is latched, active_snapshot() stays frozen on "frame-0".
+//! term.advance_with_time(b"\x1b[?2026h\r\x1b[2Kframe-1", 1.05);
+//! assert!(term.is_synchronized_output());
+//! assert_eq!(term.active_snapshot().line_text(0).as_deref(), Some("frame-0"));
+//!
+//! // Releasing DEC ?2026l exposes "frame-1" and processes queued events.
+//! term.advance_with_time(b"\x1b[?2026l\x1b]52;c;?\x07", 1.10);
+//! assert!(!term.is_synchronized_output());
+//! assert_eq!(term.active_snapshot().line_text(0).as_deref(), Some("frame-1"));
+//! assert!(term.drain_events().contains(&TerminalEvent::ClipboardReadPrompt {
+//!     selection: ClipboardSelection::Clipboard,
+//! }));
+//! ```
 
 #![forbid(unsafe_code)]
 
