@@ -6,35 +6,6 @@ use egui_xterm_core::{HyperlinkSpan, Terminal};
 use crate::layout::{FrameLayout, snap_px, snap_rect, snap_size_at_least_1px};
 
 /// Evaluates pointer hover over `OSC 8` and implicit hyperlinks strictly inside the cell grid,
-/// returning visible spans to underline when hovered.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "hyperlink interaction parameters"
-)]
-pub(crate) fn update_hyperlink_interaction(
-    ui: &Ui,
-    terminal: &mut Terminal,
-    pointer_pos: Option<Pos2>,
-    layout: &FrameLayout,
-    allow_click_activation: bool,
-    clicked_primary: bool,
-    require_ctrl: bool,
-    ctrl_or_cmd_held: bool,
-) -> Vec<HyperlinkSpan> {
-    update_hyperlink_interaction_with_cursor(
-        ui,
-        terminal,
-        pointer_pos,
-        layout,
-        allow_click_activation,
-        clicked_primary,
-        require_ctrl,
-        ctrl_or_cmd_held,
-    )
-    .0
-}
-
-/// Evaluates pointer hover over `OSC 8` and implicit hyperlinks strictly inside the cell grid,
 /// returning visible spans and whether the cursor icon was overridden to `PointingHand`.
 #[expect(
     clippy::too_many_arguments,

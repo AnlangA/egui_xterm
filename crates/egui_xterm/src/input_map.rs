@@ -66,29 +66,17 @@ struct InputFrameFlags {
 
 impl InputMapperState {
     /// Explicitly updates tracked `CapsLock` and `NumLock` states (e.g. from host OS state).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "forwarded by TerminalRuntime::set_lock_modifiers")
-    )]
     pub(crate) const fn set_lock_modifiers(&mut self, caps_lock: bool, num_lock: bool) {
         self.caps_lock = caps_lock;
         self.num_lock = num_lock;
     }
 
     /// Returns the currently tracked `CapsLock` state.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "forwarded by TerminalRuntime::caps_lock")
-    )]
     pub(crate) const fn caps_lock(&self) -> bool {
         self.caps_lock
     }
 
     /// Returns the currently tracked `NumLock` state.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "forwarded by TerminalRuntime::num_lock")
-    )]
     pub(crate) const fn num_lock(&self) -> bool {
         self.num_lock
     }

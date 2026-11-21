@@ -82,6 +82,19 @@ pub(crate) fn sanitize_ppp(pixels_per_point: f32) -> f32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellMeasureKey {
+    font_size_bits: u32,
+    ppp_bits: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CellMeasureCache {
+    key: CellMeasureKey,
+    raw_w: f32,
+    cell_size: Vec2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AutoScaleCacheKey {
     inner_w_bits: u32,
     inner_h_bits: u32,
@@ -103,6 +116,7 @@ struct AutoScaleCache {
 pub(crate) struct TerminalLayoutState {
     last_sent_size: Option<TerminalSize>,
     pending_resize: Option<(TerminalSize, f64)>,
+    cell_measure_cache: Option<CellMeasureCache>,
     auto_scale_cache: Option<AutoScaleCache>,
 }
 
@@ -142,6 +156,30 @@ fn measure_cell(ctx: &egui::Context, font_size: f32, ppp: f32) -> (f32, Vec2) {
 }
 
 impl TerminalLayoutState {
+    fn measure_cell_cached(
+        &mut self,
+        ctx: &egui::Context,
+        font_size: f32,
+        ppp: f32,
+    ) -> (f32, Vec2) {
+        let key = CellMeasureKey {
+            font_size_bits: font_size.to_bits(),
+            ppp_bits: ppp.to_bits(),
+        };
+        if let Some(cached) = self.cell_measure_cache
+            && cached.key == key
+        {
+            return (cached.raw_w, cached.cell_size);
+        }
+        let (raw_w, cell_size) = measure_cell(ctx, font_size, ppp);
+        self.cell_measure_cache = Some(CellMeasureCache {
+            key,
+            raw_w,
+            cell_size,
+        });
+        (raw_w, cell_size)
+    }
+
     /// Computes grid dimensions, allocates space using stable `id_salt`, updates `terminal.resize`,
     /// and debounces `input.resize`.
     #[expect(clippy::too_many_arguments, reason = "per-frame layout coordinator")]
@@ -190,21 +228,35 @@ impl TerminalLayoutState {
         );
 
         let base_effective = (base_font * zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
-        let (base_raw_w, base_cell) = measure_cell(ui.ctx(), base_effective, ppp);
+        let finite_bounds = avail.min.x.is_finite()
+            && avail.max.x.is_finite()
+            && avail.min.y.is_finite()
+            && avail.max.y.is_finite();
 
-        let avail_w = if avail.min.x.is_finite() && avail.max.x.is_finite() {
-            (floor_px(avail.max.x, ppp) - origin.x).max(0.0)
+        let (avail_w, avail_h) = if finite_bounds {
+            (
+                (floor_px(avail.max.x, ppp) - origin.x).max(0.0),
+                (floor_px(avail.max.y, ppp) - origin.y).max(0.0),
+            )
         } else {
-            FALLBACK_COLS * base_cell.x
-        };
-        let avail_h = if avail.min.y.is_finite() && avail.max.y.is_finite() {
-            (floor_px(avail.max.y, ppp) - origin.y).max(0.0)
-        } else {
-            FALLBACK_ROWS * base_cell.y
+            let (_, fallback_cell) = self.measure_cell_cached(ui.ctx(), base_effective, ppp);
+            let w = if avail.min.x.is_finite() && avail.max.x.is_finite() {
+                (floor_px(avail.max.x, ppp) - origin.x).max(0.0)
+            } else {
+                FALLBACK_COLS * fallback_cell.x
+            };
+            let h = if avail.min.y.is_finite() && avail.max.y.is_finite() {
+                (floor_px(avail.max.y, ppp) - origin.y).max(0.0)
+            } else {
+                FALLBACK_ROWS * fallback_cell.y
+            };
+            (w, h)
         };
 
         let (cols, rows, effective_font_size, raw_cell_w, cell_size) = match config.scale_mode {
             ScaleMode::ReflowGrid => {
+                let (base_raw_w, base_cell) =
+                    self.measure_cell_cached(ui.ctx(), base_effective, ppp);
                 let cols_f = (avail_w / base_cell.x).floor();
                 let rows_f = (avail_h / base_cell.y).floor();
                 let cols = if cols_f.is_finite() && cols_f >= 1.0 {
@@ -376,8 +428,10 @@ impl TerminalLayoutState {
         };
         let mut response = ui.interact(interact_rect, id, sense);
         response.set_intrinsic_size(grid_size);
-        let title = terminal.title().to_owned();
-        response.widget_info(move || WidgetInfo::labeled(Role::Terminal, true, &title));
+        {
+            let title = terminal.title();
+            response.widget_info(|| WidgetInfo::labeled(Role::Terminal, true, title));
+        }
 
         let prev_size = terminal.size();
         let resized_this_frame = prev_size != (cols, rows);
@@ -393,6 +447,11 @@ impl TerminalLayoutState {
             .clamp(0.0, f32::from(u16::MAX)) as u16;
         if terminal.pixel_size() != (pixel_width, pixel_height) {
             terminal.set_pixel_size(pixel_width, pixel_height);
+        }
+        let cell_px_w = (cell_size.x * ppp).round().clamp(1.0, f32::from(u16::MAX)) as u16;
+        let cell_px_h = (cell_size.y * ppp).round().clamp(1.0, f32::from(u16::MAX)) as u16;
+        if terminal.cell_pixel_size() != (cell_px_w, cell_px_h) {
+            terminal.set_cell_pixel_size(cell_px_w, cell_px_h);
         }
         let term_size = TerminalSize::with_pixels(cols, rows, pixel_width, pixel_height);
 
@@ -547,5 +606,115 @@ mod tests {
             let s = snap_size_at_least_1px(0.0, ppp);
             assert!(s.is_finite() && s > 0.0);
         }
+    }
+
+    #[test]
+    fn layout_caches_measure_cell_borrows_title_and_wires_cell_pixel_size() {
+        use egui::{CentralPanel, Context, Frame, RawInput, ViewportId};
+        use egui_xterm_core::{CoreConfig, RingBufferInput};
+
+        let ctx = Context::default();
+        ctx.enable_accesskit();
+        let mut layout_state = TerminalLayoutState::default();
+        let mut terminal = Terminal::new(80, 24, CoreConfig::default());
+        terminal.advance(b"\x1b]0;LayoutTitle\x07");
+        let mut input = RingBufferInput::new();
+        let mut pending_focus = false;
+        let mut cfg = TerminalConfig::default();
+
+        let run_pass = |layout_state: &mut TerminalLayoutState,
+                        terminal: &mut Terminal,
+                        input: &mut RingBufferInput,
+                        pending_focus: &mut bool,
+                        cfg: &TerminalConfig,
+                        time: f64,
+                        ppp: f32| {
+            let mut raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 400.0))),
+                time: Some(time),
+                ..Default::default()
+            };
+            raw.viewports
+                .entry(ViewportId::ROOT)
+                .or_default()
+                .native_pixels_per_point = Some(ppp);
+            let mut measured = Vec2::ZERO;
+            let out = ctx.run_ui(raw, |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    let frame_layout = layout_state.layout_and_resize(
+                        ui,
+                        1,
+                        cfg,
+                        terminal,
+                        input,
+                        time,
+                        pending_focus,
+                        false,
+                        None,
+                    );
+                    measured = frame_layout.cell_size;
+                });
+            });
+            let ak_has_title = out
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|u| {
+                    u.nodes
+                        .iter()
+                        .any(|(_, node)| node.label() == Some("LayoutTitle"))
+                });
+            out.drop_without_applying_deltas();
+            (measured, ak_has_title)
+        };
+
+        let (cell_1x, has_title_1) = run_pass(
+            &mut layout_state,
+            &mut terminal,
+            &mut input,
+            &mut pending_focus,
+            &cfg,
+            0.0,
+            1.0,
+        );
+        assert!(has_title_1);
+        let expected_1x = (
+            (cell_1x.x * 1.0).round().clamp(1.0, f32::from(u16::MAX)) as u16,
+            (cell_1x.y * 1.0).round().clamp(1.0, f32::from(u16::MAX)) as u16,
+        );
+        assert_eq!(terminal.cell_pixel_size(), expected_1x);
+        assert!(layout_state.cell_measure_cache.is_some());
+
+        // Same font_size and ppp hit measure_cell cache; title update propagates without stale cache.
+        terminal.advance(b"\x1b]2;UpdatedTitle\x07");
+        let (cell_1x_repeat, _) = run_pass(
+            &mut layout_state,
+            &mut terminal,
+            &mut input,
+            &mut pending_focus,
+            &cfg,
+            0.1,
+            1.0,
+        );
+        assert_eq!(cell_1x_repeat, cell_1x);
+        assert_eq!(terminal.title(), "UpdatedTitle");
+
+        // Changing ppp & font_size updates cached measure_cell and cell_pixel_size.
+        cfg.font_size = 16.0;
+        let (cell_2x, _) = run_pass(
+            &mut layout_state,
+            &mut terminal,
+            &mut input,
+            &mut pending_focus,
+            &cfg,
+            0.2,
+            2.0,
+        );
+        let expected_2x = (
+            (cell_2x.x * 2.0).round().clamp(1.0, f32::from(u16::MAX)) as u16,
+            (cell_2x.y * 2.0).round().clamp(1.0, f32::from(u16::MAX)) as u16,
+        );
+        assert_eq!(terminal.cell_pixel_size(), expected_2x);
+        assert!(cell_2x.y > cell_1x.y);
     }
 }

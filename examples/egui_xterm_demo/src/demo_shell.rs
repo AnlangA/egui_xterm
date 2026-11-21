@@ -19,6 +19,10 @@ pub const SHOWCASE_COMMANDS: &[(&str, &str)] = &[
     ("unicode", "CJK, ZWJ emoji & vector box/braille glyphs"),
     ("links", "OSC 8 hyperlinks & implicit URLs"),
     ("prompts", "OSC 133 semantic prompt zones & exit codes"),
+    (
+        "modern",
+        "OSC 9;4 progress, OSC 6 doc URI, OSC 22 cursor & OSC 99 notice",
+    ),
     ("sync", "DEC Mode 2026 synchronized frame update"),
     ("size", "Show latest debounced TerminalSize"),
     ("scroll", "Emit 120 lines for scrollback & search"),
@@ -312,6 +316,10 @@ impl DemoShellInput {
                 self.emit_prompts();
                 0
             }
+            "modern" => {
+                self.emit_modern();
+                0
+            }
             "sync" => {
                 self.emit_sync();
                 0
@@ -325,7 +333,7 @@ impl DemoShellInput {
                 0
             }
             "clear" => {
-                self.push_str("\x1b[2J\x1b[H");
+                self.push_str("\x1b[2J\x1b[H\x1b]9;4;0\x07\x1b]22;\x07\x1b]6;\x07");
                 0
             }
             other => {
@@ -430,6 +438,23 @@ impl DemoShellInput {
         out.push_str("└──────┴──────────┴──────────┘\r\n");
         out.push_str("\x1b[?2026l");
         self.push_str(&out);
+    }
+
+    fn emit_modern(&mut self) {
+        let out = concat!(
+            "\x1b]6;file://localhost/workspace/demo/README.md\x07",
+            "\x1b]9;4;1;65\x07",
+            "\x1b]22;pointer\x07",
+            "\x1b]99;i=demo1:p=title:d=0;egui_xterm Demo\x1b\\",
+            "\x1b]99;i=demo1:p=body:d=1;OSC 9;4 / 6 / 22 / 99 showcase active\x1b\\",
+            "\x07",
+            "\x1b[1;36mModern OSC Showcase:\x1b[0m\r\n",
+            "  OSC 9;4 : progress bar set to 65% (run \x1b[33mclear\x1b[0m to reset)\r\n",
+            "  OSC 6   : document URI updated\r\n",
+            "  OSC 22  : pointer cursor set to pointer\r\n",
+            "  OSC 99  : notification emitted + BEL visual flash\r\n",
+        );
+        self.push_str(out);
     }
 
     fn emit_size(&mut self) {
@@ -832,5 +857,38 @@ mod tests {
         assert_eq!(char_col(top, '┌'), 12, "top row: {top:?}");
         assert_eq!(char_col(mid, '│'), 12, "mid row: {mid:?}");
         assert_eq!(char_col(bot, '└'), 12, "bot row: {bot:?}");
+    }
+
+    #[test]
+    fn modern_showcase_emits_osc_6_9_4_22_and_99() {
+        assert!(SHOWCASE_COMMANDS.iter().any(|(cmd, _)| *cmd == "modern"));
+        let mut shell = DemoShellInput::new("Modern Showcase");
+        let _ = drain_all(&mut shell);
+
+        shell.run_showcase("modern");
+        let mut term = Terminal::new(80, 24, CoreConfig::default());
+        term.advance(&drain_bytes(&mut shell));
+        let events = term.drain_events();
+
+        assert_eq!(
+            term.document_uri(),
+            Some("file://localhost/workspace/demo/README.md")
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            egui_xterm::TerminalEvent::Progress {
+                state: 1,
+                progress: 65
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            egui_xterm::TerminalEvent::MouseShape(s) if s == "pointer"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            egui_xterm::TerminalEvent::Notification { title, body }
+                if title == "egui_xterm Demo" && body.contains("OSC 9;4")
+        )));
     }
 }

@@ -14,8 +14,8 @@ use eframe::egui;
 #[cfg(not(target_arch = "wasm32"))]
 use egui_xterm::pty::{PtyBackend, PtyConfig};
 use egui_xterm::{
-    CursorShape, ScaleMode, TerminalConfig, TerminalEvent, TerminalInput, TerminalResponse,
-    TerminalRuntime, Theme,
+    CursorShape, ProgressIndicator, ScaleMode, TerminalConfig, TerminalEvent, TerminalInput,
+    TerminalResponse, TerminalRuntime, Theme,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +58,7 @@ struct TerminalTab {
     backend: PaneBackend,
     last_response: Option<PaneMetricsSnapshot>,
     last_notice: Option<String>,
+    last_notification: Option<String>,
 }
 
 #[derive(Clone)]
@@ -68,10 +69,13 @@ struct PaneMetricsSnapshot {
     effective_font_size: f32,
     title: String,
     cwd: Option<String>,
+    document_uri: Option<String>,
     display_offset: usize,
     scrollback_len: usize,
     alt_screen: bool,
     sync_output: bool,
+    progress: Option<ProgressIndicator>,
+    last_io_error: Option<String>,
     #[cfg(feature = "shell-integration")]
     zone_count: usize,
     #[cfg(feature = "metrics")]
@@ -156,15 +160,35 @@ impl TerminalTab {
             effective_font_size: resp.effective_font_size,
             title: term.title().to_owned(),
             cwd: term.cwd().map(str::to_owned),
+            document_uri: term.document_uri().map(str::to_owned),
             display_offset: term.display_offset(),
             scrollback_len: term.scrollback_len(),
             alt_screen: term.is_alt_screen(),
             sync_output: term.is_synchronized_output(),
+            progress: rt.progress(),
+            last_io_error: rt.last_io_error().map(ToString::to_string),
             #[cfg(feature = "shell-integration")]
             zone_count: term.shell_zones().len(),
             #[cfg(feature = "metrics")]
             metrics: *term.metrics(),
             closed: rt.input().is_closed(),
+        }
+    }
+
+    fn dismiss_io_error(&mut self) {
+        match &mut self.backend {
+            #[cfg(not(target_arch = "wasm32"))]
+            PaneBackend::Pty(rt) => {
+                drop(rt.take_io_error());
+            }
+            PaneBackend::Trait(rt) => {
+                drop(rt.take_io_error());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            PaneBackend::Error(_) => {}
+        }
+        if let Some(snap) = &mut self.last_response {
+            snap.last_io_error = None;
         }
     }
 
@@ -182,6 +206,21 @@ impl TerminalTab {
                         Some(code) => format!("Exit {code}"),
                         None => "Command finished".to_owned(),
                     });
+                }
+                TerminalEvent::Notification { title, body } => {
+                    let msg = if title.is_empty() {
+                        body.clone()
+                    } else if body.is_empty() {
+                        title.clone()
+                    } else {
+                        format!("{title}: {body}")
+                    };
+                    if !msg.is_empty() {
+                        self.last_notification = Some(msg);
+                    }
+                }
+                TerminalEvent::NotificationClosed { id } => {
+                    self.last_notification = Some(format!("Closed ({id})"));
                 }
                 _ => {}
             }
@@ -297,6 +336,7 @@ impl EguiXtermDemoApp {
             backend,
             last_response: None,
             last_notice: None,
+            last_notification: None,
         });
         let new_idx = self.tabs.len() - 1;
         self.select_tab(new_idx);
@@ -323,6 +363,7 @@ impl EguiXtermDemoApp {
             backend: PaneBackend::Trait(TerminalRuntime::with_config(shell, config)),
             last_response: None,
             last_notice: None,
+            last_notification: None,
         });
     }
 
@@ -620,6 +661,36 @@ impl EguiXtermDemoApp {
                     ui.separator();
                     ui.label(format!("CWD: {cwd}"));
                 }
+                if let Some(doc_uri) = &snap.document_uri {
+                    ui.separator();
+                    ui.label(format!("Doc: {doc_uri}"));
+                }
+                if let Some(ind) = snap.progress {
+                    ui.separator();
+                    let (label, color) = match ind.state {
+                        1 => (
+                            format!("Progress: {}%", ind.progress),
+                            ui.visuals().text_color(),
+                        ),
+                        2 => (
+                            format!("Progress Err: {}%", ind.progress),
+                            ui.visuals().error_fg_color,
+                        ),
+                        3 => (
+                            "Progress: Busy".to_owned(),
+                            egui::Color32::from_rgb(100, 181, 246),
+                        ),
+                        4 => (
+                            format!("Progress Paused: {}%", ind.progress),
+                            egui::Color32::from_rgb(255, 183, 77),
+                        ),
+                        _ => (
+                            format!("Progress: {}%", ind.progress),
+                            ui.visuals().text_color(),
+                        ),
+                    };
+                    ui.colored_label(color, label);
+                }
                 if snap.alt_screen {
                     ui.separator();
                     ui.colored_label(egui::Color32::LIGHT_BLUE, "ALT");
@@ -650,6 +721,10 @@ impl EguiXtermDemoApp {
                     ));
                 }
             }
+            if let Some(notification) = &tab.last_notification {
+                ui.separator();
+                ui.label(format!("Notify: {notification}"));
+            }
             if let Some(notice) = &tab.last_notice {
                 ui.separator();
                 ui.label(notice);
@@ -663,6 +738,33 @@ impl EguiXtermDemoApp {
         egui::Panel::top("demo_toolbar").show(ui, |ui| {
             self.draw_toolbar(ui);
         });
+
+        let banner_error = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.last_response.as_ref()?.last_io_error.as_deref())
+            .map(|msg| (self.active_tab_idx, msg.to_owned()))
+            .or_else(|| {
+                self.tabs.iter().enumerate().find_map(|(idx, tab)| {
+                    tab.last_response
+                        .as_ref()?
+                        .last_io_error
+                        .as_ref()
+                        .map(|msg| (idx, msg.clone()))
+                })
+            });
+        if let Some((err_idx, err_msg)) = banner_error {
+            egui::Panel::top("demo_io_error_banner").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("I/O error: {err_msg}"));
+                    if ui.button("Dismiss").clicked()
+                        && let Some(tab) = self.tabs.get_mut(err_idx)
+                    {
+                        tab.dismiss_io_error();
+                    }
+                });
+            });
+        }
 
         egui::Panel::bottom("demo_status_bar").show(ui, |ui| {
             self.draw_status_bar(ui);
@@ -854,5 +956,66 @@ mod tests {
         let mut out = ctx.run_ui(make_input(vec![]), |ui| app.show_ui(ui));
         out.textures_delta.clear();
         assert_eq!(app.active_tab_idx, 1);
+    }
+
+    #[test]
+    fn status_bar_and_io_error_banner_surface_modern_osc_and_dismiss() {
+        let mut app = test_app_with_tabs(1);
+        app.run_showcase_on_trait_pane("modern");
+
+        let ctx = egui::Context::default();
+        let make_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1240.0, 780.0),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+
+        // Frame 1: showcase emits OSC 6, 9;4, 22, 99 -> captured into snapshot & status bar.
+        let mut out1 = ctx.run_ui(make_input(), |ui| app.show_ui(ui));
+        out1.textures_delta.clear();
+        let snap = app.tabs[0].last_response.as_ref().expect("snapshot");
+        assert_eq!(
+            snap.document_uri.as_deref(),
+            Some("file://localhost/workspace/demo/README.md")
+        );
+        assert_eq!(
+            snap.progress,
+            Some(ProgressIndicator {
+                state: 1,
+                progress: 65,
+            })
+        );
+        assert!(
+            app.tabs[0]
+                .last_notification
+                .as_deref()
+                .is_some_and(|n| n.contains("egui_xterm Demo") && n.contains("OSC 9;4"))
+        );
+
+        // Simulated I/O error on snapshot renders banner and dismiss clears it cleanly.
+        if let Some(snap_mut) = &mut app.tabs[0].last_response {
+            snap_mut.last_io_error = Some("simulated transport fault".to_owned());
+        }
+        let mut out2 = ctx.run_ui(make_input(), |ui| app.show_ui(ui));
+        out2.textures_delta.clear();
+        let has_error_text = out2.shapes.iter().any(|cs| {
+            matches!(
+                &cs.shape,
+                egui::Shape::Text(ts) if ts.galley.job.text.contains("simulated transport fault")
+            )
+        });
+        assert!(has_error_text);
+
+        app.tabs[0].dismiss_io_error();
+        assert!(
+            app.tabs[0]
+                .last_response
+                .as_ref()
+                .and_then(|s| s.last_io_error.as_ref())
+                .is_none()
+        );
     }
 }

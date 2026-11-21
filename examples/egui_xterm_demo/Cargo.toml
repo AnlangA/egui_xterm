@@ -15,6 +15,8 @@ default = [
     "hyperlinks",
     "shell-integration",
     "kitty-keyboard",
+    "kitty-graphics",
+    "sixel",
     "vector-glyphs",
     "metrics",
 ]
@@ -22,6 +24,8 @@ search = ["egui_xterm/search"]
 hyperlinks = ["egui_xterm/hyperlinks"]
 shell-integration = ["egui_xterm/shell-integration"]
 kitty-keyboard = ["egui_xterm/kitty-keyboard"]
+kitty-graphics = ["egui_xterm/kitty-graphics"]
+sixel = ["egui_xterm/sixel"]
 vector-glyphs = ["egui_xterm/vector-glyphs"]
 metrics = ["egui_xterm/metrics"]
 serde = ["egui_xterm/serde"]

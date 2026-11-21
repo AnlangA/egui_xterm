@@ -214,6 +214,8 @@ pub enum TerminalEvent {
         /// Identifier (`i=<id>`) of the closed notification.
         id: String,
     },
+    /// Non-fatal backend `poll_read`, `write_bytes`, or `resize` I/O error surfaced by the runtime.
+    IoError(String),
 }
 
 /// Zero-allocation slice view over the visible viewport rows of a [`Grid`] or `LatchedFrame`.
