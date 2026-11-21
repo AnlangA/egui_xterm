@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -32,9 +32,9 @@ allow_attributes_without_reason = "deny"
 
 [workspace.dependencies]
 # Internal workspace crates
-egui_xterm_core = { path = "crates/egui_xterm_core", version = "0.1.1", default-features = false }
-egui_xterm = { path = "crates/egui_xterm", version = "0.1.1", default-features = false }
-egui_xterm_pty = { path = "crates/egui_xterm_pty", version = "0.1.1" }
+egui_xterm_core = { path = "crates/egui_xterm_core", version = "0.2.0", default-features = false }
+egui_xterm = { path = "crates/egui_xterm", version = "0.2.0", default-features = false }
+egui_xterm_pty = { path = "crates/egui_xterm_pty", version = "0.2.0" }
 
 # Core / pure-Rust dependencies (WASM-safe)
 memchr = "2.8"

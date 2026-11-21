@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "egui_xterm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "criterion",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "egui_xterm_core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.13.2",
  "criterion",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "egui_xterm_demo"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "egui_xterm_e2e"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui_xterm",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "egui_xterm_pty"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "egui_xterm_core",

@@ -11,11 +11,11 @@ Add `egui_xterm` to your `Cargo.toml` (Rust `1.95+`, Edition `2024`, `egui 0.37`
 ```toml
 [dependencies]
 egui = "0.37"
-egui_xterm = "0.1.1"
+egui_xterm = "0.2.0"
 
 # Optional on desktop targets for OS PTY sessions and arboard clipboard fallback:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-egui_xterm = { version = "0.1.1", features = ["pty", "native-clipboard"] }
+egui_xterm = { version = "0.2.0", features = ["pty", "native-clipboard"] }
 ```
 
 ## Quickstart
