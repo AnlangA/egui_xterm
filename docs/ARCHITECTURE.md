@@ -38,6 +38,10 @@ Rather than adopting any single legacy terminal design, `egui_xterm` synthesizes
 | **Dirty Tracking & Sync Output** | Re-shaping every visible row on every cursor blink wastes CPU/GPU; partial frames during TUI redraws cause flicker. | Per-row monotonic `generation` + grid `damage_epoch` skip unchanged rows in `egui`. DEC Mode 2026 (`CSI ? 2026 h/l`, `$p`) latches a frozen display snapshot with a 250ms safety watchdog so heavy TUI updates render atomically. |
 | **Subparameters & Modern Protocols** | Legacy `;`-only CSI parsers fail on `38:2::R:G:B`, `4:3` curly underlines, and Kitty keyboard `CSI u`. | Inline 64-slot `CsiParams` storing both `;` parameters and `:` subparameters in a zero-allocation flat slice table, plus bounded 4-byte intermediates and 4 MiB OSC payloads. |
 
+The compatibility references are the [XTerm control sequence reference](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html), the [xterm.js sequence matrix](https://xtermjs.org/docs/api/vtfeatures/), [Alacritty's resize and reflow design](https://docs.rs/alacritty_terminal/latest/alacritty_terminal/grid/resize/index.html), and the [Kitty keyboard specification](https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+
+Future protocol work includes inline image support for Kitty graphics and Sixel. Graphics support needs feature-gated decoding, image placement and eviction across scrollback and resize, and rendering checks on native and WebAssembly. [Kitty graphics specification](https://sw.kovidgoyal.net/kitty/graphics-protocol/) · [XTerm Sixel reference](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Sixel-Graphics)
+
 ---
 
 ## 3. Multi-Crate Workspace & Data Flow
@@ -95,6 +99,7 @@ pub trait TerminalInput {
 ```
 
 - **Minimal Implementation Surface**: A read-only stream or mock source needs **only** `poll_read`. Interactive transports override `write_bytes`, `resize`, and `is_closed`.
+- **Idle input scheduling** — When a read yields no more data for the current frame, the runtime schedules an egui repaint after `idle_poll_interval_ms` (50 ms by default). Producers that wake the UI as data arrives can set this to `0`. The DEC 2026 watchdog schedules its own repaint at the expiration deadline.
 - **No `Send + Sync` Bound**: Enables wrapping `Rc<RefCell<_>>`, WebSocket/WebSerial callbacks, and single-threaded JS bridges directly.
 - **Object-Safe**: Usable as `Box<dyn TerminalInput>` or `&mut dyn TerminalInput` via blanket implementations for `Box<T>` and `&mut T` (`T: TerminalInput + ?Sized`).
 

@@ -86,6 +86,9 @@ pub struct TerminalConfig {
     pub theme: Theme,
     /// Maximum number of bytes polled from [`crate::TerminalInput::poll_read`] per frame.
     pub read_budget_bytes_per_frame: usize,
+    /// Delay in milliseconds before polling an idle input again, even if `egui` is otherwise idle.
+    /// Set to `0` when the producer requests repaints as bytes arrive.
+    pub idle_poll_interval_ms: u32,
     /// Additional cursor geometry and blink tuning.
     pub cursor_config: CursorRenderConfig,
     /// Copy vs interrupt behavior override for copy shortcuts.
@@ -105,6 +108,7 @@ impl Default for TerminalConfig {
             resize_debounce_secs: 0.15,
             theme: Theme::dark(),
             read_budget_bytes_per_frame: 65_536,
+            idle_poll_interval_ms: 50,
             cursor_config: CursorRenderConfig::default(),
             copy_behavior: CopyBehavior::CopyIfSelectionElseSendEtx,
         }

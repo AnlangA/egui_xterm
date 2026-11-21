@@ -541,6 +541,15 @@ impl Terminal {
         false
     }
 
+    /// Returns the armed DEC Mode 2026 watchdog deadline on the same clock as
+    /// [`Self::advance_with_time`], if it has a finite deadline.
+    #[must_use]
+    pub fn sync_output_deadline(&self) -> Option<f64> {
+        self.sync_started_at
+            .map(|started| started + self.config.sync_output_timeout_secs)
+            .filter(|deadline| deadline.is_finite())
+    }
+
     /// Resizes the terminal to `(cols.max(1), rows.max(1))`, reflowing primary scrollback and
     /// remapping cursor and selection anchors.
     pub fn resize(&mut self, cols: u16, rows: u16) {

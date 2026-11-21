@@ -1,6 +1,7 @@
 //! Frame-driven [`TerminalRuntime`] and [`TerminalWidget`] integration for `egui`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use egui::{Ui, Widget};
 use egui_xterm_core::{CoreConfig, MouseProtocol, Terminal, TerminalInput};
@@ -113,28 +114,39 @@ impl<I: TerminalInput> TerminalRuntime<I> {
         let budget = config.read_budget_bytes_per_frame;
         let mut total_read = 0usize;
         if budget > 0 && !self.input.is_closed() {
+            let mut stream_ended = false;
             while total_read < budget {
                 let want = (budget - total_read).min(self.poll_scratch.len());
                 match self.input.poll_read(&mut self.poll_scratch[..want]) {
                     Ok(0) => break,
                     Ok(n) => {
                         let n = n.min(want);
-                        if n == 0 {
-                            break;
-                        }
                         total_read += n;
                         self.terminal
                             .advance_with_time(&self.poll_scratch[..n], now_secs);
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        stream_ended = error.is_closed();
+                        break;
+                    }
                 }
             }
             if total_read >= budget {
                 ui.ctx().request_repaint();
+            } else if !stream_ended && config.idle_poll_interval_ms > 0 {
+                ui.ctx()
+                    .request_repaint_after(Duration::from_millis(u64::from(
+                        config.idle_poll_interval_ms,
+                    )));
             }
         }
         if total_read == 0 {
             let _ = self.terminal.check_sync_timeout(now_secs);
+        }
+        if let Some(deadline) = self.terminal.sync_output_deadline()
+            && let Ok(delay) = Duration::try_from_secs_f64((deadline - now_secs).max(0.0))
+        {
+            ui.ctx().request_repaint_after(delay);
         }
 
         let outgoing = self.terminal.drain_outgoing();

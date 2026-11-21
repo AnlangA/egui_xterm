@@ -44,11 +44,11 @@ Add `egui_xterm` to your `Cargo.toml` (Rust `1.95+`, Edition `2024`, `egui 0.37`
 ```toml
 [dependencies]
 egui = "0.37"
-egui_xterm = "0.1.0"
+egui_xterm = "0.1.1"
 
 # Optional on desktop targets if you want built-in OS PTY & arboard clipboard support:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-egui_xterm = { version = "0.1.0", features = ["pty", "native-clipboard"] }
+egui_xterm = { version = "0.1.1", features = ["pty", "native-clipboard"] }
 ```
 
 ### 1. Implement `TerminalInput` (or use `RingBufferInput` / `ChannelInput` / `FnInput`)
@@ -121,7 +121,8 @@ egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
 
 - **Auto-Layout & Auto-Wrap/Reflow**: Under `ScaleMode::ReflowGrid`, resizing the enclosing `egui::Frame` or changing `font_size` / `zoom_factor` / `pixels_per_point()` immediately recalculates `(cols, rows)`, reflows wrapped primary-screen lines without losing logical newlines, and dispatches a debounced `TerminalInput::resize` (`TerminalSize { cols, rows, pixel_width, pixel_height }`).
 - **Auto-Scale to Fixed Grid**: Under `ScaleMode::AutoScaleToFit { cols, rows }`, the logical grid stays pinned to `(cols, rows)` and the rendered font size scales dynamically to fit the frame rectangle.
-- **Desktop PTY**: When `pty` is enabled on non-`wasm32` targets, pass `egui_xterm::pty::PtyBackend::spawn_with_repaint(PtyConfig::default(), Box::new(move || ctx.request_repaint()))?` into `TerminalRuntime::new(...)`.
+- **Idle input** — The runtime asks `egui` for another frame after 50 ms by default, so an asynchronous data source can implement only `poll_read`. Set `TerminalConfig::idle_poll_interval_ms` to `0` when your producer calls `egui::Context::request_repaint()` on output and EOF.
+- **Desktop PTY** — With the `pty` feature enabled, pass `egui_xterm::pty::PtyBackend::spawn(PtyConfig::default())?` into `TerminalRuntime::new(...)`. For immediate wakeups with idle polling disabled, use `PtyBackend::spawn_with_repaint(PtyConfig::default(), Box::new(move || ctx.request_repaint()))?`.
 
 ---
 
@@ -205,7 +206,7 @@ The demo includes:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Full workspace & opaque-box E2E suites (516 workspace --all-features tests; 317 E2E tests across Tiers 1–5)
+# Full workspace & opaque-box E2E suites (518 workspace --all-features tests; 317 E2E tests across Tiers 1–5)
 cargo test --workspace
 cargo test --workspace --all-features
 cargo test -p egui_xterm_e2e --all-features

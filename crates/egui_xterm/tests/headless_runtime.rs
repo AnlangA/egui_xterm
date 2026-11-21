@@ -51,6 +51,87 @@ fn run_frame_with(
     run_frame_with_focus(ctx, screen_rect, ppp, time, true, events, ui_fn)
 }
 
+#[test]
+fn idle_input_polling_wakes_the_viewport_until_eof() {
+    use std::io::Read as _;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let ctx = Context::default();
+    let (repaint_tx, repaint_rx) = mpsc::channel();
+    ctx.set_repaint_observer(move |info| repaint_tx.send(info.delay).unwrap());
+    let (input_tx, input_rx) = mpsc::channel::<&[u8]>();
+    let mut runtime =
+        TerminalRuntime::new(egui_xterm::FnInput::new(
+            move |buf: &mut [u8]| match input_rx.try_recv() {
+                Ok(mut bytes) => bytes.read(buf).map_err(Into::into),
+                Err(mpsc::TryRecvError::Empty) => Ok(0),
+                Err(mpsc::TryRecvError::Disconnected) => Err(TerminalIoError::Closed),
+            },
+        ));
+    runtime.config_mut().cursor_blink = false;
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        runtime.show(ui);
+    });
+    assert!(
+        repaint_rx
+            .try_iter()
+            .any(|d| d == Duration::from_millis(50))
+    );
+
+    input_tx.send(b"late output").unwrap();
+    drop(input_tx);
+    let (clipped, _) = run_frame_with(&ctx, screen, 1.0, 0.05, Vec::new(), |ui| {
+        runtime.show(ui);
+    });
+    let mut shapes = Vec::new();
+    collect_shapes(&clipped, &mut shapes);
+    assert!(all_text(&shapes).contains("late output"));
+    assert!(
+        !repaint_rx
+            .try_iter()
+            .any(|d| d == Duration::from_millis(50))
+    );
+}
+
+#[test]
+fn synchronized_output_watchdog_wakes_an_event_driven_viewport() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let ctx = Context::default();
+    let (repaint_tx, repaint_rx) = mpsc::channel();
+    ctx.set_repaint_observer(move |info| repaint_tx.send(info.delay).unwrap());
+    let cfg = TerminalConfig {
+        cursor_blink: false,
+        idle_poll_interval_ms: 0,
+        ..TerminalConfig::default()
+    };
+    let input = RingBufferInput::from_bytes(b"\x1b[?2026hupdated");
+    let mut runtime = TerminalRuntime::with_config(input, cfg);
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        runtime.show(ui);
+    });
+    assert!(runtime.terminal().is_synchronized_output());
+    assert!(
+        repaint_rx
+            .try_iter()
+            .any(|d| d == Duration::from_millis(250))
+    );
+
+    let (clipped, _) = run_frame_with(&ctx, screen, 1.0, 0.25, Vec::new(), |ui| {
+        runtime.show(ui);
+    });
+    let mut shapes = Vec::new();
+    collect_shapes(&clipped, &mut shapes);
+    assert!(!runtime.terminal().is_synchronized_output());
+    assert!(all_text(&shapes).contains("updated"));
+}
+
 fn collect_shapes(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<Shape>) {
     fn visit(s: &Shape, out: &mut Vec<Shape>) {
         match s {
