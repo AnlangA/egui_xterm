@@ -2,12 +2,12 @@
 //! and VT handlers.
 
 pub mod cursor;
-pub mod dcs;
+mod dcs;
 pub mod modes;
 pub mod mouse;
-pub mod osc;
+mod osc;
 pub mod selection;
-pub mod sgr;
+mod sgr;
 pub mod tabs;
 
 #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
@@ -1520,6 +1520,17 @@ impl TerminalState {
     #[must_use]
     pub const fn modes(&self) -> &Modes {
         &self.modes
+    }
+
+    /// Returns active terminal [`Modes`], returning the latched pre-sync modes while
+    /// `DEC ?2026` synchronized output is latched, without heap allocation.
+    #[must_use]
+    pub const fn active_modes(&self) -> &Modes {
+        if self.modes.sync_output && self.latched_frame.active {
+            &self.latched_frame.modes
+        } else {
+            &self.modes
+        }
     }
 
     /// Returns the live [`Cursor`].
@@ -3178,6 +3189,8 @@ impl TerminalState {
             let right = self.scroll_right;
             self.active_grid_mut()
                 .scroll_up_box(top, bottom, left, right, count, bg);
+            // Box scrolls shift cells in-place without pushing lines into primary history.
+            self.sync_images_after_scroll_up(top, bottom, count, false);
             #[cfg(feature = "shell-integration")]
             if !self.modes.alt_screen {
                 self.shell_integration
@@ -3215,8 +3228,8 @@ impl TerminalState {
         } else {
             self.active_grid_mut()
                 .scroll_down_region(top, bottom, count, bg);
-            self.sync_images_after_scroll_down(top, bottom, count);
         }
+        self.sync_images_after_scroll_down(top, bottom, count);
         #[cfg(feature = "shell-integration")]
         if !self.modes.alt_screen {
             self.shell_integration
@@ -3902,94 +3915,33 @@ impl TerminalState {
         let fg = self.cursor.attrs.fg;
         let write_flags = self.cursor.attrs.flags & CellFlags::WRITE_ATTR_MASK;
         let spacer_flags = CellFlags::SIZED_SPACER | (write_flags & CellFlags::PROTECTED);
-        let right_margin = if self.cursor.col <= self.scroll_right {
-            self.scroll_right
-        } else {
-            cols - 1
-        };
         let left_margin = self.scroll_left;
-
-        if self.cursor.pending_wrap {
-            if self.modes.auto_wrap {
-                let row = self.cursor.row;
-                if right_margin == cols - 1 {
-                    self.active_grid_mut().set_row_soft_wrapped(row, true);
-                }
-                self.linefeed_internal(false);
-                self.cursor.col = left_margin;
-            }
-            self.cursor.pending_wrap = false;
-        }
-
-        if sizing.width > 0 {
-            let box_cols = usize::from(sizing.width).saturating_mul(s).max(1);
-            if self.modes.auto_wrap
-                && self.cursor.col > left_margin
-                && self.cursor.col + box_cols > right_margin + 1
-                && left_margin + box_cols <= right_margin + 1
-            {
-                let row = self.cursor.row;
-                if right_margin == cols - 1 {
-                    self.active_grid_mut().set_row_soft_wrapped(row, true);
-                }
-                self.linefeed_internal(false);
-                self.cursor.col = left_margin;
-            }
-            let row = self.cursor.row;
-            let start_col = self.cursor.col;
-            let first_g = UnicodeSegmentation::graphemes(text, true)
-                .next()
-                .unwrap_or(" ");
-            let mut chars = first_g.chars();
-            let base_ch = chars.next().unwrap_or(' ');
-            let combining: Vec<char> = chars.take(MAX_COMBINING_PER_CELL).collect();
-            let extra = Some(CellExtra {
-                combining,
-                underline_color: self.cursor.attrs.underline_color,
-                hyperlink_id: self.cursor.attrs.hyperlink_id,
-                text_sizing: Some(sizing),
-            });
-            self.active_grid_mut().write_cell(
-                row,
-                start_col,
-                Cell::new(base_ch, fg, bg, write_flags),
-                extra,
-                bg,
-            );
-            let col_end = (start_col + box_cols).min(right_margin + 1).min(cols);
-            let row_end = (row + s).min(rows);
-            for r in row..row_end {
-                for c in start_col..col_end {
-                    if r == row && c == start_col {
-                        continue;
-                    }
-                    self.active_grid_mut().write_cell(
-                        r,
-                        c,
-                        Cell::new(' ', fg, bg, spacer_flags),
-                        None,
-                        bg,
-                    );
-                }
-            }
-            #[cfg(feature = "shell-integration")]
-            if !self.modes.alt_screen && row_end > row {
-                self.shell_integration
-                    .on_primary_rows_mutated(&self.primary, row, row_end - 1);
-            }
-            let next_col = start_col + box_cols;
-            if next_col <= right_margin {
-                self.cursor.col = next_col;
-                self.cursor.pending_wrap = false;
-            } else {
-                self.cursor.col = right_margin;
-                self.cursor.pending_wrap = self.modes.auto_wrap;
-            }
-            return;
-        }
+        let gw_override = (sizing.width > 0).then(|| usize::from(sizing.width));
 
         for grapheme in UnicodeSegmentation::graphemes(text, true) {
-            let gw = UnicodeWidthStr::width(grapheme).clamp(1, 2);
+            let mut right_margin = if self.cursor.col <= self.scroll_right {
+                self.scroll_right
+            } else {
+                cols - 1
+            };
+            if self.cursor.pending_wrap {
+                if self.modes.auto_wrap {
+                    let row = self.cursor.row;
+                    if right_margin == cols - 1 {
+                        self.active_grid_mut().set_row_soft_wrapped(row, true);
+                    }
+                    self.linefeed_internal(false);
+                    self.cursor.col = left_margin;
+                    right_margin = if self.cursor.col <= self.scroll_right {
+                        self.scroll_right
+                    } else {
+                        cols - 1
+                    };
+                }
+                self.cursor.pending_wrap = false;
+            }
+
+            let gw = gw_override.unwrap_or_else(|| UnicodeWidthStr::width(grapheme).clamp(1, 2));
             let glyph_cols = gw.saturating_mul(s).max(1);
             if self.modes.auto_wrap
                 && self.cursor.col > left_margin
@@ -4002,8 +3954,14 @@ impl TerminalState {
                 }
                 self.linefeed_internal(false);
                 self.cursor.col = left_margin;
+                right_margin = if self.cursor.col <= self.scroll_right {
+                    self.scroll_right
+                } else {
+                    cols - 1
+                };
                 self.cursor.pending_wrap = false;
             }
+
             let row = self.cursor.row;
             let start_col = self.cursor.col;
             let mut chars = grapheme.chars();
@@ -5420,6 +5378,9 @@ impl VtHandler for TerminalState {
                 b'c' if params.get_or(0, 0) == 0 => {
                     self.outgoing.extend_from_slice(b"\x1b[>0;100;0c");
                 }
+                b'm' if params.is_empty() => {
+                    self.modes.modify_other_keys = 0;
+                }
                 b'm' if params.get(0) == Some(4) => {
                     let level = params.get_or(1, 0);
                     if level <= 2 {
@@ -6055,6 +6016,13 @@ impl Terminal {
     #[must_use]
     pub fn active_snapshot(&self) -> RenderSnapshot<'_> {
         self.state.active_snapshot()
+    }
+
+    /// Returns the active [`Modes`] without allocating (returning the latched pre-sync modes
+    /// while `DEC ?2026` synchronized output is latched, otherwise the live modes).
+    #[must_use]
+    pub const fn active_modes(&self) -> &Modes {
+        self.state.active_modes()
     }
 
     /// Returns active inline image placements (`kitty-graphics` or `sixel` feature).
@@ -9673,5 +9641,187 @@ mod tests {
         let p_after = t2.step_incremental_search(100);
         assert!(p_after.complete);
         assert_eq!(p_after.matches_found, 2);
+    }
+
+    #[test]
+    fn active_modes_respects_sync_latch_and_live_updates() {
+        let mut t = new_term(20, 4);
+        assert_eq!(t.active_modes(), t.modes());
+
+        t.advance(b"\x1b[?1002h\x1b[?2004h");
+        assert_eq!(t.active_modes().mouse_protocol, MouseProtocol::ButtonEvent);
+        assert!(t.active_modes().bracketed_paste);
+
+        // Latch DEC ?2026 and mutate live modes while synchronized output is active.
+        t.advance(b"\x1b[?2026h\x1b[?1002l\x1b[?1h\x1b[?1007h");
+        assert!(t.is_synchronized_output());
+        assert_eq!(t.modes().mouse_protocol, MouseProtocol::None);
+        assert!(t.modes().app_cursor_keys);
+        assert!(t.modes().alt_scroll);
+        assert_eq!(t.active_modes().mouse_protocol, MouseProtocol::ButtonEvent);
+        assert!(!t.active_modes().app_cursor_keys);
+        assert!(!t.active_modes().alt_scroll);
+        assert_eq!(t.active_modes(), t.active_snapshot().modes);
+
+        // Releasing DEC ?2026 exposes live modes again.
+        t.advance(b"\x1b[?2026l");
+        assert!(!t.is_synchronized_output());
+        assert_eq!(t.active_modes(), t.modes());
+        assert_eq!(t.active_modes().mouse_protocol, MouseProtocol::None);
+        assert!(t.active_modes().app_cursor_keys);
+    }
+
+    #[test]
+    fn osc66_multi_grapheme_explicit_width_advances_wraps_and_clamps() {
+        let mut t = new_term(20, 6);
+        t.advance(b"\x1b]66;s=2:w=2;Hi\x07!");
+        assert_eq!(t.visible_line_text(0).as_deref(), Some("Hi!"));
+        assert_eq!(t.cursor_pos(), (9, 0));
+        assert_eq!(t.cell_at(0, 0).unwrap().ch, 'H');
+        assert_eq!(t.cell_at(4, 0).unwrap().ch, 'i');
+        assert_eq!(t.cell_at(8, 0).unwrap().ch, '!');
+        assert!(
+            t.cell_at(1, 0)
+                .unwrap()
+                .flags
+                .contains(CellFlags::SIZED_SPACER)
+        );
+        assert!(
+            t.cell_at(0, 1)
+                .unwrap()
+                .flags
+                .contains(CellFlags::SIZED_SPACER)
+        );
+        assert!(
+            t.cell_at(5, 0)
+                .unwrap()
+                .flags
+                .contains(CellFlags::SIZED_SPACER)
+        );
+        assert!(
+            t.cell_at(4, 1)
+                .unwrap()
+                .flags
+                .contains(CellFlags::SIZED_SPACER)
+        );
+        let extra_h = t.grid().viewport_row(0).unwrap().cells()[0].extra_id;
+        let extra_i = t.grid().viewport_row(0).unwrap().cells()[4].extra_id;
+        assert_eq!(
+            t.cell_extra(extra_h).and_then(|e| e.text_sizing),
+            Some(TextSizing {
+                scale: 2,
+                width: 2,
+                ..TextSizing::default()
+            })
+        );
+        assert_eq!(
+            t.cell_extra(extra_i).and_then(|e| e.text_sizing),
+            Some(TextSizing {
+                scale: 2,
+                width: 2,
+                ..TextSizing::default()
+            })
+        );
+
+        // Combining grapheme cluster + trailing grapheme under w > 0.
+        t.advance("\r\n\r\n\x1b]66;s=1:w=2;e\u{0301}Z\x07".as_bytes());
+        assert_eq!(t.cell_at(0, 2).unwrap().grapheme, "e\u{0301}");
+        assert!(
+            t.cell_at(1, 2)
+                .unwrap()
+                .flags
+                .contains(CellFlags::SIZED_SPACER)
+        );
+        assert_eq!(t.cell_at(2, 2).unwrap().ch, 'Z');
+        assert_eq!(t.cursor_pos(), (4, 2));
+        t.grid().debug_verify_wide_invariants();
+        t.grid().debug_verify_extra_invariants();
+
+        // Multi-grapheme wrapping across rows when exceeding right margin (s=1:w=2 and s=1:w=1).
+        let mut tw = new_term(6, 5);
+        tw.advance(b"\x1b]66;s=1:w=2;ABCD\x07");
+        assert_eq!(tw.visible_line_text(0).as_deref(), Some("ABC"));
+        assert_eq!(tw.visible_line_text(1).as_deref(), Some("D"));
+        assert_eq!(tw.cursor_pos(), (2, 1));
+        assert!(tw.grid().viewport_row(0).unwrap().soft_wrapped());
+
+        let mut tw1 = new_term(3, 3);
+        tw1.advance(b"\x1b]66;s=1:w=1;ABCD\x07");
+        assert_eq!(tw1.visible_line_text(0).as_deref(), Some("ABC"));
+        assert_eq!(tw1.visible_line_text(1).as_deref(), Some("D"));
+        assert_eq!(tw1.cursor_pos(), (1, 1));
+
+        // DECAWM off clamps cleanly at right margin without out-of-bounds.
+        let mut tc = new_term(5, 4);
+        tc.advance(b"\x1b[?7l\x1b[1;4H\x1b]66;s=2:w=3;XY\x07");
+        assert_eq!(tc.cursor_pos(), (4, 0));
+        assert_eq!(tc.cell_at(4, 0).unwrap().ch, 'Y');
+        assert!(
+            tc.cell_at(4, 1)
+                .unwrap()
+                .flags
+                .contains(CellFlags::SIZED_SPACER)
+        );
+        tc.grid().debug_verify_wide_invariants();
+        tc.grid().debug_verify_extra_invariants();
+    }
+
+    #[cfg(feature = "kitty-graphics")]
+    #[test]
+    fn declrmm_box_scroll_syncs_inline_images() {
+        let mut t = new_term(10, 6);
+        t.advance(b"\x1b[?69h\x1b[3;8s");
+        t.advance(b"\x1b[2;3H\x1b_Ga=T,f=32,s=1,v=1,c=2,r=2,q=2;/wAA/w==\x1b\\");
+        assert_eq!(t.image_placements().len(), 1);
+        assert_eq!(t.image_placements()[0].abs_line, AbsLine(1));
+        assert_eq!(t.image_placements()[0].rows, 2);
+
+        // Full-height DECLRMM box scroll up (CSI S) shifts placement in-place (not history scroll).
+        t.advance(b"\x1b[1S");
+        assert_eq!(t.image_placements().len(), 1);
+        assert_eq!(t.image_placements()[0].abs_line, AbsLine(0));
+        assert_eq!(t.image_placements()[0].rows, 2);
+
+        // Box scroll down (CSI T) shifts placement back down.
+        t.advance(b"\x1b[2T");
+        assert_eq!(t.image_placements().len(), 1);
+        assert_eq!(t.image_placements()[0].abs_line, AbsLine(2));
+        assert_eq!(t.image_placements()[0].rows, 2);
+
+        // Linefeed at bottom margin under DECLRMM shifts placement up as well.
+        t.advance(b"\x1b[6;3H\n");
+        assert_eq!(t.image_placements().len(), 1);
+        assert_eq!(t.image_placements()[0].abs_line, AbsLine(1));
+        assert_eq!(t.image_placements()[0].rows, 2);
+
+        // Sub-region DECSTBM + DECLRMM scroll up clips then evicts placement cleanly.
+        t.advance(b"\x1b[2;5r\x1b[1S");
+        assert_eq!(t.image_placements().len(), 1);
+        assert_eq!(t.image_placements()[0].abs_line, AbsLine(1));
+        assert_eq!(t.image_placements()[0].rows, 1);
+
+        t.advance(b"\x1b[1S");
+        assert!(t.image_placements().is_empty());
+    }
+
+    #[test]
+    fn csi_gt_m_bare_resets_modify_other_keys() {
+        let mut t = new_term(20, 4);
+        t.advance(b"\x1b[>4;2m\x1b[?4m");
+        assert_eq!(t.modify_other_keys_level(), 2);
+        assert_eq!(t.drain_outgoing(), b"\x1b[>4;2m");
+
+        // Bare CSI ? m must not reset modifyOtherKeys; bare CSI > m resets it to 0.
+        t.advance(b"\x1b[?m");
+        assert_eq!(t.modify_other_keys_level(), 2);
+
+        t.advance(b"\x1b[>m\x1b[?4m");
+        assert_eq!(t.modify_other_keys_level(), 0);
+        assert_eq!(t.drain_outgoing(), b"\x1b[>4;0m");
+
+        t.advance(b"\x1b[>4;1m");
+        assert_eq!(t.modify_other_keys_level(), 1);
+        t.advance(b"\x1b[>4m");
+        assert_eq!(t.modify_other_keys_level(), 0);
     }
 }

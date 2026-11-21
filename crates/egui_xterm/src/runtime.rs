@@ -414,7 +414,7 @@ impl<I: TerminalInput> RuntimeInner<I> {
             (false, false, None);
 
         let (mouse_protocol, shift_held, secondary_shift_click) = {
-            let mouse_protocol = self.terminal.active_snapshot().modes.mouse_protocol;
+            let mouse_protocol = self.terminal.active_modes().mouse_protocol;
             let (shift_held, secondary_shift_click) = ui.input(|i| {
                 let any_btn_shift = i.events.iter().any(|ev| {
                     matches!(

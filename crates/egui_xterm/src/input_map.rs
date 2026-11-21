@@ -207,7 +207,7 @@ impl InputMapperState {
         };
 
         let (mouse_protocol, mouse_encoding) = {
-            let modes = terminal.active_snapshot().modes;
+            let modes = terminal.active_modes();
             (modes.mouse_protocol, modes.mouse_encoding)
         };
         let ppp = crate::layout::sanitize_ppp(ui.ctx().pixels_per_point());
@@ -668,8 +668,7 @@ impl InputMapperState {
                         };
 
                         if (mouse_protocol != MouseProtocol::None && !modifiers.shift)
-                            || (terminal.is_alt_screen()
-                                && terminal.active_snapshot().modes.alt_scroll)
+                            || (terminal.is_alt_screen() && terminal.active_modes().alt_scroll)
                         {
                             if delta.y.abs() > f32::EPSILON {
                                 let btn = if delta.y > 0.0 {
@@ -732,7 +731,7 @@ impl InputMapperState {
 
         let is_mac = ui.ctx().os().is_mac();
         let filtered_events = ui.input(|i| i.filtered_events(&filter));
-        let mouse_protocol = terminal.active_snapshot().modes.mouse_protocol;
+        let mouse_protocol = terminal.active_modes().mouse_protocol;
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mut skip_next_text = false;
 
@@ -759,7 +758,7 @@ impl InputMapperState {
                             #[cfg(feature = "kitty-keyboard")]
                             if kitty_active {
                                 let flags = terminal.kitty_keyboard_flags();
-                                let modes = *terminal.active_snapshot().modes;
+                                let modes = *terminal.active_modes();
                                 encode_egui_key_kitty_into(
                                     flags,
                                     &modes,
@@ -959,7 +958,7 @@ impl InputMapperState {
                     #[cfg(feature = "kitty-keyboard")]
                     if kitty_active {
                         let flags = terminal.kitty_keyboard_flags();
-                        let modes = *terminal.active_snapshot().modes;
+                        let modes = *terminal.active_modes();
                         if encode_egui_key_kitty_into(
                             flags,
                             &modes,
@@ -1002,7 +1001,7 @@ impl InputMapperState {
                         continue;
                     }
 
-                    let modes = *terminal.active_snapshot().modes;
+                    let modes = *terminal.active_modes();
                     if encode_egui_key_legacy_into(&modes, *key, *modifiers, out_bytes) {
                         out.any_user_activity = true;
                         skip_next_text = paired_text.is_some();

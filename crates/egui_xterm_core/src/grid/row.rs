@@ -567,7 +567,7 @@ impl Row {
                     }
                 }
 
-                if end == cols && !self.cells[cols - 1].is_wrap_spacer() {
+                if end == cols && !self.cells[cols - 1].is_protected() {
                     self.soft_wrapped = false;
                 }
 
@@ -1052,5 +1052,97 @@ mod tests {
         let mut b = a.clone();
         b.cells_mut(); // invalidates cache on b without mutating cells
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn clear_range_with_protection_preserves_soft_wrapped_when_last_cell_protected() {
+        let mut extras = CellExtraTable::new();
+
+        // Protected normal cell in the last column keeps soft_wrapped=true on UnprotectedOnly.
+        let mut row = Row::new(6, 1);
+        row.write_ascii_run(
+            0,
+            b"abcde",
+            PackedColor::Default,
+            PackedColor::Default,
+            CellFlags::empty(),
+            &mut extras,
+        );
+        row.write_single_cell(
+            5,
+            Cell::new(
+                'P',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::PROTECTED,
+            ),
+            PackedColor::Default,
+            &mut extras,
+        );
+        row.set_soft_wrapped(true);
+        row.clear_range_with_protection(
+            0..6,
+            PackedColor::Default,
+            EraseProtection::UnprotectedOnly,
+            &mut extras,
+        );
+        assert!(row.soft_wrapped());
+        assert_eq!(row.cells()[0].codepoint, ' ');
+        assert_eq!(row.cells()[5].codepoint, 'P');
+        assert_trimmed_len_exact(&row);
+
+        // Protected WRAP_SPACER in the last column also preserves soft_wrapped=true.
+        row.write_single_cell(
+            5,
+            Cell::new(
+                ' ',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::PROTECTED | CellFlags::WRAP_SPACER,
+            ),
+            PackedColor::Default,
+            &mut extras,
+        );
+        row.clear_range_with_protection(
+            0..6,
+            PackedColor::Default,
+            EraseProtection::UnprotectedOnly,
+            &mut extras,
+        );
+        assert!(row.soft_wrapped());
+        assert!(row.cells()[5].is_wrap_spacer());
+
+        // EraseProtection::All erases protected last cell and clears soft_wrapped.
+        row.clear_range_with_protection(
+            0..6,
+            PackedColor::Default,
+            EraseProtection::All,
+            &mut extras,
+        );
+        assert!(!row.soft_wrapped());
+        assert_trimmed_len_exact(&row);
+
+        // Unprotected last cell erased by UnprotectedOnly clears soft_wrapped.
+        row.write_single_cell(
+            5,
+            Cell::new(
+                'z',
+                PackedColor::Default,
+                PackedColor::Default,
+                CellFlags::empty(),
+            ),
+            PackedColor::Default,
+            &mut extras,
+        );
+        row.set_soft_wrapped(true);
+        row.clear_range_with_protection(
+            0..6,
+            PackedColor::Default,
+            EraseProtection::UnprotectedOnly,
+            &mut extras,
+        );
+        assert!(!row.soft_wrapped());
+        assert_eq!(row.cells()[5].codepoint, ' ');
+        assert_trimmed_len_exact(&row);
     }
 }
