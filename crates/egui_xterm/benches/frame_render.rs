@@ -671,11 +671,158 @@ fn bench_frame_render_tui(c: &mut Criterion) {
 #[cfg(not(feature = "vector-glyphs"))]
 fn bench_frame_render_tui(_c: &mut Criterion) {}
 
+fn build_bold_and_italic_screen(cols: u16, rows: u16, seed: u8) -> Vec<u8> {
+    let mut out = String::with_capacity(usize::from(cols) * usize::from(rows) * 16);
+    out.push_str("\x1b[H");
+    for r in 0..rows {
+        for c in 0..cols {
+            let sgr = match (r + c + u16::from(seed)) % 3 {
+                0 => "\x1b[1m",
+                1 => "\x1b[3m",
+                _ => "\x1b[1;3m",
+            };
+            let ch = (b'A' + ((c as u8).wrapping_add(seed)) % 26) as char;
+            out.push_str(sgr);
+            out.push(ch);
+        }
+        out.push_str("\x1b[0m");
+        if r + 1 < rows {
+            out.push_str("\r\n");
+        }
+    }
+    out.into_bytes()
+}
+
+#[cfg(feature = "search")]
+fn build_search_2500_payload(rows: usize) -> Vec<u8> {
+    let mut out = String::with_capacity(rows * 210);
+    for r in 0..rows {
+        for c in 0..42 {
+            if write!(out, "HIT{c:02}").is_err() {
+                // `String`'s `fmt::Write` impl is infallible.
+            }
+        }
+        if r + 1 < rows {
+            out.push_str("\r\n");
+        }
+    }
+    out.into_bytes()
+}
+
+#[cfg(feature = "kitty-graphics")]
+fn build_kitty_placeholder_grid_payload(cols: u16, rows: u16) -> Vec<u8> {
+    let mut out = String::with_capacity(usize::from(cols) * usize::from(rows) * 6 + 256);
+    // 2x2 RGBA white pixel: base64("/////////////////////w==")
+    if write!(
+        out,
+        "\x1b_Ga=T,i=1,p=1,U=1,f=32,s=2,v=2,c={cols},r={rows},q=2;/////////////////////w==\x1b\\\x1b[H\x1b[38;2;0;0;1m"
+    )
+    .is_err()
+    {
+        // `String`'s `fmt::Write` impl is infallible.
+    }
+    for r in 0..rows {
+        let row_diacritic = egui_xterm_core::features::inline_images::KITTY_DIACRITICS
+            .get(usize::from(r))
+            .copied()
+            .unwrap_or('\u{0305}');
+        out.push('\u{10EEEE}');
+        out.push(row_diacritic);
+        out.push('\u{0305}');
+        for _ in 1..cols {
+            out.push('\u{10EEEE}');
+        }
+        if r + 1 < rows {
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("\x1b[0m");
+    out.into_bytes()
+}
+
+fn bench_frame_render_m5(c: &mut Criterion) {
+    let mut group = c.benchmark_group("frame_render_200x60_m5");
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(4));
+    group.throughput(Throughput::Elements(
+        u64::from(TARGET_COLS) * u64::from(TARGET_ROWS),
+    ));
+
+    // 1. SGR 1 (bold) + SGR 3 (italic) full 200x60 redraw.
+    {
+        let (ctx, mut runtime, screen_rect) = setup_200x60_harness();
+        let screen_a = build_bold_and_italic_screen(TARGET_COLS, TARGET_ROWS, 1);
+        let screen_b = build_bold_and_italic_screen(TARGET_COLS, TARGET_ROWS, 2);
+        runtime.input_mut().push(&screen_a);
+        run_single_frame_and_tessellate(&ctx, &mut runtime, screen_rect, 1.0);
+        let mut t = 1.5;
+        let mut toggle = false;
+        group.bench_function("bold_and_italic_full_redraw", |b| {
+            b.iter_batched(
+                || {
+                    toggle = !toggle;
+                    if toggle { &screen_b } else { &screen_a }
+                },
+                |payload| {
+                    runtime.input_mut().push(payload);
+                    t += 1.0 / 60.0;
+                    run_single_frame_and_tessellate(&ctx, &mut runtime, screen_rect, t);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    // 2. Full 200x60 redraw with >= 2,500 active search matches (`O(log M)` partition_point).
+    #[cfg(feature = "search")]
+    {
+        let (ctx, mut runtime, screen_rect) = setup_200x60_harness();
+        let payload = build_search_2500_payload(100);
+        runtime.input_mut().push(&payload);
+        run_single_frame_and_tessellate(&ctx, &mut runtime, screen_rect, 1.0);
+        let query = egui_xterm::SearchQuery::literal("HIT");
+        let match_count = runtime.terminal_mut().search(&query).map_or(0, |m| m.len());
+        assert!(
+            match_count >= 2_500,
+            "expected >= 2,500 search matches, got {match_count}"
+        );
+        let mut t = 1.5;
+        group.bench_function("search_2500_matches_redraw", |b| {
+            b.iter(|| {
+                runtime.config_mut().theme.scheme.background[0] ^= 1;
+                t += 1.0 / 60.0;
+                run_single_frame_and_tessellate(&ctx, &mut runtime, screen_rect, t);
+            });
+        });
+    }
+
+    // 3. Kitty `U+10EEEE` virtual placement placeholder 200x60 grid coalescing.
+    #[cfg(feature = "kitty-graphics")]
+    {
+        let (ctx, mut runtime, screen_rect) = setup_200x60_harness();
+        let payload = build_kitty_placeholder_grid_payload(TARGET_COLS, TARGET_ROWS);
+        runtime.input_mut().push(&payload);
+        run_single_frame_and_tessellate(&ctx, &mut runtime, screen_rect, 1.0);
+        let mut t = 1.5;
+        group.bench_function("kitty_placeholder_grid", |b| {
+            b.iter(|| {
+                runtime.config_mut().theme.scheme.background[0] ^= 1;
+                t += 1.0 / 60.0;
+                run_single_frame_and_tessellate(&ctx, &mut runtime, screen_rect, t);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_frame_render_stages,
     bench_frame_render,
     bench_frame_render_utf8,
     bench_frame_render_tui,
+    bench_frame_render_m5,
 );
 criterion_main!(benches);
