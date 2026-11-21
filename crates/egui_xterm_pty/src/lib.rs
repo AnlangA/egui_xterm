@@ -1516,6 +1516,7 @@ mod native {
             blocked: bool,
             fail_kind: Option<ErrorKind>,
             fail_notified: bool,
+            dropped: bool,
         }
 
         struct FakeWriter {
@@ -1535,6 +1536,7 @@ mod native {
                         blocked,
                         fail_kind: None,
                         fail_notified: false,
+                        dropped: false,
                     }),
                     Condvar::new(),
                 ));
@@ -1588,6 +1590,27 @@ mod native {
                     .wait_timeout_while(guard, timeout, |s| !s.fail_notified)
                     .unwrap();
                 guard.fail_notified
+            }
+
+            fn wait_dropped(&self, timeout: Duration) -> bool {
+                let (lock, cvar) = &*self.state;
+                let guard = lock.lock().unwrap();
+                let (guard, _) = cvar
+                    .wait_timeout_while(guard, timeout, |s| !s.dropped)
+                    .unwrap();
+                guard.dropped
+            }
+        }
+
+        impl Drop for FakeWriter {
+            fn drop(&mut self) {
+                let (lock, cvar) = &*self.state;
+                let mut guard = match lock.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.dropped = true;
+                cvar.notify_all();
             }
         }
 
@@ -2024,6 +2047,7 @@ mod native {
             let TestBackendHarness {
                 mut backend,
                 reader: reader_ctrl,
+                writer: writer_ctrl,
                 child: child_ctrl,
                 master_dropped,
                 repaint_sig,
@@ -2039,15 +2063,96 @@ mod native {
             assert_eq!(&buf[..7], b"WIN_OUT");
             assert_eq!(backend.try_wait().unwrap(), None);
 
-            // Simulate child process exiting: waiter drops master & writer_tx, unblocking EOF.
+            // Simulate child process exiting: waiter surfaces exit code, closes writer, and drops
+            // master before ConPTY unblocks EOF on the reader. Each thread emits its own repaint.
             child_ctrl.set_exited(9);
-            reader_ctrl.push(ReadStep::Eof);
             wait_repaint(&repaint_sig, 2, Duration::from_secs(2));
+
+            assert!(master_dropped.load(Ordering::SeqCst));
+            assert!(
+                writer_ctrl.wait_dropped(Duration::from_secs(2)),
+                "writer thread must drop writer handle after child exit"
+            );
+            assert_eq!(
+                backend.write_bytes(b"after_exit"),
+                Err(TerminalIoError::Closed)
+            );
+            assert_eq!(
+                backend.resize(TerminalSize::new(90, 30)),
+                Err(TerminalIoError::Closed)
+            );
+            assert_eq!(backend.try_wait().unwrap(), Some(9));
+            assert!(!backend.is_closed());
+
+            // Now simulate master drop unblocking EOF on the reader.
+            reader_ctrl.push(ReadStep::Eof);
+            wait_repaint(&repaint_sig, 3, Duration::from_secs(2));
 
             assert_eq!(backend.poll_read(&mut buf), Err(TerminalIoError::Closed));
             assert!(backend.is_closed());
             assert!(master_dropped.load(Ordering::SeqCst));
             assert_eq!(backend.try_wait().unwrap(), Some(9));
+            assert_eq!(child_ctrl.try_wait_calls(), 0);
+        }
+
+        #[test]
+        fn waiter_thread_surfaces_exit_code_even_when_eof_arrives_first() {
+            let TestBackendHarness {
+                mut backend,
+                reader: reader_ctrl,
+                writer: writer_ctrl,
+                child: child_ctrl,
+                master_dropped,
+                repaint_sig,
+                ..
+            } = spawn_test_backend(ExitMonitorMode::WaiterThread, false);
+
+            reader_ctrl.push(ReadStep::Eof);
+            wait_repaint(&repaint_sig, 1, Duration::from_secs(2));
+
+            let mut buf = [0u8; 16];
+            assert_eq!(backend.poll_read(&mut buf), Err(TerminalIoError::Closed));
+            assert!(backend.is_closed());
+            assert_eq!(backend.try_wait().unwrap(), None);
+            assert!(!master_dropped.load(Ordering::SeqCst));
+
+            child_ctrl.set_exited(11);
+            wait_repaint(&repaint_sig, 2, Duration::from_secs(2));
+
+            assert!(master_dropped.load(Ordering::SeqCst));
+            assert!(
+                writer_ctrl.wait_dropped(Duration::from_secs(2)),
+                "writer thread must drop writer handle after child exit"
+            );
+            assert_eq!(backend.try_wait().unwrap(), Some(11));
+            assert_eq!(child_ctrl.try_wait_calls(), 0);
+        }
+
+        #[test]
+        fn waiter_thread_concurrent_exit_and_eof_both_notify_repaint() {
+            let TestBackendHarness {
+                mut backend,
+                reader: reader_ctrl,
+                writer: writer_ctrl,
+                child: child_ctrl,
+                master_dropped,
+                repaint_sig,
+                ..
+            } = spawn_test_backend(ExitMonitorMode::WaiterThread, false);
+
+            child_ctrl.set_exited(5);
+            reader_ctrl.push(ReadStep::Eof);
+            wait_repaint(&repaint_sig, 2, Duration::from_secs(2));
+
+            let mut buf = [0u8; 16];
+            assert_eq!(backend.poll_read(&mut buf), Err(TerminalIoError::Closed));
+            assert!(backend.is_closed());
+            assert!(master_dropped.load(Ordering::SeqCst));
+            assert!(
+                writer_ctrl.wait_dropped(Duration::from_secs(2)),
+                "writer thread must drop writer handle after child exit"
+            );
+            assert_eq!(backend.try_wait().unwrap(), Some(5));
             assert_eq!(child_ctrl.try_wait_calls(), 0);
         }
 
