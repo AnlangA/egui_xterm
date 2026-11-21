@@ -147,7 +147,8 @@ egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
 
 ### `egui_xterm_demo` Features
 
-- **`default`**: Enables `search`, `hyperlinks`, `shell-integration`, `kitty-keyboard`, `vector-glyphs`, and `metrics` (plus `pty` and `native-clipboard` automatically on `not(target_arch = "wasm32")`).
+- **`default`**: Enables `search`, `hyperlinks`, `shell-integration`, `kitty-keyboard`, `kitty-graphics`, `sixel`, `vector-glyphs`, and `metrics` (plus `pty` and `native-clipboard` automatically on `not(target_arch = "wasm32")`).
+- **`serde`**: Opt-in forwarding to `egui_xterm/serde`.
 - **`inspection`**: Enables `eframe/inspection` for live widget-tree inspection.
 
 ---
@@ -198,7 +199,7 @@ cargo run -p egui_xterm_demo
 
 The demo includes:
 - **Local PTY tab** *(desktop)*: Live OS shell via `PtyBackend::spawn_with_repaint`, with `"New PTY"` and `"Restart PTY"` actions.
-- **Trait Demo tab** *(all targets)*: Interactive `DemoShellInput` implementing `TerminalInput`, with a collapsible **Trait Showcase** sidebar (`help`, `colors`, `unicode`, `links`, `prompts`, `sync`, `size`, `scroll`, `clear`, plus modern OSC showcase).
+- **Trait Demo tab** *(all targets)*: Interactive `DemoShellInput` implementing `TerminalInput`, with a collapsible **Trait Showcase** sidebar (`help`, `colors`, `unicode`, `links`, `prompts`, `modern`, `sync`, `size`, `scroll`, `clear`).
 - **Split View & Auto-Layout controls**: Side-by-side resizable panes, live switching between `ScaleMode::ReflowGrid` and `ScaleMode::AutoScaleToFit`, font size & zoom controls, Dark/Light themes, cursor shape/blink toggles, search overlay (`Find` / `Ctrl+Shift+F`), prompt navigation (`Prev Prompt` / `Next Prompt`), and live status/metrics/I/O-error bar.
 
 ---

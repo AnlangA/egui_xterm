@@ -69,6 +69,7 @@ impl TerminalMetrics {
     }
 
     /// Records a `HyperlinkPool` garbage-collection sweep.
+    #[cfg(any(test, feature = "hyperlinks"))]
     pub(crate) fn record_hyperlink_gc(&mut self) {
         self.hyperlink_gc_runs = self.hyperlink_gc_runs.saturating_add(1);
     }
