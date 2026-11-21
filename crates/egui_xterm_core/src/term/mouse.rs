@@ -87,6 +87,26 @@ pub struct MouseInputEvent {
 /// Encodes `ev` into VT mouse reporting bytes according to `modes`, or `None` if suppressed.
 #[must_use]
 pub fn encode_mouse_event(modes: &Modes, ev: MouseInputEvent) -> Option<Vec<u8>> {
+    encode_mouse_event_inner(modes, ev, None)
+}
+
+/// Encodes `ev` into VT mouse reporting bytes according to `modes`, using `(pixel_x, pixel_y)`
+/// when [`MouseEncoding::SgrPixels`] (`DEC ? 1016`) is active.
+#[must_use]
+pub fn encode_mouse_event_pixels(
+    modes: &Modes,
+    ev: MouseInputEvent,
+    pixel_x: u32,
+    pixel_y: u32,
+) -> Option<Vec<u8>> {
+    encode_mouse_event_inner(modes, ev, Some((pixel_x, pixel_y)))
+}
+
+fn encode_mouse_event_inner(
+    modes: &Modes,
+    ev: MouseInputEvent,
+    pixels: Option<(u32, u32)>,
+) -> Option<Vec<u8>> {
     match modes.mouse_protocol {
         MouseProtocol::None => {
             if modes.alt_screen && modes.alt_scroll && ev.kind == MouseEventKind::Press {
@@ -135,8 +155,11 @@ pub fn encode_mouse_event(modes: &Modes, ev: MouseInputEvent) -> Option<Vec<u8>>
     }
 
     let is_x10 = modes.mouse_protocol == MouseProtocol::X10;
-    let mut cb = if ev.kind == MouseEventKind::Release && modes.mouse_encoding != MouseEncoding::Sgr
-    {
+    let is_sgr = matches!(
+        modes.mouse_encoding,
+        MouseEncoding::Sgr | MouseEncoding::SgrPixels
+    );
+    let mut cb = if ev.kind == MouseEventKind::Release && !is_sgr {
         3
     } else {
         ev.button.map_or(3, MouseButton::protocol_code)
@@ -168,6 +191,15 @@ pub fn encode_mouse_event(modes: &Modes, ev: MouseInputEvent) -> Option<Vec<u8>>
                 'M'
             };
             Some(format!("\x1b[<{cb};{cx};{cy}{final_ch}").into_bytes())
+        }
+        MouseEncoding::SgrPixels => {
+            let (px, py) = pixels.unwrap_or((cx, cy));
+            let final_ch = if ev.kind == MouseEventKind::Release {
+                'm'
+            } else {
+                'M'
+            };
+            Some(format!("\x1b[<{cb};{px};{py}{final_ch}").into_bytes())
         }
         MouseEncoding::Utf8 => {
             let mut out = Vec::with_capacity(9);

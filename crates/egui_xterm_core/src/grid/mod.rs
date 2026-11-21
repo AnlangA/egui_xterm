@@ -949,6 +949,188 @@ impl Grid {
         }
     }
 
+    /// Scrolls the rectangular box `[top..=bottom] x [left..=right]` up by `count` rows.
+    pub(crate) fn scroll_up_box(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+        count: usize,
+        bg: PackedColor,
+    ) {
+        let top = top.min(self.viewport_rows.saturating_sub(1));
+        let bottom = bottom.min(self.viewport_rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || count == 0 {
+            return;
+        }
+        let region_h = bottom - top + 1;
+        let n = count.min(region_h);
+        self.content_epoch += 1;
+        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
+        let hist = self.history_len();
+
+        for offset in 0..region_h {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let dst_idx = hist + top + offset;
+            if offset + n < region_h {
+                let src_idx = hist + top + offset + n;
+                self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
+                self.rows[src_idx].clear_wide_overlap_at(left, bg, &mut self.extras);
+                self.rows[src_idx].clear_wide_overlap_at(right, bg, &mut self.extras);
+                for col in left..=right {
+                    let cell = self.rows[src_idx].cells()[col];
+                    self.rows[src_idx].cells_mut()[col] = blank;
+                    self.rows[dst_idx].cells_mut()[col] = cell;
+                }
+                self.rows[src_idx].set_soft_wrapped(false);
+                self.rows[src_idx].set_generation(epoch);
+            } else {
+                self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
+            }
+            self.rows[dst_idx].set_soft_wrapped(false);
+            self.rows[dst_idx].set_generation(epoch);
+            self.dirty.mark_row(top + offset);
+        }
+    }
+
+    /// Scrolls the rectangular box `[top..=bottom] x [left..=right]` down by `count` rows.
+    pub(crate) fn scroll_down_box(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+        count: usize,
+        bg: PackedColor,
+    ) {
+        let top = top.min(self.viewport_rows.saturating_sub(1));
+        let bottom = bottom.min(self.viewport_rows.saturating_sub(1));
+        let right = right.min(self.cols.saturating_sub(1));
+        if top > bottom || left > right || count == 0 {
+            return;
+        }
+        let region_h = bottom - top + 1;
+        let n = count.min(region_h);
+        self.content_epoch += 1;
+        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
+        let hist = self.history_len();
+
+        for offset in (0..region_h).rev() {
+            self.damage_epoch += 1;
+            let epoch = self.damage_epoch;
+            let dst_idx = hist + top + offset;
+            if offset >= n {
+                let src_idx = hist + top + offset - n;
+                self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
+                self.rows[src_idx].clear_wide_overlap_at(left, bg, &mut self.extras);
+                self.rows[src_idx].clear_wide_overlap_at(right, bg, &mut self.extras);
+                for col in left..=right {
+                    let cell = self.rows[src_idx].cells()[col];
+                    self.rows[src_idx].cells_mut()[col] = blank;
+                    self.rows[dst_idx].cells_mut()[col] = cell;
+                }
+                self.rows[src_idx].set_soft_wrapped(false);
+                self.rows[src_idx].set_generation(epoch);
+            } else {
+                self.rows[dst_idx].clear_range(left..(right + 1), bg, &mut self.extras);
+            }
+            self.rows[dst_idx].set_soft_wrapped(false);
+            self.rows[dst_idx].set_generation(epoch);
+            self.dirty.mark_row(top + offset);
+        }
+    }
+
+    /// Inserts `count` blank cells (`ICH`) at `(vp_row, col)`, shifting remaining cells right
+    /// up to `right_margin` (inclusive).
+    pub(crate) fn insert_cells_in_margin(
+        &mut self,
+        vp_row: usize,
+        col: usize,
+        right_margin: usize,
+        count: usize,
+        bg: PackedColor,
+    ) {
+        let right = right_margin.min(self.cols.saturating_sub(1));
+        if vp_row >= self.viewport_rows || col > right || count == 0 {
+            return;
+        }
+        let end = right + 1;
+        let n = count.min(end - col);
+        let hist = self.history_len();
+        self.damage_epoch += 1;
+        self.content_epoch += 1;
+        let epoch = self.damage_epoch;
+        let row = &mut self.rows[hist + vp_row];
+
+        row.clear_wide_overlap_at(col, bg, &mut self.extras);
+        let shift_end = end - n;
+        if shift_end > col && row.cells()[shift_end - 1].is_wide_lead() {
+            row.clear_wide_overlap_at(shift_end - 1, bg, &mut self.extras);
+        }
+        if row.may_have_extras() {
+            for cell in &mut row.cells_mut()[shift_end..end] {
+                if cell.extra_id != 0 {
+                    self.extras.free(cell.extra_id);
+                    cell.extra_id = 0;
+                }
+            }
+        }
+
+        row.cells_mut().copy_within(col..shift_end, col + n);
+        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
+        row.cells_mut()[col..col + n].fill(blank);
+        row.set_soft_wrapped(false);
+        row.set_generation(epoch);
+        self.dirty.mark_row(vp_row);
+    }
+
+    /// Deletes `count` cells (`DCH`) at `(vp_row, col)`, shifting remaining cells left
+    /// within `col..=right_margin`.
+    pub(crate) fn delete_cells_in_margin(
+        &mut self,
+        vp_row: usize,
+        col: usize,
+        right_margin: usize,
+        count: usize,
+        bg: PackedColor,
+    ) {
+        let right = right_margin.min(self.cols.saturating_sub(1));
+        if vp_row >= self.viewport_rows || col > right || count == 0 {
+            return;
+        }
+        let end = right + 1;
+        let n = count.min(end - col);
+        let hist = self.history_len();
+        self.damage_epoch += 1;
+        self.content_epoch += 1;
+        let epoch = self.damage_epoch;
+        let row = &mut self.rows[hist + vp_row];
+
+        row.clear_wide_overlap_at(col, bg, &mut self.extras);
+        row.clear_wide_overlap_at(col + n - 1, bg, &mut self.extras);
+        if row.may_have_extras() {
+            for cell in &mut row.cells_mut()[col..col + n] {
+                if cell.extra_id != 0 {
+                    self.extras.free(cell.extra_id);
+                    cell.extra_id = 0;
+                }
+            }
+        }
+
+        if end == self.cols && end > 0 && row.cells()[end - 1].is_wrap_spacer() {
+            row.cells_mut()[end - 1] = Cell::BLANK;
+        }
+        row.cells_mut().copy_within(col + n..end, col);
+        let blank = Cell::new(' ', PackedColor::Default, bg, CellFlags::empty());
+        row.cells_mut()[end - n..end].fill(blank);
+        row.set_soft_wrapped(false);
+        row.set_generation(epoch);
+        self.dirty.mark_row(vp_row);
+    }
+
     /// Inserts `count` blank cells (`ICH`) at `(vp_row, col)`, shifting remaining cells right.
     pub(crate) fn insert_cells(
         &mut self,

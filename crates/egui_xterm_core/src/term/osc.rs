@@ -21,6 +21,7 @@ pub(crate) struct OscContext<'a> {
     pub outgoing: &'a mut Vec<u8>,
     pub events: &'a mut Vec<TerminalEvent>,
     pub palette_changed: &'a mut bool,
+    pub osc99_pending_title: &'a mut Option<String>,
     #[cfg(feature = "hyperlinks")]
     pub hyperlink_pool: &'a mut HyperlinkPool,
     #[cfg(feature = "hyperlinks")]
@@ -331,6 +332,7 @@ pub(crate) fn handle_osc(params: &[&[u8]], terminator: OscTerminator, ctx: &mut 
                 *ctx.active_hyperlink = None;
             }
         }
+        9 => handle_osc9(params, ctx),
         10..=12 => {
             for (offset, &spec) in params.iter().skip(1).enumerate() {
                 let target = cmd as usize + offset;
@@ -402,6 +404,24 @@ pub(crate) fn handle_osc(params: &[&[u8]], terminator: OscTerminator, ctx: &mut 
             ctx.palette_overrides.cursor = false;
             *ctx.palette_changed = true;
         }
+        22 => {
+            if let Some(shape) = join_osc_tail(params, 1) {
+                ctx.events.push(TerminalEvent::MouseShape(shape));
+            }
+        }
+        99 => handle_osc99(params, ctx),
+        777 => {
+            if params.len() >= 3
+                && params[1] == b"notify"
+                && let Ok(title) = std::str::from_utf8(params[2])
+            {
+                let body = join_osc_tail(params, 3).unwrap_or_default();
+                ctx.events.push(TerminalEvent::Notification {
+                    title: title.to_owned(),
+                    body,
+                });
+            }
+        }
         52 if params.len() >= 3 => {
             let selection = parse_clipboard_selection(params[1]);
             let payload = params[2];
@@ -420,5 +440,91 @@ pub(crate) fn handle_osc(params: &[&[u8]], terminator: OscTerminator, ctx: &mut 
             }
         }
         _ => {}
+    }
+}
+
+fn handle_osc9(params: &[&[u8]], ctx: &mut OscContext<'_>) {
+    if params.len() >= 3 && params[1] == b"4" {
+        if let Ok(st_str) = std::str::from_utf8(params[2])
+            && let Ok(state) = st_str.parse::<u8>()
+        {
+            let progress = params
+                .get(3)
+                .and_then(|p| std::str::from_utf8(p).ok())
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(0)
+                .min(100);
+            ctx.events.push(TerminalEvent::Progress { state, progress });
+        }
+        return;
+    }
+    if params.len() >= 2
+        && let Some(body) = join_osc_tail(params, 1)
+        && !body.is_empty()
+    {
+        ctx.events.push(TerminalEvent::Notification {
+            title: String::new(),
+            body,
+        });
+    }
+}
+
+fn handle_osc99(params: &[&[u8]], ctx: &mut OscContext<'_>) {
+    if params.len() < 3 {
+        return;
+    }
+    let mut part = "title";
+    let mut base64_encoded = false;
+    let mut done = true;
+
+    for kv in params[1].split(|&b| b == b':') {
+        if let Some(eq) = kv.iter().position(|&b| b == b'=') {
+            let k = &kv[..eq];
+            let v = &kv[eq + 1..];
+            match k {
+                b"p" => {
+                    if v == b"body" {
+                        part = "body";
+                    } else if v == b"title" {
+                        part = "title";
+                    }
+                }
+                b"e" => base64_encoded = v == b"1",
+                b"d" => done = v != b"0",
+                _ => {}
+            }
+        }
+    }
+
+    let raw_payload = join_osc_tail(params, 2);
+    let Some(raw) = raw_payload else {
+        return;
+    };
+    let text = if base64_encoded {
+        let Some(decoded) = decode_base64(raw.as_bytes()) else {
+            return;
+        };
+        let Ok(s) = String::from_utf8(decoded) else {
+            return;
+        };
+        s
+    } else {
+        raw
+    };
+
+    if part == "title" {
+        if !done {
+            *ctx.osc99_pending_title = Some(text);
+        } else {
+            *ctx.osc99_pending_title = None;
+            ctx.events.push(TerminalEvent::Notification {
+                title: text,
+                body: String::new(),
+            });
+        }
+    } else {
+        let title = ctx.osc99_pending_title.take().unwrap_or_default();
+        ctx.events
+            .push(TerminalEvent::Notification { title, body: text });
     }
 }

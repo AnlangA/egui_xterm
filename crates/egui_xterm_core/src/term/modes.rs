@@ -49,7 +49,7 @@ pub enum MouseProtocol {
     AnyEvent,
 }
 
-/// Wire encoding used for mouse reports (`?1005` / `?1006`).
+/// Wire encoding used for mouse reports (`?1005` / `?1006` / `?1016`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MouseEncoding {
@@ -60,6 +60,8 @@ pub enum MouseEncoding {
     Utf8,
     /// SGR extended decimal encoding (`CSI ? 1006 h`): `CSI < Cb ; Cx ; Cy M/m`.
     Sgr,
+    /// SGR-Pixels extended decimal encoding (`CSI ? 1016 h`): `CSI < Cb ; Px ; Py M/m`.
+    SgrPixels,
 }
 
 /// Complete ANSI and DEC private mode state for a [`Terminal`](super::Terminal).
@@ -102,6 +104,12 @@ pub struct Modes {
     pub bracketed_paste: bool,
     /// DEC `?2026`: synchronized output latched.
     pub sync_output: bool,
+    /// DEC `DECLRMM` (`CSI ? 69 h/l`): enable left/right margin mode (`DECSLRM`).
+    pub left_right_margin_mode: bool,
+    /// DEC `?2027`: UAX #29 grapheme clustering mode.
+    pub grapheme_clustering: bool,
+    /// DEC `?2031`: color scheme / theme change notification mode.
+    pub color_scheme_updates: bool,
     /// `DECKPAM` / `DECKPNM` (`ESC =` / `ESC >`): application keypad mode.
     pub app_keypad: bool,
 }
@@ -133,6 +141,9 @@ impl Modes {
             alt_scroll: false,
             bracketed_paste: false,
             sync_output: false,
+            left_right_margin_mode: false,
+            grapheme_clustering: true,
+            color_scheme_updates: false,
             app_keypad: false,
         }
     }
@@ -148,6 +159,9 @@ impl Modes {
         self.cursor_blink = default_blink;
         self.cursor_visible = true;
         self.sync_output = false;
+        self.left_right_margin_mode = false;
+        self.grapheme_clustering = true;
+        self.color_scheme_updates = false;
         self.app_keypad = false;
     }
 
@@ -164,6 +178,7 @@ impl Modes {
             12 => self.cursor_blink,
             25 => self.cursor_visible,
             47 | 1047 | 1049 => self.alt_screen,
+            69 => self.left_right_margin_mode,
             1000 => matches!(self.mouse_protocol, MouseProtocol::Normal),
             1002 => matches!(self.mouse_protocol, MouseProtocol::ButtonEvent),
             1003 => matches!(self.mouse_protocol, MouseProtocol::AnyEvent),
@@ -171,9 +186,12 @@ impl Modes {
             1005 => matches!(self.mouse_encoding, MouseEncoding::Utf8),
             1006 => matches!(self.mouse_encoding, MouseEncoding::Sgr),
             1007 => self.alt_scroll,
+            1016 => matches!(self.mouse_encoding, MouseEncoding::SgrPixels),
             1048 => return 2,
             2004 => self.bracketed_paste,
             2026 => self.sync_output,
+            2027 => self.grapheme_clustering,
+            2031 => self.color_scheme_updates,
             _ => return 0,
         };
         if is_set { 1 } else { 2 }

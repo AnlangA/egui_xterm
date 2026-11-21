@@ -48,5 +48,5 @@ pub use crate::term::{
     CursorShape, CursorSnapshot, CursorStyle, Modes, MouseButton, MouseEncoding, MouseEventKind,
     MouseInputEvent, MouseModifiers, MouseProtocol, PaletteOverrides, RenderSnapshot, SavedCursor,
     Selection, SelectionKind, SelectionMode, TabStops, Terminal, TerminalEvent, encode_mouse_event,
-    focus_event_bytes, format_paste_bytes,
+    encode_mouse_event_pixels, focus_event_bytes, format_paste_bytes,
 };

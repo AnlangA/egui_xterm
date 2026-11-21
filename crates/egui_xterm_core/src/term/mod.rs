@@ -1,6 +1,7 @@
 //! Core terminal state machine (`Terminal`), configuration, events, snapshots, and VT handlers.
 
 pub mod cursor;
+pub mod dcs;
 pub mod modes;
 pub mod mouse;
 pub mod osc;
@@ -33,13 +34,14 @@ use crate::grid::GridSnapshot;
 use crate::grid::reflow::{EvictionColPolicy, SelectionReflowInput};
 use crate::grid::{AbsLine, CellExtraTable, Grid, GridPoint, ReflowAnchors, Row, ScreenKind};
 use crate::parser::{C1Policy, CsiParams, DEFAULT_MAX_OSC_BYTES, OscTerminator, Parser, VtHandler};
+use crate::term::dcs::{DcsKind, DcsState, DecrqssState};
 use crate::term::osc::OscContext;
 
 pub use self::cursor::{Charset, CharsetSlots, Cursor, CursorAttrs, SavedCursor};
 pub use self::modes::{CursorShape, CursorStyle, Modes, MouseEncoding, MouseProtocol};
 pub use self::mouse::{
     MouseButton, MouseEventKind, MouseInputEvent, MouseModifiers, encode_mouse_event,
-    focus_event_bytes, format_paste_bytes,
+    encode_mouse_event_pixels, focus_event_bytes, format_paste_bytes,
 };
 pub use self::selection::{Selection, SelectionKind, SelectionMode};
 pub use self::tabs::TabStops;
@@ -138,6 +140,22 @@ pub enum TerminalEvent {
         /// Exit status code reported by the shell, if present and valid.
         exit_code: Option<i32>,
     },
+    /// Task progress indicator updated (`OSC 9 ; 4 ; <state> ; <progress>`).
+    Progress {
+        /// Progress state (`0` = hidden, `1` = normal, `2` = error, `3` = indeterminate, `4` = paused).
+        state: u8,
+        /// Percentage in `0..=100`.
+        progress: u8,
+    },
+    /// Desktop notification requested (`OSC 9`, `OSC 99`, or `OSC 777`).
+    Notification {
+        /// Notification title (may be empty for `OSC 9`).
+        title: String,
+        /// Notification body text.
+        body: String,
+    },
+    /// Pointer cursor shape requested (`OSC 22 ; <shape>`).
+    MouseShape(String),
 }
 
 /// Storage-agnostic inspection snapshot of a single visible cell.
@@ -395,16 +413,23 @@ pub struct Terminal {
     tabs: TabStops,
     scroll_top: usize,
     scroll_bottom: usize,
+    scroll_left: usize,
+    scroll_right: usize,
+    pixel_width: u16,
+    pixel_height: u16,
     palette: ColorScheme,
     palette_overrides: PaletteOverrides,
     extended_palette: [Option<[u8; 3]>; 240],
     title: String,
     icon_name: String,
+    title_stack: Vec<(Option<String>, Option<String>)>,
     cwd: Option<String>,
     hyperlink_pool: HyperlinkPool,
     selection: Option<Selection>,
     outgoing: Vec<u8>,
     events: Vec<TerminalEvent>,
+    dcs_state: DcsState,
+    osc99_pending_title: Option<String>,
     sync_started_at: Option<f64>,
     last_time_secs: Option<f64>,
     latched_frame: Option<LatchedFrame>,
@@ -461,16 +486,23 @@ impl Terminal {
             tabs: TabStops::new(cols_u),
             scroll_top: 0,
             scroll_bottom: rows_u - 1,
+            scroll_left: 0,
+            scroll_right: cols_u - 1,
+            pixel_width: 0,
+            pixel_height: 0,
             palette,
             palette_overrides: PaletteOverrides::default(),
             extended_palette: [None; 240],
             title: String::new(),
             icon_name: String::new(),
+            title_stack: Vec::new(),
             cwd: None,
             hyperlink_pool: HyperlinkPool::new(),
             selection: None,
             outgoing: Vec::new(),
             events: Vec::new(),
+            dcs_state: DcsState::default(),
+            osc99_pending_title: None,
             sync_started_at: None,
             last_time_secs: None,
             latched_frame: None,
@@ -738,12 +770,27 @@ impl Terminal {
         }
         self.scroll_top = 0;
         self.scroll_bottom = new_rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = new_cols - 1;
         self.last_written = None;
         self.last_graphic = None;
         #[cfg(feature = "hyperlinks")]
         self.refresh_implicit_hyperlinks();
         #[cfg(feature = "shell-integration")]
         self.shell_integration.sync_with_grid(&self.primary);
+    }
+
+    /// Updates the reported physical pixel dimensions of the terminal viewport for `XTWINOPS`
+    /// (`CSI 14 t` / `CSI 16 t`).
+    pub fn set_pixel_size(&mut self, width: u16, height: u16) {
+        self.pixel_width = width;
+        self.pixel_height = height;
+    }
+
+    /// Returns the last reported physical pixel dimensions `(width, height)`, or `(0, 0)`.
+    #[must_use]
+    pub const fn pixel_size(&self) -> (u16, u16) {
+        (self.pixel_width, self.pixel_height)
     }
 
     /// Returns the terminal dimensions as `(cols, rows)`.
@@ -1030,6 +1077,18 @@ impl Terminal {
             }
         }
         self.config.theme = theme;
+        if self.modes.color_scheme_updates {
+            let code = self.color_scheme_dsr_code();
+            let mut reply = String::with_capacity(12);
+            let _ = write!(reply, "\x1b[?997;{code}n");
+            self.outgoing.extend_from_slice(reply.as_bytes());
+        }
+    }
+
+    const fn color_scheme_dsr_code(&self) -> u8 {
+        let [r, g, b] = self.palette.background;
+        let luma = (r as u32) * 299 + (g as u32) * 587 + (b as u32) * 114;
+        if luma < 128_000 { 1 } else { 2 }
     }
 
     /// Returns explicit `OSC 4/10/11/12` override flags for the base palette.
@@ -1351,6 +1410,18 @@ impl Terminal {
     #[must_use]
     pub fn encode_mouse_event(&self, ev: MouseInputEvent) -> Option<Vec<u8>> {
         encode_mouse_event(&self.modes, ev)
+    }
+
+    /// Encodes a [`MouseInputEvent`] with pixel coordinates `(pixel_x, pixel_y)` for
+    /// `DEC ? 1016` SGR-Pixels mode, falling back to grid encoding for other modes.
+    #[must_use]
+    pub fn encode_mouse_event_pixels(
+        &self,
+        ev: MouseInputEvent,
+        pixel_x: u32,
+        pixel_y: u32,
+    ) -> Option<Vec<u8>> {
+        encode_mouse_event_pixels(&self.modes, ev, pixel_x, pixel_y)
     }
 
     /// Formats pasted text for transmission according to DEC `?2004` bracketed paste mode.
@@ -1762,16 +1833,23 @@ impl Terminal {
             tabs,
             scroll_top,
             scroll_bottom,
+            scroll_left: 0,
+            scroll_right: actual_cols - 1,
+            pixel_width: 0,
+            pixel_height: 0,
             palette: snapshot.palette,
             palette_overrides: snapshot.palette_overrides,
             extended_palette,
             title: snapshot.title,
             icon_name: snapshot.icon_name,
+            title_stack: Vec::new(),
             cwd: snapshot.cwd,
             hyperlink_pool,
             selection,
             outgoing: Vec::new(),
             events: Vec::new(),
+            dcs_state: DcsState::default(),
+            osc99_pending_title: None,
             sync_started_at: None,
             last_time_secs: None,
             latched_frame: None,
@@ -1986,7 +2064,11 @@ impl Terminal {
             } else {
                 s.row.min(rows - 1)
             };
-            self.cursor.col = s.col.min(cols - 1);
+            self.cursor.col = if self.modes.origin_mode {
+                s.col.clamp(self.scroll_left, self.scroll_right)
+            } else {
+                s.col.min(cols - 1)
+            };
             self.cursor.pending_wrap = s.pending_wrap && self.cursor.col == cols - 1;
         } else {
             self.cursor.attrs.reset_all();
@@ -1996,7 +2078,11 @@ impl Terminal {
             } else {
                 0
             };
-            self.cursor.col = 0;
+            self.cursor.col = if self.modes.origin_mode {
+                self.scroll_left
+            } else {
+                0
+            };
             self.cursor.pending_wrap = false;
         }
         self.last_written = None;
@@ -2022,6 +2108,8 @@ impl Terminal {
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.alternate.viewport_rows() - 1;
+        self.scroll_left = 0;
+        self.scroll_right = self.alternate.cols() - 1;
         self.last_written = None;
         self.last_graphic = None;
     }
@@ -2039,6 +2127,8 @@ impl Terminal {
         let cols = self.primary.cols();
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = cols - 1;
 
         if let Some(backup) = self.alt_cursor_backup.take() {
             self.cursor = backup;
@@ -2054,24 +2144,81 @@ impl Terminal {
         self.last_graphic = None;
     }
 
-    fn linefeed_internal(&mut self, apply_lnm: bool) {
-        self.cursor.pending_wrap = false;
-        if apply_lnm && self.modes.linefeed_newline {
-            self.cursor.col = 0;
-        }
-        let rows = self.active_grid().viewport_rows();
+    fn has_horizontal_margins(&self) -> bool {
+        let cols = self.active_grid().cols();
+        self.scroll_left > 0 || self.scroll_right + 1 < cols
+    }
+
+    fn scroll_up_in_margins(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        count: usize,
+        push_to_history: bool,
+    ) {
         let bg = self.cursor.attrs.bg;
-        if self.cursor.row == self.scroll_bottom {
-            let top = self.scroll_top;
-            let bottom = self.scroll_bottom;
+        if self.has_horizontal_margins() {
+            let left = self.scroll_left;
+            let right = self.scroll_right;
             self.active_grid_mut()
-                .scroll_up_region(top, bottom, 1, bg, true);
+                .scroll_up_box(top, bottom, left, right, count, bg);
             #[cfg(feature = "shell-integration")]
             if !self.modes.alt_screen {
                 self.shell_integration
-                    .on_primary_scroll_up(&self.primary, top, bottom, rows);
+                    .on_primary_rows_mutated(&self.primary, top, bottom);
             }
-            self.shift_selection_after_scroll_if_full(top, bottom);
+        } else {
+            let rows = self.active_grid().viewport_rows();
+            self.active_grid_mut()
+                .scroll_up_region(top, bottom, count, bg, push_to_history);
+            #[cfg(feature = "shell-integration")]
+            if !self.modes.alt_screen {
+                if push_to_history {
+                    self.shell_integration
+                        .on_primary_scroll_up(&self.primary, top, bottom, rows);
+                } else {
+                    self.shell_integration
+                        .on_primary_rows_mutated(&self.primary, top, bottom);
+                }
+            }
+            if push_to_history {
+                self.shift_selection_after_scroll_if_full(top, bottom);
+            }
+        }
+    }
+
+    fn scroll_down_in_margins(&mut self, top: usize, bottom: usize, count: usize) {
+        let bg = self.cursor.attrs.bg;
+        if self.has_horizontal_margins() {
+            let left = self.scroll_left;
+            let right = self.scroll_right;
+            self.active_grid_mut()
+                .scroll_down_box(top, bottom, left, right, count, bg);
+        } else {
+            self.active_grid_mut()
+                .scroll_down_region(top, bottom, count, bg);
+        }
+        #[cfg(feature = "shell-integration")]
+        if !self.modes.alt_screen {
+            self.shell_integration
+                .on_primary_rows_mutated(&self.primary, top, bottom);
+        }
+    }
+
+    fn linefeed_internal(&mut self, apply_lnm: bool) {
+        self.cursor.pending_wrap = false;
+        if apply_lnm && self.modes.linefeed_newline {
+            self.cursor.col = if self.cursor.col >= self.scroll_left {
+                self.scroll_left
+            } else {
+                0
+            };
+        }
+        let rows = self.active_grid().viewport_rows();
+        if self.cursor.row == self.scroll_bottom {
+            let top = self.scroll_top;
+            let bottom = self.scroll_bottom;
+            self.scroll_up_in_margins(top, bottom, 1, true);
         } else if self.cursor.row + 1 < rows {
             self.cursor.row += 1;
         }
@@ -2112,17 +2259,10 @@ impl Terminal {
 
     fn reverse_index(&mut self) {
         self.cursor.pending_wrap = false;
-        let bg = self.cursor.attrs.bg;
         if self.cursor.row == self.scroll_top {
             let top = self.scroll_top;
             let bottom = self.scroll_bottom;
-            self.active_grid_mut()
-                .scroll_down_region(top, bottom, 1, bg);
-            #[cfg(feature = "shell-integration")]
-            if !self.modes.alt_screen {
-                self.shell_integration
-                    .on_primary_rows_mutated(&self.primary, top, bottom);
-            }
+            self.scroll_down_in_margins(top, bottom, 1);
         } else if self.cursor.row > 0 {
             self.cursor.row -= 1;
         }
@@ -2345,34 +2485,49 @@ impl Terminal {
 
     fn write_new_cell(&mut self, ch: char, raw_width: usize, is_ri: bool) {
         let cols = self.active_grid().cols();
+        let right_margin = if self.cursor.col <= self.scroll_right {
+            self.scroll_right
+        } else {
+            cols - 1
+        };
+        let left_margin = self.scroll_left;
         let w = if cols >= 2 && raw_width >= 2 { 2 } else { 1 };
         let bg = self.cursor.attrs.bg;
 
         if self.cursor.pending_wrap {
             if self.modes.auto_wrap {
                 let row = self.cursor.row;
-                self.active_grid_mut().set_row_soft_wrapped(row, true);
+                if right_margin == cols - 1 {
+                    self.active_grid_mut().set_row_soft_wrapped(row, true);
+                }
                 self.linefeed_internal(false);
-                self.cursor.col = 0;
+                self.cursor.col = left_margin;
             }
             self.cursor.pending_wrap = false;
         }
 
-        if w == 2 && self.cursor.col + 1 >= cols {
+        if w == 2 && self.cursor.col + 1 > right_margin {
             if self.modes.auto_wrap {
                 let row = self.cursor.row;
-                self.active_grid_mut().set_wrap_spacer(row, bg);
+                if right_margin == cols - 1 {
+                    self.active_grid_mut().set_wrap_spacer(row, bg);
+                }
                 self.linefeed_internal(false);
-                self.cursor.col = 0;
+                self.cursor.col = left_margin;
             } else {
-                self.cursor.col = cols.saturating_sub(2);
+                self.cursor.col = right_margin.saturating_sub(1);
             }
         }
 
         if self.modes.insert_mode {
             let r = self.cursor.row;
             let c = self.cursor.col;
-            self.active_grid_mut().insert_cells(r, c, w, bg);
+            if right_margin + 1 < cols && c <= right_margin {
+                self.active_grid_mut()
+                    .insert_cells_in_margin(r, c, right_margin, w, bg);
+            } else {
+                self.active_grid_mut().insert_cells(r, c, w, bg);
+            }
             #[cfg(feature = "shell-integration")]
             if !self.modes.alt_screen {
                 self.shell_integration
@@ -2431,10 +2586,10 @@ impl Terminal {
             combining: Vec::new(),
         });
 
-        if col + w < cols {
+        if col + w <= right_margin {
             self.cursor.col = col + w;
         } else {
-            self.cursor.col = cols - 1;
+            self.cursor.col = right_margin;
             if self.modes.auto_wrap {
                 self.cursor.pending_wrap = true;
             }
@@ -2456,6 +2611,8 @@ impl Terminal {
                 }
                 self.scroll_top = 0;
                 self.scroll_bottom = rows - 1;
+                self.scroll_left = 0;
+                self.scroll_right = self.active_grid().cols() - 1;
                 self.cursor.row = 0;
                 self.cursor.col = 0;
                 self.cursor.pending_wrap = false;
@@ -2469,7 +2626,7 @@ impl Terminal {
             6 => {
                 self.modes.origin_mode = enable;
                 self.cursor.row = if enable { self.scroll_top } else { 0 };
-                self.cursor.col = 0;
+                self.cursor.col = if enable { self.scroll_left } else { 0 };
                 self.cursor.pending_wrap = false;
             }
             7 => {
@@ -2495,6 +2652,13 @@ impl Terminal {
                     self.enter_alt_screen(false, false);
                 } else {
                     self.exit_alt_screen(false, false);
+                }
+            }
+            69 => {
+                self.modes.left_right_margin_mode = enable;
+                if !enable {
+                    self.scroll_left = 0;
+                    self.scroll_right = self.active_grid().cols() - 1;
                 }
             }
             1000 => {
@@ -2534,6 +2698,13 @@ impl Terminal {
                 };
             }
             1007 => self.modes.alt_scroll = enable,
+            1016 => {
+                self.modes.mouse_encoding = if enable {
+                    MouseEncoding::SgrPixels
+                } else {
+                    MouseEncoding::Default
+                };
+            }
             1047 => {
                 if enable {
                     self.enter_alt_screen(true, false);
@@ -2563,6 +2734,8 @@ impl Terminal {
                     self.exit_sync_mode();
                 }
             }
+            2027 => self.modes.grapheme_clustering = enable,
+            2031 => self.modes.color_scheme_updates = enable,
             _ => {}
         }
     }
@@ -2583,8 +2756,13 @@ impl Terminal {
             self.active_grid_mut().mark_all_dirty();
         }
         let rows = self.active_grid().viewport_rows();
+        let cols = self.active_grid().cols();
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = cols - 1;
+        self.scroll_left = 0;
+        self.scroll_right = cols - 1;
         self.cursor.attrs.reset_all();
         self.cursor.charsets = CharsetSlots::default();
         self.cursor.style = CursorStyle {
@@ -2598,6 +2776,82 @@ impl Terminal {
         self.last_graphic = None;
     }
 
+    fn handle_xtwinops(&mut self, params: &CsiParams, cols: usize, rows: usize) {
+        const MAX_TITLE_STACK: usize = 16;
+        match params.get_or(0, 0) {
+            14 => {
+                let (w, h) = if self.pixel_width > 0 && self.pixel_height > 0 {
+                    (
+                        usize::from(self.pixel_width),
+                        usize::from(self.pixel_height),
+                    )
+                } else {
+                    (cols * 8, rows * 16)
+                };
+                let mut reply = String::with_capacity(24);
+                let _ = write!(reply, "\x1b[4;{h};{w}t");
+                self.outgoing.extend_from_slice(reply.as_bytes());
+            }
+            16 => {
+                let (cw, ch) = if self.pixel_width > 0 && self.pixel_height > 0 {
+                    (
+                        (usize::from(self.pixel_width) / cols.max(1)).max(1),
+                        (usize::from(self.pixel_height) / rows.max(1)).max(1),
+                    )
+                } else {
+                    (8, 16)
+                };
+                let mut reply = String::with_capacity(24);
+                let _ = write!(reply, "\x1b[6;{ch};{cw}t");
+                self.outgoing.extend_from_slice(reply.as_bytes());
+            }
+            18 => {
+                let mut reply = String::with_capacity(24);
+                let _ = write!(reply, "\x1b[8;{rows};{cols}t");
+                self.outgoing.extend_from_slice(reply.as_bytes());
+            }
+            22 => {
+                let which = params.get_or(1, 0);
+                let icon = if matches!(which, 0 | 1) {
+                    Some(self.icon_name.clone())
+                } else {
+                    None
+                };
+                let title = if matches!(which, 0 | 2) {
+                    Some(self.title.clone())
+                } else {
+                    None
+                };
+                if icon.is_some() || title.is_some() {
+                    if self.title_stack.len() >= MAX_TITLE_STACK {
+                        self.title_stack.remove(0);
+                    }
+                    self.title_stack.push((icon, title));
+                }
+            }
+            23 => {
+                let which = params.get_or(1, 0);
+                if let Some((icon, title)) = self.title_stack.pop() {
+                    if matches!(which, 0 | 1)
+                        && let Some(prev_icon) = icon
+                        && self.icon_name != prev_icon
+                    {
+                        self.icon_name.clone_from(&prev_icon);
+                        self.events.push(TerminalEvent::IconNameChanged(prev_icon));
+                    }
+                    if matches!(which, 0 | 2)
+                        && let Some(prev_title) = title
+                        && self.title != prev_title
+                    {
+                        self.title.clone_from(&prev_title);
+                        self.events.push(TerminalEvent::TitleChanged(prev_title));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn full_reset(&mut self) {
         self.exit_sync_mode();
         self.modes = Modes::with_default_blink(self.config.default_cursor_blink);
@@ -2608,6 +2862,10 @@ impl Terminal {
         self.tabs.reset(cols);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = cols - 1;
+        self.scroll_left = 0;
+        self.scroll_right = cols - 1;
         self.cursor = Cursor {
             style: CursorStyle {
                 shape: self.config.default_cursor_shape,
@@ -2623,6 +2881,8 @@ impl Terminal {
         self.extended_palette.fill(None);
         self.title.clear();
         self.icon_name.clear();
+        self.title_stack.clear();
+        self.osc99_pending_title = None;
         self.cwd = None;
         self.hyperlink_pool.clear();
         #[cfg(feature = "hyperlinks")]
@@ -2654,6 +2914,7 @@ impl VtHandler for Terminal {
             || self.cursor.charsets.active() != Charset::Ascii
             || self.cursor.attrs.underline_color.is_some()
             || self.cursor.attrs.hyperlink_id.is_some()
+            || self.has_horizontal_margins()
         {
             for &b in bytes {
                 self.print_scalar(char::from(b));
@@ -2794,14 +3055,22 @@ impl VtHandler for Terminal {
             0x0A..=0x0C => self.linefeed_internal(true),
             0x0D => {
                 self.cursor.pending_wrap = false;
-                self.cursor.col = 0;
+                self.cursor.col = if self.cursor.col >= self.scroll_left {
+                    self.scroll_left
+                } else {
+                    0
+                };
             }
             0x0E => self.cursor.charsets.gl_is_g1 = true,
             0x0F => self.cursor.charsets.gl_is_g1 = false,
             0x84 => self.linefeed_internal(false),
             0x85 => {
                 self.cursor.pending_wrap = false;
-                self.cursor.col = 0;
+                self.cursor.col = if self.cursor.col >= self.scroll_left {
+                    self.scroll_left
+                } else {
+                    0
+                };
                 self.linefeed_internal(false);
             }
             0x88 => self.tabs.set(self.cursor.col),
@@ -2810,14 +3079,36 @@ impl VtHandler for Terminal {
         }
     }
 
-    fn hook(&mut self, _params: &CsiParams, _intermediates: &[u8], _action: u8) {
+    fn hook(&mut self, params: &CsiParams, intermediates: &[u8], action: u8) {
         self.last_written = None;
         self.last_graphic = None;
+        self.dcs_state.start(params, intermediates, action);
     }
 
-    fn put(&mut self, _byte: u8) {}
+    fn put(&mut self, byte: u8) {
+        self.dcs_state.push(byte);
+    }
 
-    fn unhook(&mut self) {}
+    fn unhook(&mut self) {
+        let Some((kind, payload)) = self.dcs_state.take() else {
+            return;
+        };
+        match kind {
+            DcsKind::Xtgettcap => dcs::handle_xtgettcap(&payload, &mut self.outgoing),
+            DcsKind::Decrqss => {
+                let state = DecrqssState {
+                    attrs: &self.cursor.attrs,
+                    scroll_top: self.scroll_top,
+                    scroll_bottom: self.scroll_bottom,
+                    scroll_left: self.scroll_left,
+                    scroll_right: self.scroll_right,
+                    left_right_margin_mode: self.modes.left_right_margin_mode,
+                    cursor_style: self.cursor.style,
+                };
+                dcs::handle_decrqss(&payload, &state, &mut self.outgoing);
+            }
+        }
+    }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], terminator: OscTerminator) {
         self.last_written = None;
@@ -2852,6 +3143,7 @@ impl VtHandler for Terminal {
             outgoing: &mut self.outgoing,
             events: &mut self.events,
             palette_changed: &mut palette_changed,
+            osc99_pending_title: &mut self.osc99_pending_title,
             #[cfg(feature = "hyperlinks")]
             hyperlink_pool: &mut self.hyperlink_pool,
             #[cfg(feature = "hyperlinks")]
@@ -2905,12 +3197,22 @@ impl VtHandler for Terminal {
                 }
                 b'C' => {
                     let n = usize::from(params.get_nonzero_or(0, 1));
-                    self.cursor.col = (self.cursor.col + n).min(cols - 1);
+                    let max_col = if self.cursor.col <= self.scroll_right {
+                        self.scroll_right
+                    } else {
+                        cols - 1
+                    };
+                    self.cursor.col = (self.cursor.col + n).min(max_col);
                     self.cursor.pending_wrap = false;
                 }
                 b'D' => {
                     let n = usize::from(params.get_nonzero_or(0, 1));
-                    self.cursor.col = self.cursor.col.saturating_sub(n);
+                    let min_col = if self.cursor.col >= self.scroll_left {
+                        self.scroll_left
+                    } else {
+                        0
+                    };
+                    self.cursor.col = self.cursor.col.saturating_sub(n).max(min_col);
                     self.cursor.pending_wrap = false;
                 }
                 b'E' => {
@@ -2921,7 +3223,11 @@ impl VtHandler for Terminal {
                         rows - 1
                     };
                     self.cursor.row = (self.cursor.row + n).min(max_row);
-                    self.cursor.col = 0;
+                    self.cursor.col = if self.cursor.col >= self.scroll_left {
+                        self.scroll_left
+                    } else {
+                        0
+                    };
                     self.cursor.pending_wrap = false;
                 }
                 b'F' => {
@@ -2932,12 +3238,20 @@ impl VtHandler for Terminal {
                         0
                     };
                     self.cursor.row = self.cursor.row.saturating_sub(n).max(min_row);
-                    self.cursor.col = 0;
+                    self.cursor.col = if self.cursor.col >= self.scroll_left {
+                        self.scroll_left
+                    } else {
+                        0
+                    };
                     self.cursor.pending_wrap = false;
                 }
                 b'G' | b'`' => {
                     let c = usize::from(params.get_nonzero_or(0, 1));
-                    self.cursor.col = (c - 1).min(cols - 1);
+                    self.cursor.col = if self.modes.origin_mode {
+                        (self.scroll_left + c - 1).min(self.scroll_right)
+                    } else {
+                        (c - 1).min(cols - 1)
+                    };
                     self.cursor.pending_wrap = false;
                 }
                 b'd' => {
@@ -2957,14 +3271,24 @@ impl VtHandler for Terminal {
                     } else {
                         (r - 1).min(rows - 1)
                     };
-                    self.cursor.col = (c - 1).min(cols - 1);
+                    self.cursor.col = if self.modes.origin_mode {
+                        (self.scroll_left + c - 1).min(self.scroll_right)
+                    } else {
+                        (c - 1).min(cols - 1)
+                    };
                     self.cursor.pending_wrap = false;
                 }
                 b'@' => {
                     let n = usize::from(params.get_nonzero_or(0, 1));
                     let r = self.cursor.row;
                     let c = self.cursor.col;
-                    self.active_grid_mut().insert_cells(r, c, n, bg);
+                    if self.has_horizontal_margins() && c <= self.scroll_right {
+                        let right = self.scroll_right;
+                        self.active_grid_mut()
+                            .insert_cells_in_margin(r, c, right, n, bg);
+                    } else {
+                        self.active_grid_mut().insert_cells(r, c, n, bg);
+                    }
                     #[cfg(feature = "shell-integration")]
                     if !self.modes.alt_screen {
                         self.shell_integration
@@ -2976,7 +3300,13 @@ impl VtHandler for Terminal {
                     let n = usize::from(params.get_nonzero_or(0, 1));
                     let r = self.cursor.row;
                     let c = self.cursor.col;
-                    self.active_grid_mut().delete_cells(r, c, n, bg);
+                    if self.has_horizontal_margins() && c <= self.scroll_right {
+                        let right = self.scroll_right;
+                        self.active_grid_mut()
+                            .delete_cells_in_margin(r, c, right, n, bg);
+                    } else {
+                        self.active_grid_mut().delete_cells(r, c, n, bg);
+                    }
                     #[cfg(feature = "shell-integration")]
                     if !self.modes.alt_screen {
                         self.shell_integration
@@ -2985,39 +3315,40 @@ impl VtHandler for Terminal {
                     self.cursor.pending_wrap = false;
                 }
                 b'L' => {
-                    if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom {
+                    if self.cursor.row >= self.scroll_top
+                        && self.cursor.row <= self.scroll_bottom
+                        && (!self.has_horizontal_margins()
+                            || (self.cursor.col >= self.scroll_left
+                                && self.cursor.col <= self.scroll_right))
+                    {
                         let n = usize::from(params.get_nonzero_or(0, 1));
                         let r = self.cursor.row;
                         let bottom = self.scroll_bottom;
-                        self.active_grid_mut().scroll_down_region(r, bottom, n, bg);
-                        #[cfg(feature = "shell-integration")]
-                        if !self.modes.alt_screen {
-                            self.shell_integration.on_primary_rows_mutated(
-                                &self.primary,
-                                r,
-                                bottom,
-                            );
-                        }
-                        self.cursor.col = 0;
+                        self.scroll_down_in_margins(r, bottom, n);
+                        self.cursor.col = if self.has_horizontal_margins() {
+                            self.scroll_left
+                        } else {
+                            0
+                        };
                         self.cursor.pending_wrap = false;
                     }
                 }
                 b'M' => {
-                    if self.cursor.row >= self.scroll_top && self.cursor.row <= self.scroll_bottom {
+                    if self.cursor.row >= self.scroll_top
+                        && self.cursor.row <= self.scroll_bottom
+                        && (!self.has_horizontal_margins()
+                            || (self.cursor.col >= self.scroll_left
+                                && self.cursor.col <= self.scroll_right))
+                    {
                         let n = usize::from(params.get_nonzero_or(0, 1));
                         let r = self.cursor.row;
                         let bottom = self.scroll_bottom;
-                        self.active_grid_mut()
-                            .scroll_up_region(r, bottom, n, bg, false);
-                        #[cfg(feature = "shell-integration")]
-                        if !self.modes.alt_screen {
-                            self.shell_integration.on_primary_rows_mutated(
-                                &self.primary,
-                                r,
-                                bottom,
-                            );
-                        }
-                        self.cursor.col = 0;
+                        self.scroll_up_in_margins(r, bottom, n, false);
+                        self.cursor.col = if self.has_horizontal_margins() {
+                            self.scroll_left
+                        } else {
+                            0
+                        };
                         self.cursor.pending_wrap = false;
                     }
                 }
@@ -3100,30 +3431,13 @@ impl VtHandler for Terminal {
                     let n = usize::from(params.get_nonzero_or(0, 1));
                     let top = self.scroll_top;
                     let bottom = self.scroll_bottom;
-                    self.active_grid_mut()
-                        .scroll_up_region(top, bottom, n, bg, true);
-                    #[cfg(feature = "shell-integration")]
-                    if !self.modes.alt_screen {
-                        self.shell_integration.on_primary_scroll_up(
-                            &self.primary,
-                            top,
-                            bottom,
-                            rows,
-                        );
-                    }
-                    self.shift_selection_after_scroll_if_full(top, bottom);
+                    self.scroll_up_in_margins(top, bottom, n, true);
                 }
                 b'T' => {
                     let n = usize::from(params.get_nonzero_or(0, 1));
                     let top = self.scroll_top;
                     let bottom = self.scroll_bottom;
-                    self.active_grid_mut()
-                        .scroll_down_region(top, bottom, n, bg);
-                    #[cfg(feature = "shell-integration")]
-                    if !self.modes.alt_screen {
-                        self.shell_integration
-                            .on_primary_rows_mutated(&self.primary, top, bottom);
-                    }
+                    self.scroll_down_in_margins(top, bottom, n);
                 }
                 b'I' => {
                     let n = usize::from(params.get_nonzero_or(0, 1));
@@ -3186,7 +3500,32 @@ impl VtHandler for Terminal {
                         }
                     }
                 }
-                b's' => self.save_cursor(),
+                b's' => {
+                    if self.modes.left_right_margin_mode {
+                        let left = usize::from(params.get_nonzero_or(0, 1));
+                        #[expect(clippy::cast_possible_truncation, reason = "cols fits in u16")]
+                        let right_default = cols as u16;
+                        let right = usize::from(params.get_nonzero_or(1, right_default)).min(cols);
+                        if left < right {
+                            self.scroll_left = left - 1;
+                            self.scroll_right = right - 1;
+                            self.cursor.row = if self.modes.origin_mode {
+                                self.scroll_top
+                            } else {
+                                0
+                            };
+                            self.cursor.col = if self.modes.origin_mode {
+                                self.scroll_left
+                            } else {
+                                0
+                            };
+                            self.cursor.pending_wrap = false;
+                        }
+                    } else {
+                        self.save_cursor();
+                    }
+                }
+                b't' => self.handle_xtwinops(params, cols, rows),
                 b'u' => self.restore_cursor(),
                 b'c' => {
                     if params.get_or(0, 0) == 0 {
@@ -3201,7 +3540,11 @@ impl VtHandler for Terminal {
                         } else {
                             self.cursor.row + 1
                         };
-                        let c = self.cursor.col + 1;
+                        let c = if self.modes.origin_mode {
+                            self.cursor.col.saturating_sub(self.scroll_left) + 1
+                        } else {
+                            self.cursor.col + 1
+                        };
                         let mut reply = String::with_capacity(16);
                         let _ = write!(reply, "\x1b[{r};{c}R");
                         self.outgoing.extend_from_slice(reply.as_bytes());
@@ -3225,17 +3568,30 @@ impl VtHandler for Terminal {
                         }
                     }
                 }
-                b'n' if params.get_or(0, 0) == 6 => {
-                    let r = if self.modes.origin_mode {
-                        self.cursor.row.saturating_sub(self.scroll_top) + 1
-                    } else {
-                        self.cursor.row + 1
-                    };
-                    let c = self.cursor.col + 1;
-                    let mut reply = String::with_capacity(18);
-                    let _ = write!(reply, "\x1b[?{r};{c}R");
-                    self.outgoing.extend_from_slice(reply.as_bytes());
-                }
+                b'n' => match params.get_or(0, 0) {
+                    6 => {
+                        let r = if self.modes.origin_mode {
+                            self.cursor.row.saturating_sub(self.scroll_top) + 1
+                        } else {
+                            self.cursor.row + 1
+                        };
+                        let c = if self.modes.origin_mode {
+                            self.cursor.col.saturating_sub(self.scroll_left) + 1
+                        } else {
+                            self.cursor.col + 1
+                        };
+                        let mut reply = String::with_capacity(18);
+                        let _ = write!(reply, "\x1b[?{r};{c}R");
+                        self.outgoing.extend_from_slice(reply.as_bytes());
+                    }
+                    996 => {
+                        let code = self.color_scheme_dsr_code();
+                        let mut reply = String::with_capacity(12);
+                        let _ = write!(reply, "\x1b[?997;{code}n");
+                        self.outgoing.extend_from_slice(reply.as_bytes());
+                    }
+                    _ => {}
+                },
                 #[cfg(feature = "kitty-keyboard")]
                 b'u' if params.is_empty() => {
                     let bits = self.kitty_keyboard.flags(self.modes.alt_screen).bits();
@@ -3286,6 +3642,10 @@ impl VtHandler for Terminal {
             b">" => match action {
                 b'c' if params.get_or(0, 0) == 0 => {
                     self.outgoing.extend_from_slice(b"\x1b[>0;100;0c");
+                }
+                b'q' if params.is_empty() || params.get_or(0, 0) == 0 => {
+                    let reply = format!("\x1bP>|egui_xterm {}\x1b\\", env!("CARGO_PKG_VERSION"));
+                    self.outgoing.extend_from_slice(reply.as_bytes());
                 }
                 #[cfg(feature = "kitty-keyboard")]
                 b'u' => {
@@ -5796,5 +6156,191 @@ mod tests {
         rest_pw.advance(b"\x1b8");
         assert_eq!(live_pw.cursor_pos(), rest_pw.cursor_pos());
         assert_eq!(live_pw.cursor().pending_wrap, rest_pw.cursor().pending_wrap);
+    }
+
+    #[test]
+    fn dcs_xtgettcap_and_decrqss_queries() {
+        let mut t = new_term(80, 24);
+
+        // XTGETTCAP: TN (544e), RGB (524742), colors (636f6c6f7273), unknown (464f4f)
+        t.advance(b"\x1bP+q544e;524742;636f6c6f7273;464f4f\x1b\\");
+        let reply = String::from_utf8(t.drain_outgoing()).unwrap();
+        assert!(reply.contains("\x1bP1+r544e=656775695F787465726D\x1b\\"));
+        assert!(reply.contains("\x1bP1+r524742=382F382F38\x1b\\"));
+        assert!(reply.contains("\x1bP1+r636f6c6f7273=323536\x1b\\"));
+        assert!(reply.contains("\x1bP0+r464f4f\x1b\\"));
+
+        // XTGETTCAP: invalid hex -> 0+r
+        t.advance(b"\x1bP+qZZZZ\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP0+rZZZZ\x1b\\");
+
+        // DECRQSS: m (SGR), r (DECSTBM), q (DECSCUSR), "q (DECSCA), unsupported
+        t.advance(b"\x1b[1;4:3;38;2;10;20;30m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP1$r0;1;4:3;38;2;10;20;30m\x1b\\");
+
+        t.advance(b"\x1b[3;10r\x1bP$qr\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP1$r3;10r\x1b\\");
+
+        t.advance(b"\x1b[4 q\x1bP$q q\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP1$r4 q\x1b\\");
+
+        t.advance(b"\x1bP$q\"q\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP1$r0\"q\x1b\\");
+
+        t.advance(b"\x1bP$qxyz\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP0$r\x1b\\");
+
+        // DECRQSS s: unsupported when ?69 is off, supported when ?69 is on
+        t.advance(b"\x1bP$qs\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP0$r\x1b\\");
+        t.advance(b"\x1b[?69h\x1b[5;20s\x1bP$qs\x1b\\");
+        assert_eq!(t.drain_outgoing(), b"\x1bP1$r5;20s\x1b\\");
+    }
+
+    #[test]
+    fn csi_xtversion_xtwinops_and_theme_dsr() {
+        let mut t = new_term(80, 24);
+
+        // XTVERSION
+        t.advance(b"\x1b[>q\x1b[>0q");
+        let expected_ver = format!("\x1bP>|egui_xterm {}\x1b\\", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            String::from_utf8(t.drain_outgoing()).unwrap(),
+            format!("{expected_ver}{expected_ver}")
+        );
+
+        // XTWINOPS 14/16/18 with default fallback then explicit pixel size
+        t.advance(b"\x1b[14t\x1b[16t\x1b[18t");
+        assert_eq!(
+            t.drain_outgoing(),
+            b"\x1b[4;384;640t\x1b[6;16;8t\x1b[8;24;80t"
+        );
+        t.set_pixel_size(800, 480);
+        assert_eq!(t.pixel_size(), (800, 480));
+        t.advance(b"\x1b[14t\x1b[16t");
+        assert_eq!(t.drain_outgoing(), b"\x1b[4;480;800t\x1b[6;20;10t");
+
+        // XTWINOPS 22/23 title stack
+        t.advance(b"\x1b]0;Initial\x07\x1b[22;0t\x1b]0;Temp\x07");
+        assert_eq!(t.title(), "Temp");
+        assert_eq!(t.icon_name(), "Temp");
+        let _ = t.drain_events();
+        t.advance(b"\x1b[23;0t");
+        assert_eq!(t.title(), "Initial");
+        assert_eq!(t.icon_name(), "Initial");
+        let evs = t.drain_events();
+        assert!(evs.contains(&TerminalEvent::TitleChanged("Initial".to_owned())));
+        assert!(evs.contains(&TerminalEvent::IconNameChanged("Initial".to_owned())));
+
+        // DEC ?2027, ?2031, and DSR ?996 n
+        t.advance(b"\x1b[?2027$p\x1b[?2027l\x1b[?2027$p\x1b[?2027h");
+        assert_eq!(t.drain_outgoing(), b"\x1b[?2027;1$y\x1b[?2027;2$y");
+
+        t.advance(b"\x1b[?996n\x1b[?2031$p\x1b[?2031h\x1b[?2031$p");
+        assert_eq!(
+            t.drain_outgoing(),
+            b"\x1b[?997;1n\x1b[?2031;2$y\x1b[?2031;1$y"
+        );
+
+        t.set_theme(Theme::light());
+        assert_eq!(t.drain_outgoing(), b"\x1b[?997;2n");
+        t.advance(b"\x1b[?996n");
+        assert_eq!(t.drain_outgoing(), b"\x1b[?997;2n");
+    }
+
+    #[test]
+    fn decslrm_margins_wrap_scroll_and_scosc() {
+        let mut t = new_term(10, 4);
+
+        // When ?69 is unset, CSI s acts as SCOSC (save cursor)
+        t.advance(b"\x1b[2;4H\x1b[s\x1b[1;1H\x1b[u");
+        assert_eq!(t.cursor_pos(), (3, 1));
+
+        // Enable ?69, set margins 3..=6 (0-based 2..=5), and write wrapping text
+        t.advance(b"\x1b[?69h\x1b[?69$p\x1b[3;6s");
+        assert_eq!(t.drain_outgoing(), b"\x1b[?69;1$y");
+        t.advance(b"\x1b[1;3HABCDEFGH");
+        assert_eq!(t.visible_line_text(0).as_deref(), Some("  ABCD"));
+        assert_eq!(t.visible_line_text(1).as_deref(), Some("  EFGH"));
+
+        // CR stays at left margin (col 2)
+        t.advance(b"\rX");
+        assert_eq!(t.visible_line_text(1).as_deref(), Some("  XFGH"));
+
+        // Scroll up within box (rows 0..=3, cols 2..=5) preserves cols outside margins
+        t.advance(b"\x1b[1;1H1\x1b[2;1H2\x1b[1S");
+        assert_eq!(t.visible_line_text(0).as_deref(), Some("1 XFGH"));
+        assert_eq!(t.visible_line_text(1).as_deref(), Some("2"));
+
+        // Disabling ?69 resets horizontal margins
+        t.advance(b"\x1b[?69l\x1b[?69$p");
+        assert_eq!(t.drain_outgoing(), b"\x1b[?69;2$y");
+        assert_eq!(t.scroll_left, 0);
+        assert_eq!(t.scroll_right, 9);
+    }
+
+    #[test]
+    fn mouse_1016_sgr_pixels_and_modern_osc_events() {
+        let mut t = new_term(80, 24);
+        t.advance(b"\x1b[?1002h\x1b[?1016h\x1b[?1016$p");
+        assert_eq!(t.drain_outgoing(), b"\x1b[?1016;1$y");
+        assert_eq!(t.modes().mouse_encoding, MouseEncoding::SgrPixels);
+
+        let press = MouseInputEvent {
+            kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left),
+            col: 5,
+            row: 3,
+            modifiers: MouseModifiers {
+                shift: false,
+                alt: false,
+                ctrl: true,
+            },
+        };
+        assert_eq!(
+            t.encode_mouse_event_pixels(press, 123, 456).as_deref(),
+            Some(b"\x1b[<16;123;456M".as_slice())
+        );
+
+        let release = MouseInputEvent {
+            kind: MouseEventKind::Release,
+            ..press
+        };
+        assert_eq!(
+            t.encode_mouse_event_pixels(release, 123, 456).as_deref(),
+            Some(b"\x1b[<16;123;456m".as_slice())
+        );
+
+        // OSC 9;4 progress, OSC 9 notification, OSC 99 (chunked + base64), OSC 777, OSC 22
+        t.advance(b"\x1b]9;4;1;42\x07");
+        t.advance(b"\x1b]9;Build complete\x07");
+        t.advance(b"\x1b]99;p=title:d=0;Alerts\x1b\\");
+        t.advance(b"\x1b]99;p=body:e=1;aGVsbG8=\x1b\\");
+        t.advance(b"\x1b]777;notify;Done;All tests passed\x07");
+        t.advance(b"\x1b]22;pointer\x07");
+
+        let events = t.drain_events();
+        assert_eq!(
+            events,
+            vec![
+                TerminalEvent::Progress {
+                    state: 1,
+                    progress: 42
+                },
+                TerminalEvent::Notification {
+                    title: String::new(),
+                    body: "Build complete".to_owned()
+                },
+                TerminalEvent::Notification {
+                    title: "Alerts".to_owned(),
+                    body: "hello".to_owned()
+                },
+                TerminalEvent::Notification {
+                    title: "Done".to_owned(),
+                    body: "All tests passed".to_owned()
+                },
+                TerminalEvent::MouseShape("pointer".to_owned()),
+            ]
+        );
     }
 }
