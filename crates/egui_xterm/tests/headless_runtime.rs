@@ -244,6 +244,7 @@ fn resize_debounce_and_channel_input_roundtrip() {
 #[test]
 fn dec_2026_watchdog_and_ime_and_copy_selection() {
     let ctx = Context::default();
+    ctx.set_os(egui::os::OperatingSystem::Windows);
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(b"OLD\r\n"));
     let screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
 
@@ -1318,6 +1319,7 @@ fn adversarial_poll_read_over_budget_length_never_panics() {
 #[test]
 fn virtual_col_empty_selection_sends_sigint_and_no_copy_text() {
     let ctx = Context::default();
+    ctx.set_os(egui::os::OperatingSystem::Windows);
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(b"hi\r\n"));
     let wide = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 400.0));
 

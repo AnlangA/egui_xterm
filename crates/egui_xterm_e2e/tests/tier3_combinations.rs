@@ -1357,20 +1357,19 @@ fn t3_21_f20_f13_pty_osc133_shell_integration() {
 
     #[cfg(unix)]
     {
-        let mut finished_zero = false;
-        for _ in 0..30 {
-            sess.harness.advance_time(1.0 / 60.0);
-            let out = sess.harness.run_frame();
-            if out
+        let command_finished = |frame: &egui_xterm_e2e::FrameOutcome| {
+            frame
                 .terminal_response
                 .events
                 .contains(&TerminalEvent::CommandFinished { exit_code: Some(0) })
-            {
-                finished_zero = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        // The command can finish in the same frame that first displays its output.
+        let finished_zero = sess.harness.last_outcome().is_some_and(command_finished)
+            || (0..30).any(|_| {
+                std::thread::sleep(Duration::from_millis(10));
+                sess.harness.advance_time(1.0 / 60.0);
+                command_finished(&sess.harness.run_frame())
+            });
         assert!(
             !sess.harness.runtime.terminal().shell_zones().is_empty(),
             "expected OSC 133 shell_zones on Unix PTY"

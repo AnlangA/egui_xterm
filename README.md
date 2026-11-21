@@ -27,13 +27,13 @@ Every line of VT parsing, grid storage, resize reflow, `egui` rendering, and PTY
 
 | Crate / Path | Role | WASM32 Safe |
 |---|---|---|
-| [`crates/egui_xterm_core`](crates/egui_xterm_core) | Pure-Rust VT500 parser, 20B `Cell`, ring scrollback `Grid`, lossless reflow, `Terminal`, `TerminalInput` & built-in adapters, and feature-gated protocol extensions | Yes (always) |
-| [`crates/egui_xterm`](crates/egui_xterm) | `egui 0.37` `TerminalRuntime<I>` & `TerminalWidget`, `TerminalConfig`, `ScaleMode`, pixel-snapped auto-layout, 4-stage cached renderer, IME/clipboard/mouse mapping, and UI overlays (`search_bar`, `scrollbar`, `context_menu`, `prompt_gutter`, `hyperlink`) | Yes (default features) |
-| [`crates/egui_xterm_pty`](crates/egui_xterm_pty) | Desktop `portable-pty 0.9` `PtyBackend` implementing `TerminalInput` with background reader thread, repaint callback, cross-platform default shell resolution, and Windows ConPTY handshake handling (re-exported as `egui_xterm::pty` under `pty`) | Re-exports core types only on `wasm32` |
-| [`crates/egui_xterm_e2e`](crates/egui_xterm_e2e) | Opaque-box end-to-end test suite (`publish = false`) | Test harness |
-| [`examples/egui_xterm_demo`](examples/egui_xterm_demo) | Runnable `eframe 0.37` demo app (`publish = false`) with local PTY tabs (desktop), cross-platform trait-driven `DemoShellInput`, split-pane auto-layout, and live `ScaleMode`/theme/cursor controls | Yes (`--target wasm32-unknown-unknown` checks cleanly) |
+| [`egui_xterm_core`](https://crates.io/crates/egui_xterm_core) | Pure-Rust VT500 parser, 20B `Cell`, ring scrollback `Grid`, lossless reflow, `Terminal`, `TerminalInput` & built-in adapters, and feature-gated protocol extensions | Yes (always) |
+| [`egui_xterm`](https://crates.io/crates/egui_xterm) | `egui 0.37` `TerminalRuntime<I>` & `TerminalWidget`, `TerminalConfig`, `ScaleMode`, pixel-snapped auto-layout, 4-stage cached renderer, IME/clipboard/mouse mapping, and UI overlays (`search_bar`, `scrollbar`, `context_menu`, `prompt_gutter`, `hyperlink`) | Yes (default features) |
+| [`egui_xterm_pty`](https://crates.io/crates/egui_xterm_pty) | Desktop `portable-pty 0.9` `PtyBackend` implementing `TerminalInput` with background reader thread, repaint callback, cross-platform default shell resolution, and Windows ConPTY handshake handling (re-exported as `egui_xterm::pty` under `pty`) | Re-exports core types only on `wasm32` |
+| [`crates/egui_xterm_e2e`](https://github.com/AnlangA/egui_xterm/tree/main/crates/egui_xterm_e2e) | Opaque-box end-to-end test suite (`publish = false`) | Test harness |
+| [`examples/egui_xterm_demo`](https://github.com/AnlangA/egui_xterm/tree/main/examples/egui_xterm_demo) | Runnable `eframe 0.37` demo app (`publish = false`) with local PTY tabs (desktop), cross-platform trait-driven `DemoShellInput`, split-pane auto-layout, and live `ScaleMode`/theme/cursor controls | Yes (`--target wasm32-unknown-unknown` checks cleanly) |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architectural design specification.
+See the [architecture guide](https://github.com/AnlangA/egui_xterm/blob/main/docs/ARCHITECTURE.md) and the [widget API documentation](https://docs.rs/egui_xterm).
 
 ---
 
@@ -251,11 +251,11 @@ Summary of post-Phase-2 `--release` measurements (`Intel Core Ultra 9 285K`, Win
 | `reflow_10k_scrollback/widen_80x40_to_160x40` | `6.1975 ms` | `1.6136 Melem/s` |
 
 For architecture details and full raw Criterion reports, see:
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+- [Architecture guide](https://github.com/AnlangA/egui_xterm/blob/main/docs/ARCHITECTURE.md)
+- [Benchmark results](https://github.com/AnlangA/egui_xterm/blob/main/docs/BENCHMARKS.md)
 
 ---
 
 ## License
 
-Dual-licensed under `MIT OR Apache-2.0`. See [`Cargo.toml`](Cargo.toml) for workspace metadata.
+Licensed under either the [MIT License](https://github.com/AnlangA/egui_xterm/blob/main/LICENSE-MIT) or the [Apache License, Version 2.0](https://github.com/AnlangA/egui_xterm/blob/main/LICENSE-APACHE), at your option.

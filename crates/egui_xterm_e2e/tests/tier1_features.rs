@@ -2136,15 +2136,23 @@ mod stage_m4_f18 {
     }
 
     #[test]
-    fn f18_t1_04_event_copy_without_selection_sends_etx() {
-        let mut h = HeadlessTermHarness::scripted();
-        h.focus_terminal();
-        h.runtime.input_mut().clear_written();
+    fn f18_t1_04_event_copy_without_selection_respects_os() {
+        use egui::os::OperatingSystem;
 
-        h.inject_copy();
-        let outcome = h.run_frame();
-        assert_eq!(h.runtime.input().written_bytes(), b"\x03");
-        assert!(outcome.copied_texts().is_empty());
+        for (os, expected) in [
+            (OperatingSystem::Windows, b"\x03".as_slice()),
+            (OperatingSystem::Mac, b"".as_slice()),
+        ] {
+            let mut h = HeadlessTermHarness::scripted();
+            h.ctx.set_os(os);
+            h.focus_terminal();
+            h.runtime.input_mut().clear_written();
+
+            h.inject_copy();
+            let outcome = h.run_frame();
+            assert_eq!(h.runtime.input().written_bytes(), expected, "OS: {os:?}");
+            assert!(outcome.copied_texts().is_empty());
+        }
     }
 
     #[test]

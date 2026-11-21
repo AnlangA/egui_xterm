@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/egui_xterm_pty"
 description = "Desktop PTY backend for egui_xterm implementing TerminalInput via portable-pty"
+keywords = ["terminal", "pty", "conpty", "egui", "shell"]
+categories = ["emulators", "os"]
 
 [lints]
 workspace = true
