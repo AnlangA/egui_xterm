@@ -22,6 +22,10 @@ pub use crate::cell::{
 pub use crate::color::{ColorScheme, PackedColor, Theme};
 #[cfg(feature = "hyperlinks")]
 pub use crate::features::hyperlinks::{HyperlinkInfo, HyperlinkSpan};
+#[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+pub use crate::features::inline_images::{
+    DEFAULT_IMAGE_MEMORY_BUDGET, ImageFormat, ImagePlacement, ImageStore, StoredImage,
+};
 #[cfg(feature = "kitty-keyboard")]
 pub use crate::features::kitty_keyboard::{
     KITTY_STACK_CAP, KittyEventType, KittyKey, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers,

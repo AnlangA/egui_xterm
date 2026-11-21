@@ -15,11 +15,20 @@ categories = ["emulators", "parsing"]
 workspace = true
 
 [features]
-default = ["search", "hyperlinks", "shell-integration", "kitty-keyboard"]
+default = [
+    "search",
+    "hyperlinks",
+    "shell-integration",
+    "kitty-keyboard",
+    "kitty-graphics",
+    "sixel",
+]
 search = ["dep:regex"]
 hyperlinks = []
 shell-integration = []
 kitty-keyboard = []
+kitty-graphics = []
+sixel = []
 serde = ["dep:serde", "bitflags/serde"]
 metrics = []
 

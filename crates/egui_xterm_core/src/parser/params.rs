@@ -11,6 +11,9 @@ pub const MAX_INTERMEDIATES: usize = 4;
 /// Default maximum `OSC` payload buffer size (4 MiB).
 pub const DEFAULT_MAX_OSC_BYTES: usize = 4 * 1024 * 1024;
 
+/// Default maximum `APC` payload buffer size (32 MiB).
+pub const DEFAULT_MAX_APC_BYTES: usize = 32 * 1024 * 1024;
+
 /// Zero-allocation bounded parameter list supporting both `;` parameters and `:` subparameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CsiParams {

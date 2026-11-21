@@ -30,7 +30,9 @@ pub enum State {
     DcsIgnore,
     /// Accumulating `OSC` (`ESC ]` or `0x9D`) payload until `BEL` or `ST`.
     OscString,
-    /// Ignoring `SOS` (`ESC X`), `PM` (`ESC ^`), or `APC` (`ESC _`) string until `ST`.
+    /// Accumulating `APC` (`ESC _` or `0x9F`) payload until `ST`.
+    ApcString,
+    /// Ignoring `SOS` (`ESC X`) or `PM` (`ESC ^`) string until `ST`.
     SosPmApcString,
 }
 

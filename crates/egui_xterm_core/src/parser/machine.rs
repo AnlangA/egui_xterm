@@ -1,7 +1,7 @@
 //! Clean-room DEC VT500 / Paul Williams state machine with SWAR and `memchr` fast-paths.
 
 use super::handler::VtHandler;
-use super::params::{CsiParams, DEFAULT_MAX_OSC_BYTES, MAX_INTERMEDIATES};
+use super::params::{CsiParams, DEFAULT_MAX_APC_BYTES, DEFAULT_MAX_OSC_BYTES, MAX_INTERMEDIATES};
 use super::state::{C1Policy, OscTerminator, State};
 use super::utf8::{Reprocess, Utf8Decoder, Utf8Step};
 
@@ -42,6 +42,9 @@ pub struct Parser {
     osc_ranges: Vec<(usize, usize)>,
     osc_overflow: bool,
     max_osc_bytes: usize,
+    apc_buf: Vec<u8>,
+    apc_overflow: bool,
+    max_apc_bytes: usize,
 }
 
 impl Default for Parser {
@@ -72,6 +75,9 @@ impl Parser {
             osc_ranges: Vec::new(),
             osc_overflow: false,
             max_osc_bytes: DEFAULT_MAX_OSC_BYTES,
+            apc_buf: Vec::new(),
+            apc_overflow: false,
+            max_apc_bytes: DEFAULT_MAX_APC_BYTES,
         }
     }
 
@@ -82,12 +88,20 @@ impl Parser {
         self
     }
 
+    /// Sets the maximum retained `APC` payload byte budget before dropping overflowing payloads.
+    #[must_use]
+    pub fn with_max_apc_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_apc_bytes = max_bytes;
+        self
+    }
+
     /// Resets the parser to [`State::Ground`] and clears all partial sequences.
     pub fn reset(&mut self) {
         self.state = State::Ground;
         self.utf8.reset();
         self.clear_sequence();
         self.clear_and_shrink_osc();
+        self.clear_and_shrink_apc();
     }
 
     /// Returns the current VT500 parser state.
@@ -132,6 +146,25 @@ impl Parser {
                                 for &b in chunk {
                                     if b != 0x7F {
                                         handler.put(b);
+                                    }
+                                }
+                            }
+                            pos += stop;
+                            continue;
+                        }
+                    }
+                    State::ApcString => {
+                        let rest = &bytes[pos..];
+                        let stop = memchr::memchr3(0x1B, 0x18, 0x1A, rest).unwrap_or(rest.len());
+                        if stop > 0 {
+                            if !self.apc_overflow {
+                                let chunk = &rest[..stop];
+                                for &b in chunk {
+                                    if b >= 0x20 && b != 0x7F {
+                                        self.apc_put(b);
+                                        if self.apc_overflow {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -240,11 +273,46 @@ impl Parser {
         self.clear_and_shrink_osc();
     }
 
+    fn apc_start(&mut self) {
+        self.apc_buf.clear();
+        self.apc_overflow = false;
+    }
+
+    fn apc_put(&mut self, byte: u8) {
+        if !self.apc_overflow {
+            if self.apc_buf.len() < self.max_apc_bytes {
+                self.apc_buf.push(byte);
+            } else {
+                self.apc_overflow = true;
+                self.apc_buf.clear();
+            }
+        }
+    }
+
+    fn clear_and_shrink_apc(&mut self) {
+        self.apc_buf.clear();
+        self.apc_overflow = false;
+        if self.apc_buf.capacity() > 64 * 1024 {
+            self.apc_buf.shrink_to(4096);
+        }
+    }
+
+    fn apc_end(&mut self, handler: &mut impl VtHandler) {
+        if !self.apc_overflow {
+            handler.apc_dispatch(&self.apc_buf);
+        }
+        self.clear_and_shrink_apc();
+    }
+
     fn exit_current_state_for_abort(&mut self, handler: &mut impl VtHandler) {
         match self.state {
             State::OscString => {
                 // CAN/SUB abort OSC without dispatching.
                 self.clear_and_shrink_osc();
+            }
+            State::ApcString => {
+                // CAN/SUB abort APC without dispatching.
+                self.clear_and_shrink_apc();
             }
             State::DcsPassthrough => handler.unhook(),
             State::Ground => {
@@ -259,6 +327,7 @@ impl Parser {
     fn exit_current_state_for_control(&mut self, handler: &mut impl VtHandler) {
         match self.state {
             State::OscString => self.osc_end(OscTerminator::St, handler),
+            State::ApcString => self.apc_end(handler),
             State::DcsPassthrough => handler.unhook(),
             State::Ground => {
                 if let Some(repl) = self.utf8.take_incomplete() {
@@ -295,8 +364,12 @@ impl Parser {
                         self.clear_sequence();
                         self.state = State::DcsEntry;
                     }
-                    0x98 | 0x9E | 0x9F => {
+                    0x98 | 0x9E => {
                         self.state = State::SosPmApcString;
+                    }
+                    0x9F => {
+                        self.apc_start();
+                        self.state = State::ApcString;
                     }
                     0x9B => {
                         self.clear_sequence();
@@ -374,8 +447,12 @@ impl Parser {
                     self.clear_sequence();
                     self.state = State::DcsEntry;
                 }
-                0x58 | 0x5E | 0x5F => {
+                0x58 | 0x5E => {
                     self.state = State::SosPmApcString;
+                }
+                0x5F => {
+                    self.apc_start();
+                    self.state = State::ApcString;
                 }
                 0x5B => {
                     self.clear_sequence();
@@ -565,6 +642,12 @@ impl Parser {
                 0x18 | 0x1A | 0x1B | 0x7F => {}
             },
 
+            State::ApcString => match byte {
+                0x00..=0x17 | 0x19 | 0x1C..=0x1F | 0x7F => {}
+                0x20..=0x7E | 0x80..=0xFF => self.apc_put(byte),
+                0x18 | 0x1A | 0x1B => {}
+            },
+
             State::DcsIgnore | State::SosPmApcString => {}
 
             State::OscString => match byte {
@@ -610,6 +693,7 @@ mod tests {
             intermediates: Vec<u8>,
             action: u8,
         },
+        Apc(Vec<u8>),
     }
 
     #[derive(Default)]
@@ -685,6 +769,10 @@ mod tests {
                 action,
             });
         }
+
+        fn apc_dispatch(&mut self, data: &[u8]) {
+            self.events.push(Event::Apc(data.to_vec()));
+        }
     }
 
     // T1: All 14 states and transitions.
@@ -746,7 +834,7 @@ mod tests {
         assert_eq!(parser.state(), State::Ground);
 
         parser.advance(b"\x1b_apc", &mut rec);
-        assert_eq!(parser.state(), State::SosPmApcString);
+        assert_eq!(parser.state(), State::ApcString);
         parser.advance(b"\x1b\\", &mut rec);
         assert_eq!(parser.state(), State::Ground);
 
@@ -1275,5 +1363,52 @@ mod tests {
         let big_osc = format!("\x1b]2;{}\x07", "X".repeat(80_000));
         parser.advance(big_osc.as_bytes(), &mut rec);
         assert!(parser.osc_buf.capacity() <= 4096);
+    }
+
+    #[test]
+    fn apc_dispatch_abort_overflow_and_eight_bit() {
+        let mut parser = Parser::new().with_max_apc_bytes(16);
+        let mut rec = Recorder::default();
+
+        // 7-bit APC dispatch (followed by ST `ESC \`).
+        parser.advance(b"\x1b_Gi=1;AAAA\x1b\\", &mut rec);
+        assert_eq!(
+            rec.events,
+            vec![
+                Event::Apc(b"Gi=1;AAAA".to_vec()),
+                Event::Esc {
+                    intermediates: Vec::new(),
+                    action: b'\\',
+                }
+            ]
+        );
+
+        // CAN aborts APC without dispatching.
+        rec.events.clear();
+        parser.advance(b"\x1b_Gi=2;BBBB\x18ok", &mut rec);
+        assert_eq!(
+            rec.events,
+            vec![Event::Execute(0x18), Event::Print('o'), Event::Print('k')]
+        );
+
+        // Overflow drops payload cleanly and recovers on ST.
+        rec.events.clear();
+        parser.advance(b"\x1b_0123456789ABCDEFG\x1b\\Z", &mut rec);
+        assert_eq!(
+            rec.events,
+            vec![
+                Event::Esc {
+                    intermediates: Vec::new(),
+                    action: b'\\',
+                },
+                Event::Print('Z'),
+            ]
+        );
+
+        // 8-bit APC (0x9F ... 0x9C).
+        let mut p8 = Parser::with_c1_policy(C1Policy::Vt500EightBit);
+        rec.events.clear();
+        p8.advance(b"\x9Fhello\x9C", &mut rec);
+        assert_eq!(rec.events, vec![Event::Apc(b"hello".to_vec())]);
     }
 }

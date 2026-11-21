@@ -21,6 +21,12 @@ use crate::features::hyperlinks::{
     HyperlinkInfo, HyperlinkSpan, ImplicitLinkStore, collect_grid_hyperlink_ids,
     explicit_visible_spans,
 };
+#[cfg(feature = "kitty-graphics")]
+use crate::features::inline_images::kitty::handle_kitty_apc;
+#[cfg(feature = "sixel")]
+use crate::features::inline_images::sixel::SixelDecoder;
+#[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+use crate::features::inline_images::{ImagePlacement, ImageStore, StoredImage};
 #[cfg(feature = "kitty-keyboard")]
 use crate::features::kitty_keyboard::{KittyKeyboardFlags, KittyKeyboardState};
 #[cfg(feature = "metrics")]
@@ -253,6 +259,10 @@ pub struct RenderSnapshot<'a> {
     /// [`AbsLine`] corresponding to `visible_rows[0]`.
     pub top_abs_line: AbsLine,
     extras: SnapshotExtras<'a>,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    visible_images: Vec<ImagePlacement>,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    image_store: &'a ImageStore,
 }
 
 impl RenderSnapshot<'_> {
@@ -318,6 +328,20 @@ impl RenderSnapshot<'_> {
             ColorScheme::xterm_256_color(index, &self.palette.ansi)
         }
     }
+
+    /// Returns inline image placements intersecting the visible viewport.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn image_placements(&self) -> &[ImagePlacement] {
+        &self.visible_images
+    }
+
+    /// Looks up decoded pixel data for inline image `id`.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn image_data(&self, id: u32) -> Option<&StoredImage> {
+        self.image_store.get_image(id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +361,8 @@ struct LatchedFrame {
     is_alt_screen: bool,
     damage_epoch: u64,
     top_abs_line: AbsLine,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    visible_images: Vec<ImagePlacement>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -448,6 +474,10 @@ pub struct Terminal {
     shell_integration: ShellIntegrationState,
     #[cfg(feature = "kitty-keyboard")]
     kitty_keyboard: KittyKeyboardState,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    image_store: ImageStore,
+    #[cfg(feature = "sixel")]
+    active_sixel: Option<SixelDecoder>,
     #[cfg(feature = "metrics")]
     metrics: TerminalMetrics,
 }
@@ -521,6 +551,10 @@ impl Terminal {
             shell_integration,
             #[cfg(feature = "kitty-keyboard")]
             kitty_keyboard: KittyKeyboardState::default(),
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            image_store: ImageStore::default(),
+            #[cfg(feature = "sixel")]
+            active_sixel: None,
             #[cfg(feature = "metrics")]
             metrics: TerminalMetrics::new(),
         }
@@ -537,6 +571,9 @@ impl Terminal {
         self.refresh_implicit_hyperlinks();
         #[cfg(feature = "shell-integration")]
         self.shell_integration.sync_with_grid(&self.primary);
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        self.image_store
+            .prune_before(ScreenKind::Primary, self.primary.oldest_abs_line());
     }
 
     /// Streams raw VT/ANSI `bytes` into the terminal using `now_secs` for the DEC Mode 2026
@@ -778,6 +815,9 @@ impl Terminal {
         self.refresh_implicit_hyperlinks();
         #[cfg(feature = "shell-integration")]
         self.shell_integration.sync_with_grid(&self.primary);
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        self.image_store
+            .prune_before(ScreenKind::Primary, self.primary.oldest_abs_line());
     }
 
     /// Updates the reported physical pixel dimensions of the terminal viewport for `XTWINOPS`
@@ -1376,6 +1416,10 @@ impl Terminal {
                 damage_epoch: latched.damage_epoch,
                 top_abs_line: latched.top_abs_line,
                 extras: SnapshotExtras::Latched(&latched.extras),
+                #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+                visible_images: latched.visible_images.clone(),
+                #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+                image_store: &self.image_store,
             };
         }
 
@@ -1386,6 +1430,17 @@ impl Terminal {
             .collect();
         let display_offset = self.display_offset();
         let cursor = self.live_cursor_snapshot(display_offset);
+        let top_abs_line = grid.screen_to_abs(0);
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        let visible_images = {
+            let screen = if self.modes.alt_screen {
+                ScreenKind::Alternate
+            } else {
+                ScreenKind::Primary
+            };
+            self.image_store
+                .visible_placements(screen, top_abs_line, rows)
+        };
         RenderSnapshot {
             cols,
             rows,
@@ -1401,9 +1456,32 @@ impl Terminal {
             is_alt_screen: self.modes.alt_screen,
             is_synchronized_output: false,
             damage_epoch: grid.damage_epoch(),
-            top_abs_line: grid.screen_to_abs(0),
+            top_abs_line,
             extras: SnapshotExtras::Live(grid.extras()),
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            visible_images,
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            image_store: &self.image_store,
         }
+    }
+
+    /// Returns all inline image placements on the active screen.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn image_placements(&self) -> &[ImagePlacement] {
+        let screen = if self.modes.alt_screen {
+            ScreenKind::Alternate
+        } else {
+            ScreenKind::Primary
+        };
+        self.image_store.placements(screen)
+    }
+
+    /// Looks up decoded pixel data for inline image `id`.
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[must_use]
+    pub fn image_data(&self, id: u32) -> Option<&StoredImage> {
+        self.image_store.get_image(id)
     }
 
     /// Encodes a grid-relative [`MouseInputEvent`] according to active mouse modes.
@@ -1868,6 +1946,10 @@ impl Terminal {
             shell_integration,
             #[cfg(feature = "kitty-keyboard")]
             kitty_keyboard,
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            image_store: ImageStore::default(),
+            #[cfg(feature = "sixel")]
+            active_sixel: None,
             #[cfg(feature = "metrics")]
             metrics: TerminalMetrics::new(),
         };
@@ -1998,6 +2080,17 @@ impl Terminal {
         let cursor = self.live_cursor_snapshot(display_offset);
         let grid = self.grid();
         let (visible_rows, extras) = grid.clone_visible_snapshot();
+        let top_abs_line = grid.screen_to_abs(0);
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        let visible_images = {
+            let screen = if self.modes.alt_screen {
+                ScreenKind::Alternate
+            } else {
+                ScreenKind::Primary
+            };
+            self.image_store
+                .visible_placements(screen, top_abs_line, rows)
+        };
         self.latched_frame = Some(LatchedFrame {
             cols,
             rows,
@@ -2013,7 +2106,9 @@ impl Terminal {
             scrollback_len: grid.history_len(),
             is_alt_screen: self.modes.alt_screen,
             damage_epoch: grid.damage_epoch(),
-            top_abs_line: grid.screen_to_abs(0),
+            top_abs_line,
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            visible_images,
         });
         self.modes.sync_output = true;
         self.sync_started_at = self.last_time_secs;
@@ -2100,6 +2195,8 @@ impl Terminal {
         self.selection = None;
         if clear_alt {
             self.alternate.clear_visible(PackedColor::Default);
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            self.image_store.clear_screen(ScreenKind::Alternate);
             #[cfg(feature = "kitty-keyboard")]
             self.kitty_keyboard.reset_alt();
             self.cursor.row = 0;
@@ -2120,6 +2217,8 @@ impl Terminal {
         }
         if clear_alt {
             self.alternate.clear_visible(PackedColor::Default);
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            self.image_store.clear_screen(ScreenKind::Alternate);
         }
         self.modes.alt_screen = false;
         self.selection = None;
@@ -2647,6 +2746,7 @@ impl Terminal {
                 self.cursor.style.blink = enable;
             }
             25 => self.modes.cursor_visible = enable,
+            80 => self.modes.sixel_display_mode = enable,
             47 => {
                 if enable {
                     self.enter_alt_screen(false, false);
@@ -2893,6 +2993,12 @@ impl Terminal {
         }
         #[cfg(feature = "shell-integration")]
         self.shell_integration.reset();
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        self.image_store.clear_all();
+        #[cfg(feature = "sixel")]
+        {
+            self.active_sixel = None;
+        }
         #[cfg(feature = "kitty-keyboard")]
         self.kitty_keyboard.reset_all();
         self.selection = None;
@@ -3082,14 +3188,77 @@ impl VtHandler for Terminal {
     fn hook(&mut self, params: &CsiParams, intermediates: &[u8], action: u8) {
         self.last_written = None;
         self.last_graphic = None;
+        #[cfg(feature = "sixel")]
+        if action == b'q' && intermediates.is_empty() {
+            self.active_sixel = Some(SixelDecoder::new(params));
+            return;
+        }
         self.dcs_state.start(params, intermediates, action);
     }
 
     fn put(&mut self, byte: u8) {
+        #[cfg(feature = "sixel")]
+        if let Some(dec) = &mut self.active_sixel {
+            dec.put(byte);
+            return;
+        }
         self.dcs_state.push(byte);
     }
 
     fn unhook(&mut self) {
+        #[cfg(feature = "sixel")]
+        if let Some(dec) = self.active_sixel.take() {
+            if let Some((w, h, rgba)) = dec.finish() {
+                let screen = if self.modes.alt_screen {
+                    ScreenKind::Alternate
+                } else {
+                    ScreenKind::Primary
+                };
+                let id = self.image_store.allocate_id();
+                let stored = StoredImage {
+                    id,
+                    width: w,
+                    height: h,
+                    format: crate::features::inline_images::ImageFormat::Rgba8,
+                    rgba,
+                };
+                if self.image_store.insert_image(stored) {
+                    let (place_row, place_col) = if self.modes.sixel_display_mode {
+                        (0, 0)
+                    } else {
+                        (self.cursor.row, self.cursor.col)
+                    };
+                    let abs_line = self.grid().live_viewport_to_abs(place_row);
+                    let cols = u16::try_from(w.div_ceil(8)).unwrap_or(u16::MAX);
+                    let rows = u16::try_from(h.div_ceil(16)).unwrap_or(u16::MAX);
+                    self.image_store.add_placement(
+                        screen,
+                        ImagePlacement {
+                            image_id: id,
+                            placement_id: 0,
+                            abs_line,
+                            col: u16::try_from(place_col).unwrap_or(u16::MAX),
+                            cols,
+                            rows,
+                            src_x: 0,
+                            src_y: 0,
+                            src_w: 0,
+                            src_h: 0,
+                            z_index: 0,
+                        },
+                    );
+                    if !self.modes.sixel_display_mode {
+                        for _ in 0..rows {
+                            self.linefeed_internal(false);
+                        }
+                        self.cursor.col = 0;
+                        self.cursor.pending_wrap = false;
+                    }
+                    self.active_grid_mut().mark_all_dirty();
+                }
+            }
+            return;
+        }
         let Some((kind, payload)) = self.dcs_state.take() else {
             return;
         };
@@ -3108,6 +3277,52 @@ impl VtHandler for Terminal {
                 dcs::handle_decrqss(&payload, &state, &mut self.outgoing);
             }
         }
+    }
+
+    fn apc_dispatch(&mut self, data: &[u8]) {
+        self.last_written = None;
+        self.last_graphic = None;
+        #[cfg(feature = "kitty-graphics")]
+        {
+            let screen = if self.modes.alt_screen {
+                ScreenKind::Alternate
+            } else {
+                ScreenKind::Primary
+            };
+            let cursor_abs_line = self.grid().live_viewport_to_abs(self.cursor.row);
+            let cursor_col = u16::try_from(self.cursor.col).unwrap_or(u16::MAX);
+            let outcome = handle_kitty_apc(
+                &mut self.image_store,
+                data,
+                screen,
+                cursor_abs_line,
+                cursor_col,
+                (8, 16),
+                &mut self.outgoing,
+            );
+            if outcome.move_cursor {
+                let grid_cols = self.active_grid().cols();
+                let new_col = self
+                    .cursor
+                    .col
+                    .saturating_add(usize::from(outcome.advance_cols));
+                for _ in 0..outcome.advance_rows.saturating_sub(1) {
+                    self.linefeed_internal(false);
+                }
+                if new_col >= grid_cols {
+                    self.linefeed_internal(false);
+                    self.cursor.col = 0;
+                } else {
+                    self.cursor.col = new_col;
+                }
+                self.cursor.pending_wrap = false;
+            }
+            if outcome.modified {
+                self.active_grid_mut().mark_all_dirty();
+            }
+        }
+        #[cfg(not(feature = "kitty-graphics"))]
+        let _ = data;
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], terminator: OscTerminator) {
@@ -3369,6 +3584,22 @@ impl VtHandler for Terminal {
                     let r = self.cursor.row;
                     let c = self.cursor.col;
                     self.active_grid_mut().erase_in_display(r, c, mode, bg);
+                    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+                    match mode {
+                        2 => {
+                            let screen = if self.modes.alt_screen {
+                                ScreenKind::Alternate
+                            } else {
+                                ScreenKind::Primary
+                            };
+                            self.image_store.clear_screen(screen);
+                        }
+                        3 if !self.modes.alt_screen => {
+                            let top = self.primary.live_viewport_to_abs(0);
+                            self.image_store.prune_before(ScreenKind::Primary, top);
+                        }
+                        _ => {}
+                    }
                     if !self.modes.alt_screen {
                         match mode {
                             0 =>

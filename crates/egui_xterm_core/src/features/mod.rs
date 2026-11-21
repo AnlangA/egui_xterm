@@ -1,8 +1,10 @@
 //! Optional feature-gated terminal capabilities (`search`, `hyperlinks`, `shell-integration`,
-//! `kitty-keyboard`, `metrics`).
+//! `kitty-keyboard`, `kitty-graphics`, `sixel`, `metrics`).
 
 #[cfg(feature = "hyperlinks")]
 pub mod hyperlinks;
+#[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+pub mod inline_images;
 #[cfg(feature = "kitty-keyboard")]
 pub mod kitty_keyboard;
 #[cfg(feature = "metrics")]

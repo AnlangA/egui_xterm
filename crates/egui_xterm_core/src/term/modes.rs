@@ -90,6 +90,8 @@ pub struct Modes {
     pub cursor_blink: bool,
     /// DEC `DECTCEM` (`CSI ? 25 h/l`): cursor visibility.
     pub cursor_visible: bool,
+    /// DEC `DECSDM` (`CSI ? 80 h/l`): sixel display mode (disables sixel scrolling when set).
+    pub sixel_display_mode: bool,
     /// Active alternate screen buffer (`?47`, `?1047`, `?1049`).
     pub alt_screen: bool,
     /// Active mouse reporting protocol (`?9`, `?1000`, `?1002`, `?1003`).
@@ -134,6 +136,7 @@ impl Modes {
             auto_wrap: true,
             cursor_blink: default_blink,
             cursor_visible: true,
+            sixel_display_mode: false,
             alt_screen: false,
             mouse_protocol: MouseProtocol::None,
             mouse_encoding: MouseEncoding::Default,
@@ -177,6 +180,7 @@ impl Modes {
             9 => matches!(self.mouse_protocol, MouseProtocol::X10),
             12 => self.cursor_blink,
             25 => self.cursor_visible,
+            80 => self.sixel_display_mode,
             47 | 1047 | 1049 => self.alt_screen,
             69 => self.left_right_margin_mode,
             1000 => matches!(self.mouse_protocol, MouseProtocol::Normal),

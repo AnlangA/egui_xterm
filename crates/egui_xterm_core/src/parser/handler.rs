@@ -37,4 +37,7 @@ pub trait VtHandler {
 
     /// Dispatches a completed `ESC` sequence.
     fn esc_dispatch(&mut self, intermediates: &[u8], action: u8);
+
+    /// Dispatches a completed `APC` (`ESC _` or `0x9F` ... `ST`) payload.
+    fn apc_dispatch(&mut self, _data: &[u8]) {}
 }
