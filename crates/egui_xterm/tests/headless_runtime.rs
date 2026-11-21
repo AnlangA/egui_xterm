@@ -86,7 +86,12 @@ fn idle_input_polling_wakes_the_viewport_until_eof() {
     });
     let mut shapes = Vec::new();
     collect_shapes(&clipped, &mut shapes);
-    assert!(all_text(&shapes).contains("late output"));
+    assert_eq!(
+        runtime.terminal().visible_line_text(0).as_deref(),
+        Some("late output")
+    );
+    let text_mesh = find_text_mesh(&shapes).expect("coalesced text mesh for late output");
+    assert_eq!(text_mesh.vertices.len(), "lateoutput".len() * 4);
     assert!(
         !repaint_rx
             .try_iter()
@@ -127,7 +132,12 @@ fn synchronized_output_watchdog_wakes_an_event_driven_viewport() {
     let mut shapes = Vec::new();
     collect_shapes(&clipped, &mut shapes);
     assert!(!runtime.terminal().is_synchronized_output());
-    assert!(all_text(&shapes).contains("updated"));
+    assert_eq!(
+        runtime.terminal().visible_line_text(0).as_deref(),
+        Some("updated")
+    );
+    let text_mesh = find_text_mesh(&shapes).expect("coalesced text mesh for updated");
+    assert_eq!(text_mesh.vertices.len(), "updated".len() * 4);
 }
 
 fn collect_shapes(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<Shape>) {
@@ -155,6 +165,18 @@ fn all_text(shapes: &[Shape]) -> String {
         }
     }
     buf
+}
+
+fn find_text_mesh(shapes: &[Shape]) -> Option<&std::sync::Arc<egui::epaint::Mesh>> {
+    shapes.iter().find_map(|s| match s {
+        Shape::Mesh(m)
+            if m.texture_id == egui::TextureId::default()
+                && m.vertices.iter().any(|v| v.uv != egui::epaint::WHITE_UV) =>
+        {
+            Some(m)
+        }
+        _ => None,
+    })
 }
 
 fn check_all_rects_snapped(shapes: &[Shape], ppp: f32) -> usize {
@@ -243,7 +265,12 @@ fn terminal_widget_adapter_and_pixel_snapping() {
         let mut shapes = Vec::new();
         collect_shapes(&clipped, &mut shapes);
         assert_eq!(check_all_rects_snapped(&shapes, ppp), 0);
-        assert!(all_text(&shapes).contains("Hello Widget"));
+        assert_eq!(
+            rt.terminal().visible_line_text(0).as_deref(),
+            Some("Hello Widget")
+        );
+        let text_mesh = find_text_mesh(&shapes).expect("coalesced text mesh for Hello Widget");
+        assert_eq!(text_mesh.vertices.len(), "HelloWidget".len() * 4);
     }
 }
 
@@ -384,10 +411,14 @@ fn dec_2026_watchdog_and_ime_and_copy_selection() {
     assert!(plat_mid.ime.is_some());
     let mut mid_shapes = Vec::new();
     collect_shapes(&clipped_mid, &mut mid_shapes);
+    assert_eq!(
+        rt.terminal().render_snapshot_line_text(0).as_deref(),
+        Some("OLD")
+    );
+    let mid_mesh = find_text_mesh(&mid_shapes).expect("latched OLD text mesh");
+    assert_eq!(mid_mesh.vertices.len(), "OLD".len() * 4);
     let mid_txt = all_text(&mid_shapes);
-    assert!(mid_txt.contains("OLD"));
     assert!(mid_txt.contains("nihao"));
-    assert!(!mid_txt.contains("NEW_AFTER_WATCHDOG"));
 
     // After >250ms, watchdog unlatches + empty preedit clears preedit.
     let (clipped_after, _) = run_frame_with(
@@ -407,9 +438,13 @@ fn dec_2026_watchdog_and_ime_and_copy_selection() {
     );
     let mut after_shapes = Vec::new();
     collect_shapes(&clipped_after, &mut after_shapes);
-    let after_txt = all_text(&after_shapes);
-    assert!(after_txt.contains("NEW_AFTER_WATCHDOG"));
-    assert!(!after_txt.contains("nihao"));
+    assert_eq!(
+        rt.terminal().render_snapshot_line_text(0).as_deref(),
+        Some("NEW_AFTER_WATCHDOG")
+    );
+    let after_mesh = find_text_mesh(&after_shapes).expect("unlatched NEW_AFTER_WATCHDOG text mesh");
+    assert_eq!(after_mesh.vertices.len(), "NEW_AFTER_WATCHDOG".len() * 4);
+    assert!(!all_text(&after_shapes).contains("nihao"));
 
     // Copy without selection -> \x03
     let _ = run_frame_with(&ctx, screen, 1.0, 0.40, vec![Event::Copy], |ui| {
@@ -897,79 +932,73 @@ fn ascii_fast_path_preserves_galley_sections_colors_reuse_and_fallback() {
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(
         b"  \x1b[38;2;10;20;30mAB\x1b[3mCD\x1b[8mSEC\x1b[0mEF  \r\nX\xE2\x94\x80Y\r\n",
     ));
+    rt.config_mut().cursor_blink = false;
 
-    // Frame 1: initial render populates AsciiGlyphCache
+    // Frame 1: initial render populates AsciiGlyphCache and coalesces rows into text_mesh.
     let mut cell_size = vec2(0.0, 0.0);
-    let mut origin_x = 0.0;
+    let mut origin = Pos2::ZERO;
     let (c1, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             let resp = rt.show(ui);
             cell_size = resp.cell_size;
-            origin_x = resp.response.rect.min.x;
+            origin = resp.response.rect.min;
         });
     });
     let mut s1 = Vec::new();
     collect_shapes(&c1, &mut s1);
     assert_eq!(check_all_rects_snapped(&s1, 1.0), 0);
+    assert!(!s1.iter().any(|s| matches!(s, Shape::Text(_))));
+    assert!(
+        rt.terminal()
+            .visible_line_text(0)
+            .as_deref()
+            .is_some_and(|line| line.contains("ABCDSECEF"))
+    );
+    assert_eq!(rt.terminal().visible_line_text(1).as_deref(), Some("X─Y"));
 
-    let text_shapes: Vec<_> = s1
+    let m1 = find_text_mesh(&s1).expect("coalesced text mesh frame 1");
+    let row0_quads: Vec<&[egui::epaint::Vertex; 4]> = m1
+        .vertices
+        .as_chunks::<4>()
+        .0
         .iter()
-        .filter_map(|s| match s {
-            Shape::Text(ts) => Some(ts),
-            _ => None,
-        })
+        .filter(|q| ((q[0].pos.y + q[2].pos.y) * 0.5) < origin.y + cell_size.y)
         .collect();
-    assert_eq!(text_shapes.len(), 2);
-    let row0_ts = text_shapes[0];
-    let row0 = &row0_ts.galley;
-    assert_eq!(row0.job.text, "ABCDSECEF");
-    assert!((row0_ts.pos.x - (origin_x + 2.0 * cell_size.x)).abs() <= 1e-3);
-    assert_eq!(row0.rows[0].row.visuals.mesh.vertices.len(), 9 * 4);
-
-    let f_x = row0_ts.pos.x + row0.pos_from_cursor(egui::text::CCursor::new(8)).min.x;
-    assert!((f_x - (origin_x + 10.0 * cell_size.x)).abs() <= 1.0);
-
-    // Verify contiguous sections covering entire text and SGR 8 HIDDEN transparent color.
-    let mut expected_start = 0usize;
-    let mut saw_rgb = false;
-    let mut saw_italic = false;
-    let mut saw_hidden = false;
-    for sec in &row0.job.sections {
-        assert_eq!(sec.byte_range.start.0, expected_start);
-        expected_start = sec.byte_range.end.0;
-        if sec.format.color == egui::Color32::from_rgb(10, 20, 30) {
-            saw_rgb = true;
-        }
-        if sec.format.italics {
-            saw_italic = true;
-        }
-        if row0.job.text[sec.byte_range.start.0..sec.byte_range.end.0].contains("SEC") {
-            assert_eq!(sec.format.color, egui::Color32::TRANSPARENT);
-            saw_hidden = true;
-        }
-    }
-    assert_eq!(expected_start, row0.job.text.len());
-    assert!(saw_rgb && saw_italic && saw_hidden);
+    // Row 0 visible ASCII glyphs: A, B, C, D, E, F (spaces & SGR 8 HIDDEN "SEC" emit 0 quads).
+    assert_eq!(row0_quads.len(), 6);
+    assert_eq!(row0_quads[0][0].color, egui::Color32::from_rgb(10, 20, 30));
+    assert_eq!(row0_quads[1][0].color, egui::Color32::from_rgb(10, 20, 30));
+    assert!(row0_quads[0][2].pos.x >= origin.x + 2.0 * cell_size.x - 1.0);
+    assert!(row0_quads[0][2].pos.x < origin.x + 3.0 * cell_size.x);
+    assert!(
+        row0_quads[2][0].pos.x > row0_quads[2][2].pos.x,
+        "italic C should slant top vertices right"
+    );
+    assert!(
+        row0_quads[3][0].pos.x > row0_quads[3][2].pos.x,
+        "italic D should slant top vertices right"
+    );
+    assert!(
+        row0_quads[5][2].pos.x >= origin.x + 10.0 * cell_size.x - 1.0
+            && row0_quads[5][2].pos.x < origin.x + 11.0 * cell_size.x,
+        "F should land at col 10 after hidden SEC"
+    );
 
     // Row 1 has vector/Unicode box-drawing between X and Y; verify Y stays at column 2.
-    let row1_ts = text_shapes[1];
-    assert!(row1_ts.galley.job.text.contains('X') && row1_ts.galley.job.text.contains('Y'));
-    let y_char_idx = row1_ts
-        .galley
-        .job
-        .text
-        .chars()
-        .position(|c| c == 'Y')
-        .expect("Y char");
-    let y_x = row1_ts.pos.x
-        + row1_ts
-            .galley
-            .pos_from_cursor(egui::text::CCursor::new(y_char_idx))
-            .min
-            .x;
-    assert!(y_x >= origin_x + 1.5 * cell_size.x);
+    let row1_quads: Vec<&[egui::epaint::Vertex; 4]> = m1
+        .vertices
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|q| {
+            let ym = (q[0].pos.y + q[2].pos.y) * 0.5;
+            ym >= origin.y + cell_size.y && ym < origin.y + 2.0 * cell_size.y
+        })
+        .collect();
+    let last_row1 = row1_quads.last().expect("row1 Y quad");
+    assert!(last_row1[2].pos.x >= origin.x + 1.5 * cell_size.x);
 
-    // Frame 2: overwrite row 0 in-place to exercise slot.galley Arc::get_mut reuse
+    // Frame 2: overwrite row 0 in-place and verify text_mesh updates cleanly.
     rt.input_mut()
         .push_str("\x1b[1;1H\x1b[2K\x1b[38;2;200;100;50mUPDATED_ROW0");
     let (c2, _) = run_frame_with(&ctx, screen, 1.0, 0.05, Vec::new(), |ui| {
@@ -979,9 +1008,21 @@ fn ascii_fast_path_preserves_galley_sections_colors_reuse_and_fallback() {
     });
     let mut s2 = Vec::new();
     collect_shapes(&c2, &mut s2);
-    let txt2 = all_text(&s2);
-    assert!(txt2.contains("UPDATED_ROW0"));
-    assert!(!txt2.contains("ABCDSECEF"));
+    assert_eq!(
+        rt.terminal().visible_line_text(0).as_deref(),
+        Some("UPDATED_ROW0")
+    );
+    let m2 = find_text_mesh(&s2).expect("text mesh frame 2");
+    assert!(
+        m2.vertices
+            .iter()
+            .any(|v| v.color == egui::Color32::from_rgb(200, 100, 50))
+    );
+    assert!(
+        !m2.vertices
+            .iter()
+            .any(|v| v.color == egui::Color32::from_rgb(10, 20, 30))
+    );
 
     // Frame 3: change pixels_per_point to 2.0 and verify AsciiGlyphCache invalidates cleanly
     let (c3, _) = run_frame_with(&ctx, screen, 2.0, 0.10, Vec::new(), |ui| {
@@ -992,11 +1033,23 @@ fn ascii_fast_path_preserves_galley_sections_colors_reuse_and_fallback() {
     let mut s3 = Vec::new();
     collect_shapes(&c3, &mut s3);
     assert_eq!(check_all_rects_snapped(&s3, 2.0), 0);
-    for s in &s3 {
-        if let Shape::Text(ts) = s {
-            assert!((ts.galley.pixels_per_point - 2.0).abs() < 1e-6);
-        }
+    let m3 = find_text_mesh(&s3).expect("text mesh frame 3");
+    assert!(!std::sync::Arc::ptr_eq(m2, m3));
+    for v in &m3.vertices {
+        assert!(v.uv.x.is_finite() && v.uv.y.is_finite());
+        assert!(v.uv.x >= 0.0 && v.uv.x <= 1.0 && v.uv.y >= 0.0 && v.uv.y <= 1.0);
     }
+
+    // Frame 4: idle frame at ppp=2.0 reuses cached text_mesh Arc.
+    let (c4, _) = run_frame_with(&ctx, screen, 2.0, 0.15, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut s4 = Vec::new();
+    collect_shapes(&c4, &mut s4);
+    let m4 = find_text_mesh(&s4).expect("text mesh frame 4");
+    assert!(std::sync::Arc::ptr_eq(m3, m4));
 }
 
 #[test]
@@ -1007,74 +1060,106 @@ fn unicode_slow_path_eliminates_cumulative_drift() {
     line2.push_str("END");
     let payload = format!("你好🚀OK\r\n{line2}\r\n👨\u{200D}👩\u{200D}👧\u{200D}👦AB\r\n");
     let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(payload.as_bytes()));
+    rt.config_mut().cursor_blink = false;
 
-    let mut origin_x = 0.0;
-    let mut cell_w = 0.0;
+    let mut origin = Pos2::ZERO;
+    let mut cell_size = vec2(0.0, 0.0);
+    let mut eff_font_size = 14.0;
     let (clipped, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             let resp = rt.show(ui);
-            origin_x = resp.response.rect.min.x;
-            cell_w = resp.cell_size.x;
+            origin = resp.response.rect.min;
+            cell_size = resp.cell_size;
+            eff_font_size = resp.effective_font_size;
         });
     });
+    let cell_w = cell_size.x;
+    let cell_h = cell_size.y;
+
+    assert_eq!(
+        rt.terminal().visible_line_text(0).as_deref(),
+        Some("你好🚀OK")
+    );
+    assert_eq!(
+        rt.terminal().visible_line_text(1).as_deref(),
+        Some(line2.as_str())
+    );
+    assert_eq!(
+        rt.terminal().visible_line_text(2).as_deref(),
+        Some("👨\u{200D}👩\u{200D}👧\u{200D}👦AB")
+    );
 
     let mut shapes = Vec::new();
     collect_shapes(&clipped, &mut shapes);
-    let text_shapes: Vec<_> = shapes
-        .iter()
-        .filter_map(|s| match s {
-            Shape::Text(ts) => Some(ts),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text_shapes.len(), 3);
+    let text_mesh = find_text_mesh(&shapes).expect("coalesced unicode text mesh");
 
-    // Row 0: "你好🚀OK" stays in a single Galley and 'O' lands at col 6.
-    let row0 = text_shapes[0];
-    assert_eq!(row0.galley.job.text, "你好🚀OK");
-    let o_idx = row0
-        .galley
-        .job
-        .text
-        .chars()
-        .position(|c| c == 'O')
-        .expect("O");
-    let o_x = row0.pos.x + row0.galley.rows[0].row.glyphs[o_idx].pos.x;
-    let expected_o_x = origin_x + 6.0 * cell_w;
+    let probe_min_x = |ch: &str| -> f32 {
+        ctx.fonts_mut(|f| {
+            let mut job = egui::text::LayoutJob {
+                first_row_min_height: cell_h,
+                break_on_newline: false,
+                keep_trailing_whitespace: true,
+                ..Default::default()
+            };
+            job.append(
+                ch,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::new(eff_font_size, egui::FontFamily::Monospace),
+                    ..Default::default()
+                },
+            );
+            let g = f.layout_job(job);
+            g.rows[0].row.visuals.mesh.vertices[0].pos.x
+        })
+    };
+    let ref_o_dx = probe_min_x("O");
+    let ref_e_dx = probe_min_x("E");
+    let ref_a_dx = probe_min_x("A");
+
+    let row_quads = |row_idx: usize| -> Vec<&[egui::epaint::Vertex; 4]> {
+        let y0 = origin.y + row_idx as f32 * cell_h;
+        let y1 = y0 + cell_h;
+        text_mesh
+            .vertices
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| {
+                let ym = (q[0].pos.y + q[2].pos.y) * 0.5;
+                ym >= y0 && ym < y1
+            })
+            .collect()
+    };
+
+    // Row 0: "你好🚀OK" -> 'O' (second-to-last quad) lands at col 6.
+    let r0 = row_quads(0);
+    assert!(r0.len() >= 2);
+    let o_x = r0[r0.len() - 2][0].pos.x - ref_o_dx;
+    let expected_o_x = origin.x + 6.0 * cell_w;
     assert!(
         (o_x - expected_o_x).abs() <= 0.5,
         "row0 'O' drifted: got {o_x}, expected {expected_o_x}"
     );
 
-    // Row 1: 20x 🚀 + "END" places 'E' at col 40 within <= 0.5px.
-    let row1 = text_shapes[1];
-    let e_idx = row1
-        .galley
-        .job
-        .text
-        .chars()
-        .position(|c| c == 'E')
-        .expect("E");
-    let e_x = row1.pos.x + row1.galley.rows[0].row.glyphs[e_idx].pos.x;
-    let expected_e_x = origin_x + 40.0 * cell_w;
+    // Row 1: 20x 🚀 + "END" -> 'E' (third-to-last quad) lands at col 40 within <= 0.5px.
+    let r1 = row_quads(1);
+    assert!(r1.len() >= 3);
+    let e_x = r1[r1.len() - 3][0].pos.x - ref_e_dx;
+    let expected_e_x = origin.x + 40.0 * cell_w;
     assert!(
         (e_x - expected_e_x).abs() <= 0.5,
         "20x🚀+END 'E' drifted: got {e_x}, expected {expected_e_x}"
     );
 
-    // Row 2: ZWJ family emoji + "AB" places 'A' at col 2 (>= 1.5 * cell_w).
-    let row2 = text_shapes[2];
-    let a_idx = row2
-        .galley
-        .job
-        .text
-        .chars()
-        .position(|c| c == 'A')
-        .expect("A");
-    let a_x = row2.pos.x + row2.galley.rows[0].row.glyphs[a_idx].pos.x;
+    // Row 2: ZWJ family emoji + "AB" -> 'A' (second-to-last quad) lands at col 2 (>= 1.5 * cell_w).
+    let r2 = row_quads(2);
+    assert!(r2.len() >= 2);
+    let a_x = r2[r2.len() - 2][0].pos.x - ref_a_dx;
     assert!(
-        a_x >= origin_x + 1.5 * cell_w,
-        "ZWJ family 'A' collided: got {a_x}, origin_x={origin_x}, cell_w={cell_w}"
+        a_x >= origin.x + 1.5 * cell_w && (a_x - (origin.x + 2.0 * cell_w)).abs() <= 0.5,
+        "ZWJ family 'A' collided or drifted: got {a_x}, origin_x={}, cell_w={cell_w}",
+        origin.x
     );
 }
 
@@ -2225,72 +2310,32 @@ fn mid_frame_glyph_atlas_exhaustion_completes_without_deadlock_and_recovers() {
         });
     });
 
+    assert_eq!(
+        rt.terminal().visible_line_text(0).as_deref(),
+        Some("POST_EXHAUST_OK")
+    );
     let mut shapes = Vec::new();
     collect_shapes(&clipped, &mut shapes);
-    let post_ts = shapes
-        .iter()
-        .find_map(|s| match s {
-            Shape::Text(ts) if ts.galley.job.text == "POST_EXHAUST_OK" => Some(ts),
-            _ => None,
-        })
-        .expect("POST_EXHAUST_OK galley after atlas recovery");
-
-    // Compare each character quad's UVs against a fresh `fonts.layout_job` reference at x=0
-    // (matching the SubpixelBin::Zero allocation used by the terminal's ASCII glyph cache)
-    // and verify the UVs reside cleanly inside the current font atlas bounds.
-    let atlas_size = ctx.fonts_mut(|f| f.font_image_size());
-    let text_chars: Vec<char> = post_ts.galley.job.text.chars().collect();
-    let verts = &post_ts.galley.rows[0].row.visuals.mesh.vertices;
-    assert_eq!(verts.len(), text_chars.len() * 4);
-
-    for (idx, &ch) in text_chars.iter().enumerate() {
-        let mut s = [0u8; 4];
-        let ch_str = ch.encode_utf8(&mut s);
-        let ref_galley = ctx.fonts_mut(|f| {
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                ch_str,
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
-                    ..Default::default()
-                },
-            );
-            f.layout_job(job)
-        });
-        let got_uvs: Vec<[f32; 2]> = verts[idx * 4..(idx + 1) * 4]
-            .iter()
-            .map(|v| [v.uv.x, v.uv.y])
-            .collect();
-        let ref_uvs: Vec<[f32; 2]> = ref_galley.rows[0]
-            .row
-            .visuals
-            .mesh
-            .vertices
-            .iter()
-            .map(|v| [v.uv.x, v.uv.y])
-            .collect();
-        assert_eq!(
-            got_uvs, ref_uvs,
-            "UV mismatch for char {ch:?} after recovery"
-        );
-        for [u, v] in got_uvs {
-            assert!(
-                u.is_finite()
-                    && v.is_finite()
-                    && u >= 0.0
-                    && v >= 0.0
-                    && u <= atlas_size[0] as f32
-                    && v <= atlas_size[1] as f32
-            );
-        }
-    }
+    let post_mesh = find_text_mesh(&shapes).expect("POST_EXHAUST_OK text mesh after recovery");
+    assert_text_mesh_uvs_match_fresh_fonts(
+        &ctx,
+        post_mesh,
+        "POST_EXHAUST_OK",
+        "POST_EXHAUST_OK recovery",
+    );
 }
 
-fn assert_text_uvs_match_fresh_fonts(ctx: &Context, ts: &egui::epaint::TextShape, label: &str) {
+fn assert_text_mesh_uvs_match_fresh_fonts(
+    ctx: &Context,
+    mesh: &egui::epaint::Mesh,
+    expected_text: &str,
+    label: &str,
+) {
     let atlas_size = ctx.fonts_mut(|f| f.font_image_size());
-    let text_chars: Vec<char> = ts.galley.job.text.chars().collect();
-    let verts = &ts.galley.rows[0].row.visuals.mesh.vertices;
+    let tex_w = atlas_size[0] as f32;
+    let tex_h = atlas_size[1] as f32;
+    let text_chars: Vec<char> = expected_text.chars().collect();
+    let verts = &mesh.vertices;
     assert_eq!(
         verts.len(),
         text_chars.len() * 4,
@@ -2322,18 +2367,24 @@ fn assert_text_uvs_match_fresh_fonts(ctx: &Context, ts: &egui::epaint::TextShape
             .mesh
             .vertices
             .iter()
-            .map(|v| [v.uv.x, v.uv.y])
+            .map(|v| [v.uv.x / tex_w, v.uv.y / tex_h])
             .collect();
-        assert_eq!(got_uvs, ref_uvs, "{label}: UV mismatch for char {ch:?}");
-        for [u, v] in got_uvs {
+        assert_eq!(got_uvs.len(), ref_uvs.len());
+        for (got, expected) in got_uvs.iter().zip(ref_uvs.iter()) {
             assert!(
-                u.is_finite()
-                    && v.is_finite()
-                    && u >= 0.0
-                    && v >= 0.0
-                    && u <= atlas_size[0] as f32
-                    && v <= atlas_size[1] as f32,
-                "{label}: UV ({u}, {v}) out of atlas bounds {atlas_size:?}"
+                (got[0] - expected[0]).abs() <= 1e-5 && (got[1] - expected[1]).abs() <= 1e-5,
+                "{label}: UV mismatch for char {ch:?}: got {got:?}, expected {expected:?}"
+            );
+            assert!(
+                got[0].is_finite()
+                    && got[1].is_finite()
+                    && got[0] >= 0.0
+                    && got[1] >= 0.0
+                    && got[0] <= 1.0
+                    && got[1] <= 1.0,
+                "{label}: normalized UV ({}, {}) out of 0..=1 bounds",
+                got[0],
+                got[1]
             );
         }
     }
@@ -2453,18 +2504,17 @@ fn two_widget_sibling_atlas_clear_invalidates_terminal_uvs() {
         pre_rt_fill >= fill0 && pre_rt_h >= h0,
         "test setup must reproduce fill >= fill0 ({pre_rt_fill} >= {fill0}) and h >= h0 ({pre_rt_h} >= {h0})"
     );
+    assert_eq!(
+        rt.terminal().visible_line_text(0).as_deref(),
+        Some("HELLO_WORLD")
+    );
     let mut shapes1 = Vec::new();
     collect_shapes(&clipped1, &mut shapes1);
-    let frame1_ts = shapes1
-        .iter()
-        .find_map(|s| match s {
-            Shape::Text(ts) if ts.galley.job.text == "HELLO_WORLD" => Some(ts.clone()),
-            _ => None,
-        })
-        .expect("HELLO_WORLD galley on Frame 1");
-    assert_text_uvs_match_fresh_fonts(&ctx, &frame1_ts, "Frame 1");
+    let frame1_mesh = find_text_mesh(&shapes1).expect("HELLO_WORLD text mesh on Frame 1");
+    assert_text_mesh_uvs_match_fresh_fonts(&ctx, frame1_mesh, "HELLO_WORLD", "Frame 1");
 
-    // Frame 2: steady-state normal frame (no atlas clear) must hit cached Galley without rebuild.
+    // Frame 2: steady-state normal frame (no atlas clear); verify UVs, then confirm Frame 2b
+    // reuses the cached text Mesh Arc without spurious invalidation.
     let (clipped2, _) = run_frame_with(&ctx, screen, 1.0, 0.10, Vec::new(), |ui| {
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             ui.allocate_ui(vec2(600.0, 200.0), |ui| {
@@ -2474,16 +2524,22 @@ fn two_widget_sibling_atlas_clear_invalidates_terminal_uvs() {
     });
     let mut shapes2 = Vec::new();
     collect_shapes(&clipped2, &mut shapes2);
-    let frame2_ts = shapes2
-        .iter()
-        .find_map(|s| match s {
-            Shape::Text(ts) if ts.galley.job.text == "HELLO_WORLD" => Some(ts.clone()),
-            _ => None,
-        })
-        .expect("HELLO_WORLD galley on Frame 2");
+    let frame2_mesh = find_text_mesh(&shapes2).expect("HELLO_WORLD text mesh on Frame 2");
+    assert_text_mesh_uvs_match_fresh_fonts(&ctx, frame2_mesh, "HELLO_WORLD", "Frame 2");
+
+    let (clipped2b, _) = run_frame_with(&ctx, screen, 1.0, 0.12, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            ui.allocate_ui(vec2(600.0, 200.0), |ui| {
+                let _ = rt.show(ui);
+            });
+        });
+    });
+    let mut shapes2b = Vec::new();
+    collect_shapes(&clipped2b, &mut shapes2b);
+    let frame2b_mesh = find_text_mesh(&shapes2b).expect("HELLO_WORLD text mesh on Frame 2b");
     assert!(
-        std::sync::Arc::ptr_eq(&frame1_ts.galley, &frame2_ts.galley),
-        "steady-state Frame 2 should reuse cached Galley Arc without spurious invalidation"
+        std::sync::Arc::ptr_eq(frame2_mesh, frame2b_mesh),
+        "steady-state Frame 2b should reuse cached text Mesh Arc without spurious invalidation"
     );
 
     // Frame 3: `ctx.set_fonts(...)` replaces Fonts/galley_caches in-place; UVs must stay valid.
@@ -2504,14 +2560,8 @@ fn two_widget_sibling_atlas_clear_invalidates_terminal_uvs() {
     });
     let mut shapes3 = Vec::new();
     collect_shapes(&clipped3, &mut shapes3);
-    let frame3_ts = shapes3
-        .iter()
-        .find_map(|s| match s {
-            Shape::Text(ts) if ts.galley.job.text == "HELLO_WORLD" => Some(ts.clone()),
-            _ => None,
-        })
-        .expect("HELLO_WORLD galley on Frame 3");
-    assert_text_uvs_match_fresh_fonts(&ctx, &frame3_ts, "Frame 3 (set_fonts)");
+    let frame3_mesh = find_text_mesh(&shapes3).expect("HELLO_WORLD text mesh on Frame 3");
+    assert_text_mesh_uvs_match_fresh_fonts(&ctx, frame3_mesh, "HELLO_WORLD", "Frame 3 (set_fonts)");
 }
 
 #[test]
@@ -8195,6 +8245,14 @@ fn sgr_blink_schedules_repaint_only_when_visible_and_toggles_visibility() {
     // Feed SGR 5 blinking text.
     rt.terminal_mut().advance(b"\r\n\x1b[5mBLINK\x1b[0m");
 
+    assert_eq!(
+        rt.terminal().visible_line_text(0).as_deref(),
+        Some("plain text")
+    );
+    assert_eq!(rt.terminal().visible_line_text(1).as_deref(), Some("BLINK"));
+    let plain_verts = "plaintext".len() * 4;
+    let total_on_verts = ("plaintext".len() + "BLINK".len()) * 4;
+
     // At t = 0.0 (on phase), BLINK is visible and schedules <= 500ms repaint.
     let (clipped_on, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
@@ -8203,16 +8261,8 @@ fn sgr_blink_schedules_repaint_only_when_visible_and_toggles_visibility() {
     });
     let mut shapes_on = Vec::new();
     collect_shapes(&clipped_on, &mut shapes_on);
-    let blink_visible_on = shapes_on.iter().any(|s| {
-        if let Shape::Text(t) = s {
-            t.galley.text().contains("BLINK")
-                && t.galley
-                    .rows
-                    .iter()
-                    .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
-        } else {
-            false
-        }
+    let blink_visible_on = find_text_mesh(&shapes_on).is_some_and(|m| {
+        m.vertices.len() == total_on_verts && m.vertices.iter().all(|v| v.color.a() > 0)
     });
     assert!(blink_visible_on, "blinking text should be visible at t=0.0");
     assert!(
@@ -8222,7 +8272,7 @@ fn sgr_blink_schedules_repaint_only_when_visible_and_toggles_visibility() {
         "must schedule blink repaint when blinking cells are visible"
     );
 
-    // At t = 0.6 (off phase), BLINK row's galley vertices for BLINK are transparent.
+    // At t = 0.6 (off phase), BLINK is hidden from coalesced text_mesh while "plain text" remains.
     let (clipped_off, _) = run_frame_with(&ctx, screen, 1.0, 0.6, Vec::new(), |ui| {
         CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
             let _ = rt.show(ui);
@@ -8230,19 +8280,11 @@ fn sgr_blink_schedules_repaint_only_when_visible_and_toggles_visibility() {
     });
     let mut shapes_off = Vec::new();
     collect_shapes(&clipped_off, &mut shapes_off);
-    let blink_row_opaque = shapes_off.iter().any(|s| {
-        if let Shape::Text(t) = s {
-            t.galley.text().contains("BLINK")
-                && t.galley
-                    .rows
-                    .iter()
-                    .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
-        } else {
-            false
-        }
+    let blink_hidden_off = find_text_mesh(&shapes_off).is_some_and(|m| {
+        m.vertices.len() == plain_verts && m.vertices.iter().all(|v| v.color.a() > 0)
     });
     assert!(
-        !blink_row_opaque,
+        blink_hidden_off,
         "blinking text should be hidden during off phase (t=0.6)"
     );
 
@@ -8256,16 +8298,8 @@ fn sgr_blink_schedules_repaint_only_when_visible_and_toggles_visibility() {
     });
     let mut shapes_disabled = Vec::new();
     collect_shapes(&clipped_disabled, &mut shapes_disabled);
-    let blink_visible_disabled = shapes_disabled.iter().any(|s| {
-        if let Shape::Text(t) = s {
-            t.galley.text().contains("BLINK")
-                && t.galley
-                    .rows
-                    .iter()
-                    .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
-        } else {
-            false
-        }
+    let blink_visible_disabled = find_text_mesh(&shapes_disabled).is_some_and(|m| {
+        m.vertices.len() == total_on_verts && m.vertices.iter().all(|v| v.color.a() > 0)
     });
     assert!(
         blink_visible_disabled,

@@ -645,7 +645,7 @@ impl<I: TerminalInput> RuntimeInner<I> {
 
         // 6. 4-stage cached rendering.
         let has_focus = layout.response.has_focus();
-        let ime_cursor_rect = self.renderer.render(
+        let ime_cursor_rect = self.renderer.render_with_bell_style(
             ui,
             &layout,
             config,
@@ -655,6 +655,8 @@ impl<I: TerminalInput> RuntimeInner<I> {
             &self.input_mapper.ime_preedit,
             #[cfg(feature = "hyperlinks")]
             &hovered_spans,
+            config.visual_bell_color,
+            config.visual_bell_opacity,
         );
 
         // 7. Overlaid scrollbar, progress bar, & optional floating search bar.
@@ -1331,7 +1333,11 @@ mod tests {
             .shapes
             .iter()
             .filter(|cs| {
-                matches!(&cs.shape, egui::Shape::Rect(r) if r.rect.min.y == 0.0 && r.rect.height() <= 4.0)
+                matches!(
+                    &cs.shape,
+                    egui::Shape::Rect(r)
+                        if r.rect.min.y == 0.0 && r.rect.height() <= 4.0 && r.rect.width() > 50.0
+                )
             })
             .count();
         out1.drop_without_applying_deltas();
@@ -1362,7 +1368,11 @@ mod tests {
             .shapes
             .iter()
             .filter(|cs| {
-                matches!(&cs.shape, egui::Shape::Rect(r) if r.rect.min.y == 0.0 && r.rect.height() <= 4.0)
+                matches!(
+                    &cs.shape,
+                    egui::Shape::Rect(r)
+                        if r.rect.min.y == 0.0 && r.rect.height() <= 4.0 && r.rect.width() > 50.0
+                )
             })
             .count();
         out2.drop_without_applying_deltas();

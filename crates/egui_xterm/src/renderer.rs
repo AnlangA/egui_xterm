@@ -462,35 +462,6 @@ impl TerminalRenderer {
         self.effective_cursor_blink
     }
 
-    /// Executes the 4-stage render pipeline with default visual bell styling (`None`, `0.18`) and
-    /// returns the cursor anchor rect (in local layer coordinates) for IME positioning.
-    #[expect(clippy::too_many_arguments, reason = "per-frame render context")]
-    pub(crate) fn render(
-        &mut self,
-        ui: &mut Ui,
-        layout: &FrameLayout,
-        config: &TerminalConfig,
-        terminal: &mut Terminal,
-        now_secs: f64,
-        has_focus: bool,
-        ime_preedit: &ImePreeditState,
-        #[cfg(feature = "hyperlinks")] hovered_link_spans: &[egui_xterm_core::HyperlinkSpan],
-    ) -> Rect {
-        self.render_with_bell_style(
-            ui,
-            layout,
-            config,
-            terminal,
-            now_secs,
-            has_focus,
-            ime_preedit,
-            #[cfg(feature = "hyperlinks")]
-            hovered_link_spans,
-            None,
-            0.18,
-        )
-    }
-
     /// Executes the 4-stage render pipeline with explicit visual bell color and opacity, returning
     /// the cursor anchor rect (in local layer coordinates) for IME positioning.
     #[expect(clippy::too_many_arguments, reason = "per-frame render context")]
@@ -2091,7 +2062,7 @@ impl TerminalRenderer {
         blink_hidden: bool,
         frame_seq: u64,
     ) {
-        if !all_placements.iter().any(|p| p.is_virtual) {
+        if !snapshot.is_synchronized_output && !all_placements.iter().any(|p| p.is_virtual) {
             return;
         }
 
@@ -2110,8 +2081,7 @@ impl TerminalRenderer {
         let cell_px_h = (cell_h * ppp).round().max(1.0) as u32;
 
         let mut emit_run = |run: PlaceholderRun, vp_row: usize| {
-            let Some(vp) =
-                lookup_virtual_placement(snapshot, all_placements, run.image_id, run.placement_id)
+            let Some(vp) = lookup_virtual_placement(snapshot, run.image_id, run.placement_id)
             else {
                 return;
             };
@@ -2257,28 +2227,15 @@ impl TerminalRenderer {
     }
 }
 
-/// Virtual placement lookup hook. Uses `all_placements` on `main`, and can delegate directly to
-/// `RenderSnapshot::virtual_placement` once M4.4 lands on `RenderSnapshot`.
+/// Looks up a virtual (`U=1`) inline image placement directly via
+/// [`RenderSnapshot::virtual_placement`].
 #[cfg(feature = "kitty-graphics")]
 fn lookup_virtual_placement(
-    _snapshot: &RenderSnapshot<'_>,
-    all_placements: &[ImagePlacement],
+    snapshot: &RenderSnapshot<'_>,
     image_id: u32,
     placement_id: u32,
 ) -> Option<ImagePlacement> {
-    if placement_id != 0 {
-        all_placements
-            .iter()
-            .rev()
-            .copied()
-            .find(|p| p.is_virtual && p.image_id == image_id && p.placement_id == placement_id)
-    } else {
-        all_placements
-            .iter()
-            .rev()
-            .copied()
-            .find(|p| p.is_virtual && p.image_id == image_id)
-    }
+    snapshot.virtual_placement(image_id, placement_id)
 }
 
 #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
@@ -4689,33 +4646,21 @@ mod tests {
                 let layout = make_frame_layout(ui, cols, rows, ppp, config.font_size);
                 #[cfg(feature = "hyperlinks")]
                 let hovered: [egui_xterm_core::HyperlinkSpan; 0] = [];
-                if let Some((bell_c, bell_op)) = bell_style {
-                    let _ = renderer.render_with_bell_style(
-                        ui,
-                        &layout,
-                        config,
-                        terminal,
-                        time,
-                        true,
-                        &ImePreeditState::default(),
-                        #[cfg(feature = "hyperlinks")]
-                        &hovered,
-                        bell_c,
-                        bell_op,
-                    );
-                } else {
-                    let _ = renderer.render(
-                        ui,
-                        &layout,
-                        config,
-                        terminal,
-                        time,
-                        true,
-                        &ImePreeditState::default(),
-                        #[cfg(feature = "hyperlinks")]
-                        &hovered,
-                    );
-                }
+                let (bell_c, bell_op) =
+                    bell_style.unwrap_or((config.visual_bell_color, config.visual_bell_opacity));
+                let _ = renderer.render_with_bell_style(
+                    ui,
+                    &layout,
+                    config,
+                    terminal,
+                    time,
+                    true,
+                    &ImePreeditState::default(),
+                    #[cfg(feature = "hyperlinks")]
+                    &hovered,
+                    bell_c,
+                    bell_op,
+                );
             });
         })
     }
@@ -4899,7 +4844,7 @@ mod tests {
                 let layout = make_frame_layout(ui, 20, 3, 1.0, cfg.font_size);
                 #[cfg(feature = "hyperlinks")]
                 let hovered: [egui_xterm_core::HyperlinkSpan; 0] = [];
-                let _ = renderer.render(
+                let _ = renderer.render_with_bell_style(
                     ui,
                     &layout,
                     &cfg,
@@ -4909,6 +4854,8 @@ mod tests {
                     &ImePreeditState::default(),
                     #[cfg(feature = "hyperlinks")]
                     &hovered,
+                    cfg.visual_bell_color,
+                    cfg.visual_bell_opacity,
                 );
             });
         });
