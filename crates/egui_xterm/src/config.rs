@@ -1,6 +1,16 @@
 //! Configuration and response types for the [`crate::TerminalRuntime`] widget.
 
-use egui_xterm_core::{CursorShape, TerminalEvent, Theme};
+use egui_xterm_core::{CursorShape, Osc52ReadPolicy, TerminalEvent, Theme};
+
+/// Active `OSC 9;4` task progress indicator state reported by the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProgressIndicator {
+    /// Progress state (`0` = hidden, `1` = normal, `2` = error, `3` = indeterminate, `4` = paused).
+    pub state: u8,
+    /// Completion percentage (`0..=100`).
+    pub progress: u8,
+}
 
 /// How the terminal grid adapts when its allocated [`egui::Ui`] container changes size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +107,17 @@ pub struct TerminalConfig {
     pub enable_blink: bool,
     /// Duration in milliseconds of the visual bell flash on `BEL` (`0x07`). Set to `0` to disable.
     pub visual_bell_duration_ms: u32,
+    /// Optional color override for the visual bell flash on `BEL` (`0x07`). When `None`, uses
+    /// the active theme's foreground color.
+    pub visual_bell_color: Option<egui::Color32>,
+    /// Peak opacity of the visual bell flash in `0.0..=1.0`. Set to `0.0` to disable.
+    pub visual_bell_opacity: f32,
+    /// When `true`, render a subtle top-edge `OSC 9;4` progress indicator bar when active.
+    pub show_progress_bar: bool,
+    /// When `true`, allow `OSC 52` clipboard write sequences to update the host clipboard.
+    pub osc52_write_enabled: bool,
+    /// Policy controlling how `OSC 52 ; Pc ; ?` clipboard read requests are handled.
+    pub osc52_read_policy: Osc52ReadPolicy,
     /// When `true`, clicking a hyperlink requires holding `Ctrl` (or `Cmd` on macOS).
     pub hyperlink_require_ctrl: bool,
 }
@@ -119,6 +140,11 @@ impl Default for TerminalConfig {
             copy_behavior: CopyBehavior::CopyIfSelectionElseSendEtx,
             enable_blink: true,
             visual_bell_duration_ms: 150,
+            visual_bell_color: None,
+            visual_bell_opacity: 0.18,
+            show_progress_bar: true,
+            osc52_write_enabled: true,
+            osc52_read_policy: Osc52ReadPolicy::Deny,
             hyperlink_require_ctrl: false,
         }
     }
@@ -156,4 +182,31 @@ pub struct TerminalResponse {
     pub resized_this_frame: bool,
     /// Semantic terminal events emitted during this frame (e.g. title, CWD, bell, hyperlinks).
     pub events: Vec<TerminalEvent>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_config_and_progress_indicator_defaults() {
+        let cfg = TerminalConfig::default();
+        assert_eq!(cfg.visual_bell_color, None);
+        assert!((cfg.visual_bell_opacity - 0.18).abs() < 1e-6);
+        assert!(cfg.show_progress_bar);
+        assert!(cfg.osc52_write_enabled);
+        assert_eq!(cfg.osc52_read_policy, Osc52ReadPolicy::Deny);
+
+        let ind = ProgressIndicator::default();
+        assert_eq!(ind.state, 0);
+        assert_eq!(ind.progress, 0);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn terminal_config_and_progress_indicator_implement_serde() {
+        fn assert_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+        assert_serde::<ProgressIndicator>();
+        assert_serde::<TerminalConfig>();
+    }
 }

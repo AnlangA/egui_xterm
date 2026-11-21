@@ -29,14 +29,14 @@ pub(crate) fn paint_prompt_gutter(
     let badge_w = snap_size_at_least_1px(4.0, ppp);
     let grid_right = snap_px(origin.x + f32::from(snapshot.cols) * cell_size.x, ppp);
 
-    for zone in zones {
+    for zone in zones.in_line_range(retained_top, retained_end) {
         if zone.end_line < retained_top || zone.start_line >= retained_end {
             continue;
         }
         let r0 = zone.start_line.saturating_sub(retained_top);
         let r1 = zone
             .end_line
-            .min(retained_end - 1)
+            .min(retained_end.saturating_sub(1))
             .saturating_sub(retained_top);
 
         let color = match zone.exit_code {
@@ -76,5 +76,38 @@ pub(crate) fn paint_prompt_gutter(
                 overlay_mesh.add_colored_rect(badge_rect, color);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_xterm_core::{CoreConfig, Terminal};
+
+    use super::*;
+
+    #[test]
+    fn prompt_gutter_uses_range_query_across_many_zones() {
+        let mut term = Terminal::new(80, 10, CoreConfig::default());
+        for i in 0..2500 {
+            let line =
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd_{i}\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+            term.advance(line.as_bytes());
+        }
+        term.scroll_display(1200);
+        let snap = term.active_snapshot();
+        let zones = term.shell_zones();
+        assert!(zones.len() >= 100);
+
+        let mut mesh = Mesh::default();
+        paint_prompt_gutter(
+            &mut mesh,
+            &snap,
+            zones,
+            Pos2::ZERO,
+            Vec2::new(8.0, 16.0),
+            1.0,
+        );
+        assert!(!mesh.indices.is_empty());
+        assert!(mesh.vertices.len() <= 200);
     }
 }

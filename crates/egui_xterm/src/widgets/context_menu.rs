@@ -17,9 +17,9 @@ pub(crate) fn attach_context_menu(
     }
 
     let mut action = None;
-    let has_selection = terminal.selection_text().is_some_and(|s| !s.is_empty());
 
     response.context_menu(|ui| {
+        let has_selection = terminal.has_non_empty_selection();
         if ui
             .add_enabled(has_selection, egui::Button::new("Copy"))
             .clicked()

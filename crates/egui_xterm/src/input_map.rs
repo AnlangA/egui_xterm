@@ -1,6 +1,8 @@
 //! Translation of `egui` keyboard, text, IME, clipboard, focus, and pointer events into
 //! terminal actions and VT byte sequences.
 
+use std::borrow::Cow;
+
 use egui::{
     Event, EventFilter, ImeEvent, Key, Modifiers, MouseWheelUnit, OutputCommand, PointerButton,
     Pos2, Rect, Ui, Vec2,
@@ -27,6 +29,9 @@ pub(crate) struct InputMapperState {
     last_reported_focus: Option<bool>,
     pub pending_focus_lock_settle: bool,
     pub ime_preedit: ImePreeditState,
+    outgoing_scratch: Vec<u8>,
+    caps_lock: bool,
+    num_lock: bool,
     scrollbar_press_active: bool,
     left_down_in_grid: bool,
     press_pos: Option<Pos2>,
@@ -42,8 +47,8 @@ pub(crate) struct InputMapperState {
 }
 
 /// Output produced by [`InputMapperState::process_frame_events`].
-pub(crate) struct InputFrameOutcome {
-    pub bytes_to_write: Vec<u8>,
+pub(crate) struct InputFrameOutcome<'a> {
+    pub bytes_to_write: Cow<'a, [u8]>,
     #[cfg(feature = "hyperlinks")]
     pub clean_primary_click: bool,
     pub any_user_activity: bool,
@@ -51,7 +56,43 @@ pub(crate) struct InputFrameOutcome {
     pub open_search_requested: bool,
 }
 
+struct InputFrameFlags {
+    #[cfg(feature = "hyperlinks")]
+    clean_primary_click: bool,
+    any_user_activity: bool,
+    #[cfg(feature = "search")]
+    open_search_requested: bool,
+}
+
 impl InputMapperState {
+    /// Explicitly updates tracked `CapsLock` and `NumLock` states (e.g. from host OS state).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "forwarded by TerminalRuntime::set_lock_modifiers")
+    )]
+    pub(crate) const fn set_lock_modifiers(&mut self, caps_lock: bool, num_lock: bool) {
+        self.caps_lock = caps_lock;
+        self.num_lock = num_lock;
+    }
+
+    /// Returns the currently tracked `CapsLock` state.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "forwarded by TerminalRuntime::caps_lock")
+    )]
+    pub(crate) const fn caps_lock(&self) -> bool {
+        self.caps_lock
+    }
+
+    /// Returns the currently tracked `NumLock` state.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "forwarded by TerminalRuntime::num_lock")
+    )]
+    pub(crate) const fn num_lock(&self) -> bool {
+        self.num_lock
+    }
+
     /// Marks that focus was requested on this frame so the next frame guards immediate `Escape`/`Tab`.
     #[cfg(feature = "search")]
     pub(crate) fn note_focus_requested(&mut self) {
@@ -81,7 +122,7 @@ impl InputMapperState {
     }
 
     /// Applies focus lock, processes pointer/mouse/keyboard/IME/clipboard events, and updates
-    /// selection and IME preedit state.
+    /// selection and IME preedit state, borrowing the reusable `outgoing_scratch` buffer.
     #[expect(clippy::too_many_arguments, reason = "per-frame input coordinator")]
     pub(crate) fn process_frame_events(
         &mut self,
@@ -102,9 +143,65 @@ impl InputMapperState {
         scrollbar_dragging: bool,
         scrollbar_pointer_active: bool,
         context_menu_open: bool,
-    ) -> InputFrameOutcome {
-        let mut out = InputFrameOutcome {
-            bytes_to_write: Vec::new(),
+    ) -> InputFrameOutcome<'_> {
+        let mut scratch = std::mem::take(&mut self.outgoing_scratch);
+        scratch.clear();
+        let flags = self.process_frame_events_into(
+            ui,
+            id,
+            response,
+            term_rect,
+            cell_size,
+            cols,
+            rows,
+            now_secs,
+            config,
+            terminal,
+            search_bar_focused,
+            search_bar_actually_focused,
+            search_bar_rect,
+            scrollbar_rect,
+            scrollbar_dragging,
+            scrollbar_pointer_active,
+            context_menu_open,
+            &mut scratch,
+        );
+        self.outgoing_scratch = scratch;
+        InputFrameOutcome {
+            bytes_to_write: Cow::Borrowed(&self.outgoing_scratch),
+            #[cfg(feature = "hyperlinks")]
+            clean_primary_click: flags.clean_primary_click,
+            any_user_activity: flags.any_user_activity,
+            #[cfg(feature = "search")]
+            open_search_requested: flags.open_search_requested,
+        }
+    }
+
+    /// Processes frame input events and appends outgoing VT bytes directly into `out_bytes`
+    /// without allocating intermediate `Vec<u8>` buffers.
+    #[expect(clippy::too_many_arguments, reason = "per-frame input coordinator")]
+    fn process_frame_events_into(
+        &mut self,
+        ui: &Ui,
+        id: egui::Id,
+        response: &egui::Response,
+        term_rect: Rect,
+        cell_size: Vec2,
+        cols: u16,
+        rows: u16,
+        now_secs: f64,
+        config: &TerminalConfig,
+        terminal: &mut Terminal,
+        search_bar_focused: bool,
+        search_bar_actually_focused: bool,
+        search_bar_rect: Option<Rect>,
+        scrollbar_rect: Option<Rect>,
+        scrollbar_dragging: bool,
+        scrollbar_pointer_active: bool,
+        context_menu_open: bool,
+        out_bytes: &mut Vec<u8>,
+    ) -> InputFrameFlags {
+        let mut out = InputFrameFlags {
             #[cfg(feature = "hyperlinks")]
             clean_primary_click: false,
             any_user_activity: false,
@@ -297,7 +394,7 @@ impl InputMapperState {
         // Stage 7 so closing the bar via its "x" button keeps terminal focus without a spurious
         // `\x1b[O` -> `\x1b[I` bounce.
         if os_has_focus || search_bar_rect.is_none() {
-            self.sync_focus_transition(terminal, os_has_focus, &mut out.bytes_to_write);
+            self.sync_focus_transition(terminal, os_has_focus, out_bytes);
         }
 
         // Process pointer / mouse / wheel events first.
@@ -413,11 +510,7 @@ impl InputMapperState {
                                         row,
                                         modifiers: to_mouse_mods(mods),
                                     };
-                                    if let Some(bytes) =
-                                        terminal.encode_mouse_event_pixels(mev, px, py)
-                                    {
-                                        out.bytes_to_write.extend_from_slice(&bytes);
-                                    }
+                                    terminal.encode_mouse_event_pixels_into(mev, px, py, out_bytes);
                                 }
                             }
                         }
@@ -447,8 +540,9 @@ impl InputMapperState {
                                             .selection_update(usize::from(row), usize::from(col));
                                     }
                                     terminal.selection_finish();
-                                    if let Some(sel) =
-                                        terminal.selection_text().filter(|s| !s.is_empty())
+                                    if terminal.has_non_empty_selection()
+                                        && let Some(sel) =
+                                            terminal.selection_text().filter(|s| !s.is_empty())
                                     {
                                         ui.ctx().send_cmd(OutputCommand::TextSelectionSettled(sel));
                                     }
@@ -487,11 +581,8 @@ impl InputMapperState {
                                             row,
                                             modifiers: to_mouse_mods(*modifiers),
                                         };
-                                        if let Some(bytes) =
-                                            terminal.encode_mouse_event_pixels(mev, px, py)
-                                        {
-                                            out.bytes_to_write.extend_from_slice(&bytes);
-                                        }
+                                        terminal
+                                            .encode_mouse_event_pixels_into(mev, px, py, out_bytes);
                                     }
                                 }
                             }
@@ -524,10 +615,7 @@ impl InputMapperState {
                                     row,
                                     modifiers: to_mouse_mods(*modifiers),
                                 };
-                                if let Some(bytes) = terminal.encode_mouse_event_pixels(mev, px, py)
-                                {
-                                    out.bytes_to_write.extend_from_slice(&bytes);
-                                }
+                                terminal.encode_mouse_event_pixels_into(mev, px, py, out_bytes);
                             }
                         } else if *button == PointerButton::Primary
                             && let Some((col, row)) =
@@ -574,7 +662,7 @@ impl InputMapperState {
                             continue;
                         }
                         let pointer_inside = hover_pos.is_some_and(in_interact_grid);
-                        if !pointer_inside && !(has_focus && hover_pos.is_none()) {
+                        if !pointer_inside && (!has_focus || hover_pos.is_some()) {
                             continue;
                         }
                         let (col, row) = hover_pos
@@ -609,11 +697,7 @@ impl InputMapperState {
                                         row,
                                         modifiers: to_mouse_mods(*modifiers),
                                     };
-                                    if let Some(bytes) =
-                                        terminal.encode_mouse_event_pixels(mev, px, py)
-                                    {
-                                        out.bytes_to_write.extend_from_slice(&bytes);
-                                    }
+                                    terminal.encode_mouse_event_pixels_into(mev, px, py, out_bytes);
                                 }
                             } else if delta.x.abs() > f32::EPSILON
                                 && mouse_protocol != MouseProtocol::None
@@ -630,10 +714,7 @@ impl InputMapperState {
                                     row,
                                     modifiers: to_mouse_mods(*modifiers),
                                 };
-                                if let Some(bytes) = terminal.encode_mouse_event_pixels(mev, px, py)
-                                {
-                                    out.bytes_to_write.extend_from_slice(&bytes);
-                                }
+                                terminal.encode_mouse_event_pixels_into(mev, px, py, out_bytes);
                             }
                         } else if delta.y.abs() > f32::EPSILON {
                             let signed_lines = if delta.y > 0.0 {
@@ -648,7 +729,7 @@ impl InputMapperState {
                         if has_focus && self.last_reported_focus != Some(*focused) =>
                     {
                         if let Some(bytes) = terminal.focus_report(*focused) {
-                            out.bytes_to_write.extend_from_slice(bytes);
+                            out_bytes.extend_from_slice(bytes);
                         }
                         self.last_reported_focus = Some(*focused);
                     }
@@ -671,28 +752,54 @@ impl InputMapperState {
             match ev {
                 Event::Copy => {
                     out.any_user_activity = true;
-                    #[cfg(feature = "kitty-keyboard")]
-                    let kitty_handled = if !is_mac && !terminal.kitty_keyboard_flags().is_empty() {
-                        let has_sel = terminal.selection_text().is_some_and(|s| !s.is_empty());
-                        let should_send_key = match config.effective_copy_behavior() {
-                            CopyBehavior::AlwaysSendEtx => true,
-                            CopyBehavior::CopyIfSelectionElseSendEtx => !has_sel,
-                            CopyBehavior::AlwaysCopy => false,
-                        };
+                    let protocol_handled = if !is_mac {
+                        #[cfg(feature = "kitty-keyboard")]
+                        let kitty_active = !terminal.kitty_keyboard_flags().is_empty();
+                        #[cfg(not(feature = "kitty-keyboard"))]
+                        let kitty_active = false;
+
+                        let mok_always = !kitty_active && terminal.modify_other_keys_level() >= 2;
+                        let should_send_key = (kitty_active || mok_always)
+                            && match config.effective_copy_behavior() {
+                                CopyBehavior::AlwaysSendEtx => true,
+                                CopyBehavior::CopyIfSelectionElseSendEtx => {
+                                    !terminal.has_non_empty_selection()
+                                }
+                                CopyBehavior::AlwaysCopy => false,
+                            };
                         if should_send_key {
-                            let flags = terminal.kitty_keyboard_flags();
-                            let modes = *terminal.active_snapshot().modes;
-                            if let Some(encoded) = encode_egui_key_kitty(
-                                flags,
-                                &modes,
-                                Key::C,
-                                true,
-                                false,
-                                Modifiers::CTRL,
-                                None,
-                            ) {
-                                out.bytes_to_write.extend_from_slice(&encoded);
-                                true
+                            #[cfg(feature = "kitty-keyboard")]
+                            if kitty_active {
+                                let flags = terminal.kitty_keyboard_flags();
+                                let modes = *terminal.active_snapshot().modes;
+                                encode_egui_key_kitty_into(
+                                    flags,
+                                    &modes,
+                                    Key::C,
+                                    true,
+                                    false,
+                                    Modifiers::CTRL,
+                                    None,
+                                    self.caps_lock,
+                                    self.num_lock,
+                                    out_bytes,
+                                )
+                            } else {
+                                encode_egui_modify_other_keys_into(
+                                    terminal,
+                                    Key::C,
+                                    Modifiers::CTRL,
+                                    out_bytes,
+                                )
+                            }
+                            #[cfg(not(feature = "kitty-keyboard"))]
+                            if mok_always {
+                                encode_egui_modify_other_keys_into(
+                                    terminal,
+                                    Key::C,
+                                    Modifiers::CTRL,
+                                    out_bytes,
+                                )
                             } else {
                                 false
                             }
@@ -702,37 +809,26 @@ impl InputMapperState {
                     } else {
                         false
                     };
-                    #[cfg(not(feature = "kitty-keyboard"))]
-                    let kitty_handled = false;
 
-                    if !kitty_handled {
-                        handle_copy_shortcut(
-                            ui,
-                            config,
-                            terminal,
-                            is_mac,
-                            true,
-                            &mut out.bytes_to_write,
-                        );
+                    if !protocol_handled {
+                        handle_copy_shortcut(ui, config, terminal, is_mac, true, out_bytes);
                     }
                 }
                 Event::Cut => {
                     out.any_user_activity = true;
                     if !is_mac {
-                        out.bytes_to_write.push(0x18);
+                        out_bytes.push(0x18);
                     }
                 }
                 Event::Paste(text) => {
                     out.any_user_activity = true;
-                    let formatted = terminal.format_paste(text);
-                    out.bytes_to_write.extend_from_slice(&formatted);
+                    terminal.format_paste_into(text, out_bytes);
                 }
                 Event::MiddleClickPaste { text, pos } => {
                     let allow_middle_paste = mouse_protocol == MouseProtocol::None || shift_held;
                     if allow_middle_paste && in_interact_grid(*pos) && !pointer_in_overlay(*pos) {
                         out.any_user_activity = true;
-                        let formatted = terminal.format_paste(text);
-                        out.bytes_to_write.extend_from_slice(&formatted);
+                        terminal.format_paste_into(text, out_bytes);
                     }
                 }
                 Event::Ime(ime_ev) => {
@@ -754,7 +850,7 @@ impl InputMapperState {
                             self.ime_preedit.text.clear();
                             self.ime_preedit.active_range_chars = None;
                             if !text.is_empty() {
-                                out.bytes_to_write.extend_from_slice(text.as_bytes());
+                                out_bytes.extend_from_slice(text.as_bytes());
                             }
                         }
                         ImeEvent::DeleteSurrounding { .. } => {}
@@ -781,6 +877,33 @@ impl InputMapperState {
                         None
                     };
 
+                    if *pressed && !*repeat {
+                        match key {
+                            Key::CapsLock => self.caps_lock = !self.caps_lock,
+                            Key::NumLock => self.num_lock = !self.num_lock,
+                            _ => {}
+                        }
+                    }
+                    // Heuristic sync for CapsLock when OS lock state changed outside focus.
+                    if *pressed
+                        && is_alpha_key(*key)
+                        && !modifiers.shift
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.mac_cmd
+                        && !modifiers.command
+                        && let Some(txt) = paired_text
+                    {
+                        let mut chars = txt.chars();
+                        if let (Some(ch), None) = (chars.next(), chars.next()) {
+                            if ch.is_ascii_uppercase() {
+                                self.caps_lock = true;
+                            } else if ch.is_ascii_lowercase() {
+                                self.caps_lock = false;
+                            }
+                        }
+                    }
+
                     if *pressed && *key == Key::F && modifiers.ctrl && modifiers.shift {
                         #[cfg(feature = "search")]
                         {
@@ -794,9 +917,7 @@ impl InputMapperState {
                     let kitty_active = !terminal.kitty_keyboard_flags().is_empty();
                     #[cfg(not(feature = "kitty-keyboard"))]
                     let kitty_active = false;
-
-                    let has_non_empty_selection =
-                        terminal.selection_text().is_some_and(|s| !s.is_empty());
+                    let mok_level = terminal.modify_other_keys_level();
 
                     // Handle direct Key::C + CTRL when not already translated into Event::Copy.
                     if *pressed
@@ -805,21 +926,17 @@ impl InputMapperState {
                         && !modifiers.shift
                         && !modifiers.alt
                         && !modifiers.mac_cmd
-                        && (!kitty_active
-                            || (has_non_empty_selection
-                                && config.effective_copy_behavior() != CopyBehavior::AlwaysSendEtx))
                     {
-                        out.any_user_activity = true;
-                        handle_copy_shortcut(
-                            ui,
-                            config,
-                            terminal,
-                            false,
-                            false,
-                            &mut out.bytes_to_write,
-                        );
-                        skip_next_text = paired_text.is_some();
-                        continue;
+                        let protocol_captures_etx = kitty_active || mok_level >= 2;
+                        let allow_copy_shortcut = !protocol_captures_etx
+                            || (config.effective_copy_behavior() != CopyBehavior::AlwaysSendEtx
+                                && terminal.has_non_empty_selection());
+                        if allow_copy_shortcut {
+                            out.any_user_activity = true;
+                            handle_copy_shortcut(ui, config, terminal, false, false, out_bytes);
+                            skip_next_text = paired_text.is_some();
+                            continue;
+                        }
                     }
 
                     // Handle Ctrl+Shift+C / Ctrl+Shift+V when Kitty keyboard isn't intercepting them.
@@ -830,7 +947,10 @@ impl InputMapperState {
                         && !modifiers.alt
                     {
                         if *key == Key::C {
-                            if let Some(sel) = terminal.selection_text().filter(|s| !s.is_empty()) {
+                            if terminal.has_non_empty_selection()
+                                && let Some(sel) =
+                                    terminal.selection_text().filter(|s| !s.is_empty())
+                            {
                                 copy_text_everywhere(ui, sel);
                             }
                             skip_next_text = paired_text.is_some();
@@ -838,8 +958,7 @@ impl InputMapperState {
                         }
                         if *key == Key::V {
                             if let Some(text) = try_read_native_clipboard() {
-                                let formatted = terminal.format_paste(&text);
-                                out.bytes_to_write.extend_from_slice(&formatted);
+                                terminal.format_paste_into(&text, out_bytes);
                             } else {
                                 ui.ctx()
                                     .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
@@ -853,7 +972,7 @@ impl InputMapperState {
                     if kitty_active {
                         let flags = terminal.kitty_keyboard_flags();
                         let modes = *terminal.active_snapshot().modes;
-                        if let Some(encoded) = encode_egui_key_kitty(
+                        if encode_egui_key_kitty_into(
                             flags,
                             &modes,
                             *key,
@@ -861,9 +980,11 @@ impl InputMapperState {
                             *repeat,
                             *modifiers,
                             paired_text,
+                            self.caps_lock,
+                            self.num_lock,
+                            out_bytes,
                         ) {
                             out.any_user_activity = true;
-                            out.bytes_to_write.extend_from_slice(&encoded);
                             skip_next_text = paired_text.is_some();
                             continue;
                         } else if !*pressed
@@ -875,18 +996,27 @@ impl InputMapperState {
                             // Suppressed key release, or let Event::Text handle printable char.
                             continue;
                         }
-                        // Fall through to legacy encoding when Kitty returns `None` on press
-                        // (e.g., Flag 2 only with Ctrl+- / Ctrl+/ / Ctrl+2..7).
+                        // Fall through to legacy encoding when Kitty returns `false` on press
+                        // (e.g., Flag 2 only with Ctrl+- / Ctrl+/ / Ctrl+2..7). Kitty retains
+                        // strict precedence over `modifyOtherKeys`.
                     }
 
                     if !*pressed {
                         continue;
                     }
 
-                    let modes = *terminal.active_snapshot().modes;
-                    if let Some(bytes) = encode_egui_key_legacy(&modes, *key, *modifiers) {
+                    if !kitty_active
+                        && mok_level > 0
+                        && encode_egui_modify_other_keys_into(terminal, *key, *modifiers, out_bytes)
+                    {
                         out.any_user_activity = true;
-                        out.bytes_to_write.extend_from_slice(&bytes);
+                        skip_next_text = paired_text.is_some();
+                        continue;
+                    }
+
+                    let modes = *terminal.active_snapshot().modes;
+                    if encode_egui_key_legacy_into(&modes, *key, *modifiers, out_bytes) {
+                        out.any_user_activity = true;
                         skip_next_text = paired_text.is_some();
                     }
                 }
@@ -897,7 +1027,7 @@ impl InputMapperState {
                     }
                     if !text.is_empty() {
                         out.any_user_activity = true;
-                        out.bytes_to_write.extend_from_slice(text.as_bytes());
+                        out_bytes.extend_from_slice(text.as_bytes());
                     }
                 }
                 _ => {}
@@ -918,7 +1048,9 @@ fn handle_copy_shortcut(
 ) {
     match config.effective_copy_behavior() {
         CopyBehavior::AlwaysCopy => {
-            if let Some(sel) = terminal.selection_text().filter(|s| !s.is_empty()) {
+            if terminal.has_non_empty_selection()
+                && let Some(sel) = terminal.selection_text().filter(|s| !s.is_empty())
+            {
                 copy_text_everywhere(ui, sel);
             }
         }
@@ -928,7 +1060,9 @@ fn handle_copy_shortcut(
             }
         }
         CopyBehavior::CopyIfSelectionElseSendEtx => {
-            if let Some(sel) = terminal.selection_text().filter(|s| !s.is_empty()) {
+            if terminal.has_non_empty_selection()
+                && let Some(sel) = terminal.selection_text().filter(|s| !s.is_empty())
+            {
                 copy_text_everywhere(ui, sel);
             } else if !(from_copy_event && is_mac) {
                 out_bytes.push(0x03);
@@ -1055,8 +1189,58 @@ const fn first_pressed_button(mask: u8) -> Option<MouseButton> {
     }
 }
 
+const fn is_egui_modifier_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::SuperLeft
+            | Key::SuperRight
+            | Key::CapsLock
+            | Key::NumLock
+            | Key::ScrollLock
+    )
+}
+
+const fn is_alpha_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::A
+            | Key::B
+            | Key::C
+            | Key::D
+            | Key::E
+            | Key::F
+            | Key::G
+            | Key::H
+            | Key::I
+            | Key::J
+            | Key::K
+            | Key::L
+            | Key::M
+            | Key::N
+            | Key::O
+            | Key::P
+            | Key::Q
+            | Key::R
+            | Key::S
+            | Key::T
+            | Key::U
+            | Key::V
+            | Key::W
+            | Key::X
+            | Key::Y
+            | Key::Z
+    )
+}
+
 #[cfg(feature = "kitty-keyboard")]
-fn encode_egui_key_kitty(
+#[expect(clippy::too_many_arguments, reason = "kitty keyboard input encoder")]
+fn encode_egui_key_kitty_into(
     flags: egui_xterm_core::KittyKeyboardFlags,
     modes: &egui_xterm_core::Modes,
     key: Key,
@@ -1064,9 +1248,12 @@ fn encode_egui_key_kitty(
     repeat: bool,
     modifiers: Modifiers,
     associated_text: Option<&str>,
-) -> Option<Vec<u8>> {
+    caps_lock: bool,
+    num_lock: bool,
+    out_bytes: &mut Vec<u8>,
+) -> bool {
     use egui_xterm_core::{
-        KittyEventType, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers, encode_kitty_key,
+        KittyEventType, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers, encode_kitty_key_into,
     };
 
     let event_type = if !pressed {
@@ -1084,8 +1271,8 @@ fn encode_egui_key_kitty(
         super_key: modifiers.mac_cmd || modifiers.command && !modifiers.ctrl,
         hyper: false,
         meta: false,
-        caps_lock: false,
-        num_lock: false,
+        caps_lock,
+        num_lock,
     };
 
     // Preserve DECCKM application cursor keys when no modifiers/event-types/report-all apply.
@@ -1094,18 +1281,24 @@ fn encode_egui_key_kitty(
         && !k_mods.has_active_modifiers()
         && !flags.contains(KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
     {
-        match key {
-            Key::ArrowUp => return Some(b"\x1bOA".to_vec()),
-            Key::ArrowDown => return Some(b"\x1bOB".to_vec()),
-            Key::ArrowRight => return Some(b"\x1bOC".to_vec()),
-            Key::ArrowLeft => return Some(b"\x1bOD".to_vec()),
-            Key::Home => return Some(b"\x1bOH".to_vec()),
-            Key::End => return Some(b"\x1bOF".to_vec()),
-            _ => {}
+        let seq: Option<&[u8]> = match key {
+            Key::ArrowUp => Some(b"\x1bOA"),
+            Key::ArrowDown => Some(b"\x1bOB"),
+            Key::ArrowRight => Some(b"\x1bOC"),
+            Key::ArrowLeft => Some(b"\x1bOD"),
+            Key::Home => Some(b"\x1bOH"),
+            Key::End => Some(b"\x1bOF"),
+            _ => None,
+        };
+        if let Some(bytes) = seq {
+            out_bytes.extend_from_slice(bytes);
+            return true;
         }
     }
 
-    let (kitty_key, shifted_key, base_layout_key) = egui_key_to_kitty(key)?;
+    let Some((kitty_key, shifted_key, base_layout_key)) = egui_key_to_kitty(key) else {
+        return false;
+    };
     let ev = KittyKeyEvent {
         key: kitty_key,
         event_type,
@@ -1114,7 +1307,122 @@ fn encode_egui_key_kitty(
         base_layout_key,
         associated_text,
     };
-    encode_kitty_key(flags, &ev)
+    encode_kitty_key_into(flags, &ev, out_bytes)
+}
+
+#[cfg(feature = "kitty-keyboard")]
+fn encode_egui_modify_other_keys_into(
+    terminal: &Terminal,
+    key: Key,
+    modifiers: Modifiers,
+    out_bytes: &mut Vec<u8>,
+) -> bool {
+    use egui_xterm_core::{KittyEventType, KittyKeyEvent, KittyModifiers};
+
+    if modifiers.mac_cmd || is_egui_modifier_key(key) {
+        return false;
+    }
+    let Some((kitty_key, shifted_key, base_layout_key)) = egui_key_to_kitty(key) else {
+        return false;
+    };
+    let ev = KittyKeyEvent {
+        key: kitty_key,
+        event_type: KittyEventType::Press,
+        modifiers: KittyModifiers {
+            shift: modifiers.shift,
+            alt: modifiers.alt,
+            ctrl: modifiers.ctrl,
+            ..KittyModifiers::default()
+        },
+        shifted_key,
+        base_layout_key,
+        associated_text: None,
+    };
+    terminal.encode_modify_other_keys_into(&ev, out_bytes)
+}
+
+#[cfg(not(feature = "kitty-keyboard"))]
+fn encode_egui_modify_other_keys_into(
+    terminal: &Terminal,
+    key: Key,
+    modifiers: Modifiers,
+    out_bytes: &mut Vec<u8>,
+) -> bool {
+    let level = terminal.modify_other_keys_level();
+    if level == 0 || modifiers.mac_cmd || is_egui_modifier_key(key) {
+        return false;
+    }
+    let mod_mask = u8::from(modifiers.shift)
+        | (u8::from(modifiers.alt) << 1)
+        | (u8::from(modifiers.ctrl) << 2);
+    if mod_mask == 0 {
+        return false;
+    }
+    let codepoint: u32 = match key {
+        Key::Enter => {
+            if level == 1 && !modifiers.shift && !modifiers.ctrl {
+                return false;
+            }
+            13
+        }
+        Key::Tab => {
+            if level == 1 && !modifiers.ctrl {
+                return false;
+            }
+            9
+        }
+        Key::Backspace => {
+            if level == 1 && !modifiers.shift {
+                return false;
+            }
+            127
+        }
+        Key::Escape => {
+            if level == 1 && !modifiers.shift && !modifiers.ctrl {
+                return false;
+            }
+            27
+        }
+        Key::Space => {
+            if level == 1 && !(modifiers.shift && modifiers.ctrl) {
+                return false;
+            }
+            32
+        }
+        _ => {
+            let Some((base, shifted)) = key_to_ascii_pair(key).or_else(|| {
+                if key == Key::IntlBackslash {
+                    Some(('\\', '|'))
+                } else {
+                    None
+                }
+            }) else {
+                return false;
+            };
+            if !modifiers.ctrl && !modifiers.alt {
+                return false;
+            }
+            if level == 1 {
+                let has_legacy_ctrl = matches!(
+                    base.to_ascii_lowercase(),
+                    '@' | 'a'..='z' | '[' | '\\' | ']' | '^' | '_'
+                );
+                if !modifiers.ctrl
+                    || (!(modifiers.shift && base.is_ascii_alphabetic()) && has_legacy_ctrl)
+                {
+                    return false;
+                }
+            }
+            let eff = if modifiers.shift { shifted } else { base };
+            u32::from(eff)
+        }
+    };
+    out_bytes.extend_from_slice(b"\x1b[27;");
+    push_decimal_u32(out_bytes, 1 + u32::from(mod_mask));
+    out_bytes.push(b';');
+    push_decimal_u32(out_bytes, codepoint);
+    out_bytes.push(b'~');
+    true
 }
 
 #[cfg(feature = "kitty-keyboard")]
@@ -1123,7 +1431,7 @@ fn egui_key_to_kitty(key: Key) -> Option<(egui_xterm_core::KittyKey, Option<char
 
     // Note: `egui::Key` collapses numpad digits/operators into `Num0..=Num9`, `Enter`, `Plus`,
     // `Minus`, `Period`, `Slash`, `Equals`, and `Comma`, which are handled by `key_to_ascii_pair`
-    // and the command keys below.
+    // and the command keys below. Only `Key::Clear` maps directly to `KittyKey::KpBegin` (`\x1b[E`).
     if let Some((base, shifted)) = key_to_ascii_pair(key) {
         return Some((KittyKey::Char(base), Some(shifted), Some(base)));
     }
@@ -1149,7 +1457,7 @@ fn egui_key_to_kitty(key: Key) -> Option<(egui_xterm_core::KittyKey, Option<char
         Key::PrintScreen => KittyKey::PrintScreen,
         Key::Pause => KittyKey::Pause,
         Key::Menu => KittyKey::Menu,
-        Key::Clear => KittyKey::KeyCode(57409),
+        Key::Clear => KittyKey::KpBegin,
         Key::IntlBackslash => return Some((KittyKey::Char('\\'), Some('|'), Some('\\'))),
         Key::ShiftLeft => KittyKey::LeftShift,
         Key::ShiftRight => KittyKey::RightShift,
@@ -1199,66 +1507,140 @@ fn egui_key_to_kitty(key: Key) -> Option<(egui_xterm_core::KittyKey, Option<char
     Some((kk, None, None))
 }
 
-fn encode_egui_key_legacy(
+fn encode_egui_key_legacy_into(
     modes: &egui_xterm_core::Modes,
     key: Key,
     modifiers: Modifiers,
-) -> Option<Vec<u8>> {
+    out_bytes: &mut Vec<u8>,
+) -> bool {
     let mod_param = legacy_modifier_param(modifiers);
 
     match key {
         Key::Enter => {
-            let base: &[u8] = if modes.linefeed_newline {
-                b"\r\n"
-            } else {
-                b"\r"
-            };
             if modifiers.alt {
-                let mut out = Vec::with_capacity(base.len() + 1);
-                out.push(0x1B);
-                out.extend_from_slice(base);
-                return Some(out);
+                out_bytes.push(0x1B);
             }
-            return Some(base.to_vec());
+            if modes.linefeed_newline {
+                out_bytes.extend_from_slice(b"\r\n");
+            } else {
+                out_bytes.push(b'\r');
+            }
+            return true;
         }
         Key::Tab => {
             if modifiers.shift {
-                return Some(b"\x1b[Z".to_vec());
+                out_bytes.extend_from_slice(b"\x1b[Z");
+            } else {
+                out_bytes.push(b'\t');
             }
-            return Some(b"\t".to_vec());
+            return true;
         }
         Key::Backspace => {
             if modifiers.alt {
-                return Some(b"\x1b\x7f".to_vec());
+                out_bytes.extend_from_slice(b"\x1b\x7f");
+            } else if modifiers.ctrl {
+                out_bytes.push(0x08);
+            } else {
+                out_bytes.push(0x7F);
             }
-            if modifiers.ctrl {
-                return Some(b"\x08".to_vec());
-            }
-            return Some(b"\x7f".to_vec());
+            return true;
         }
-        Key::Escape => return Some(b"\x1b".to_vec()),
-        Key::ArrowUp => return Some(encode_csi_cursor(b'A', mod_param, modes.app_cursor_keys)),
-        Key::ArrowDown => return Some(encode_csi_cursor(b'B', mod_param, modes.app_cursor_keys)),
-        Key::ArrowRight => return Some(encode_csi_cursor(b'C', mod_param, modes.app_cursor_keys)),
-        Key::ArrowLeft => return Some(encode_csi_cursor(b'D', mod_param, modes.app_cursor_keys)),
-        Key::Home => return Some(encode_csi_cursor(b'H', mod_param, modes.app_cursor_keys)),
-        Key::End => return Some(encode_csi_cursor(b'F', mod_param, modes.app_cursor_keys)),
-        Key::Insert => return Some(encode_tilde_key(2, mod_param)),
-        Key::Delete => return Some(encode_tilde_key(3, mod_param)),
-        Key::PageUp => return Some(encode_tilde_key(5, mod_param)),
-        Key::PageDown => return Some(encode_tilde_key(6, mod_param)),
-        Key::F1 => return Some(encode_ss3_or_csi(b'P', mod_param)),
-        Key::F2 => return Some(encode_ss3_or_csi(b'Q', mod_param)),
-        Key::F3 => return Some(encode_ss3_or_csi(b'R', mod_param)),
-        Key::F4 => return Some(encode_ss3_or_csi(b'S', mod_param)),
-        Key::F5 => return Some(encode_tilde_key(15, mod_param)),
-        Key::F6 => return Some(encode_tilde_key(17, mod_param)),
-        Key::F7 => return Some(encode_tilde_key(18, mod_param)),
-        Key::F8 => return Some(encode_tilde_key(19, mod_param)),
-        Key::F9 => return Some(encode_tilde_key(20, mod_param)),
-        Key::F10 => return Some(encode_tilde_key(21, mod_param)),
-        Key::F11 => return Some(encode_tilde_key(23, mod_param)),
-        Key::F12 => return Some(encode_tilde_key(24, mod_param)),
+        Key::Escape => {
+            out_bytes.push(0x1B);
+            return true;
+        }
+        Key::ArrowUp => {
+            encode_csi_cursor_into(b'A', mod_param, modes.app_cursor_keys, out_bytes);
+            return true;
+        }
+        Key::ArrowDown => {
+            encode_csi_cursor_into(b'B', mod_param, modes.app_cursor_keys, out_bytes);
+            return true;
+        }
+        Key::ArrowRight => {
+            encode_csi_cursor_into(b'C', mod_param, modes.app_cursor_keys, out_bytes);
+            return true;
+        }
+        Key::ArrowLeft => {
+            encode_csi_cursor_into(b'D', mod_param, modes.app_cursor_keys, out_bytes);
+            return true;
+        }
+        Key::Clear => {
+            encode_csi_cursor_into(b'E', mod_param, false, out_bytes);
+            return true;
+        }
+        Key::Home => {
+            encode_csi_cursor_into(b'H', mod_param, modes.app_cursor_keys, out_bytes);
+            return true;
+        }
+        Key::End => {
+            encode_csi_cursor_into(b'F', mod_param, modes.app_cursor_keys, out_bytes);
+            return true;
+        }
+        Key::Insert => {
+            encode_tilde_key_into(2, mod_param, out_bytes);
+            return true;
+        }
+        Key::Delete => {
+            encode_tilde_key_into(3, mod_param, out_bytes);
+            return true;
+        }
+        Key::PageUp => {
+            encode_tilde_key_into(5, mod_param, out_bytes);
+            return true;
+        }
+        Key::PageDown => {
+            encode_tilde_key_into(6, mod_param, out_bytes);
+            return true;
+        }
+        Key::F1 => {
+            encode_ss3_or_csi_into(b'P', mod_param, out_bytes);
+            return true;
+        }
+        Key::F2 => {
+            encode_ss3_or_csi_into(b'Q', mod_param, out_bytes);
+            return true;
+        }
+        Key::F3 => {
+            encode_ss3_or_csi_into(b'R', mod_param, out_bytes);
+            return true;
+        }
+        Key::F4 => {
+            encode_ss3_or_csi_into(b'S', mod_param, out_bytes);
+            return true;
+        }
+        Key::F5 => {
+            encode_tilde_key_into(15, mod_param, out_bytes);
+            return true;
+        }
+        Key::F6 => {
+            encode_tilde_key_into(17, mod_param, out_bytes);
+            return true;
+        }
+        Key::F7 => {
+            encode_tilde_key_into(18, mod_param, out_bytes);
+            return true;
+        }
+        Key::F8 => {
+            encode_tilde_key_into(19, mod_param, out_bytes);
+            return true;
+        }
+        Key::F9 => {
+            encode_tilde_key_into(20, mod_param, out_bytes);
+            return true;
+        }
+        Key::F10 => {
+            encode_tilde_key_into(21, mod_param, out_bytes);
+            return true;
+        }
+        Key::F11 => {
+            encode_tilde_key_into(23, mod_param, out_bytes);
+            return true;
+        }
+        Key::F12 => {
+            encode_tilde_key_into(24, mod_param, out_bytes);
+            return true;
+        }
         _ => {}
     }
 
@@ -1300,11 +1682,11 @@ fn encode_egui_key_legacy(
             _ => None,
         };
         if let Some(b) = ctrl_byte {
-            return if modifiers.alt {
-                Some(vec![0x1B, b])
-            } else {
-                Some(vec![b])
-            };
+            if modifiers.alt {
+                out_bytes.push(0x1B);
+            }
+            out_bytes.push(b);
+            return true;
         }
     }
 
@@ -1312,14 +1694,17 @@ fn encode_egui_key_legacy(
     if modifiers.alt && !modifiers.ctrl && !modifiers.mac_cmd {
         if let Some((base, shifted)) = key_to_ascii_pair(key) {
             let ch = if modifiers.shift { shifted } else { base };
-            return Some(vec![0x1B, ch as u8]);
+            out_bytes.push(0x1B);
+            out_bytes.push(ch as u8);
+            return true;
         }
         if key == Key::Space {
-            return Some(vec![0x1B, b' ']);
+            out_bytes.extend_from_slice(b"\x1b ");
+            return true;
         }
     }
 
-    None
+    false
 }
 
 const fn legacy_modifier_param(mods: Modifiers) -> u8 {
@@ -1336,29 +1721,50 @@ const fn legacy_modifier_param(mods: Modifiers) -> u8 {
     if mask == 0 { 1 } else { 1 + mask }
 }
 
-fn encode_csi_cursor(final_ch: u8, mod_param: u8, app_cursor: bool) -> Vec<u8> {
+#[inline]
+fn push_decimal_u32(out: &mut Vec<u8>, mut val: u32) {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+fn encode_csi_cursor_into(final_ch: u8, mod_param: u8, app_cursor: bool, out: &mut Vec<u8>) {
     if mod_param > 1 {
-        format!("\x1b[1;{mod_param}{}", final_ch as char).into_bytes()
+        out.extend_from_slice(b"\x1b[1;");
+        push_decimal_u32(out, u32::from(mod_param));
+        out.push(final_ch);
     } else if app_cursor {
-        vec![0x1B, b'O', final_ch]
+        out.extend_from_slice(&[0x1B, b'O', final_ch]);
     } else {
-        vec![0x1B, b'[', final_ch]
+        out.extend_from_slice(&[0x1B, b'[', final_ch]);
     }
 }
 
-fn encode_tilde_key(num: u16, mod_param: u8) -> Vec<u8> {
+fn encode_tilde_key_into(num: u16, mod_param: u8, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\x1b[");
+    push_decimal_u32(out, u32::from(num));
     if mod_param > 1 {
-        format!("\x1b[{num};{mod_param}~").into_bytes()
-    } else {
-        format!("\x1b[{num}~").into_bytes()
+        out.push(b';');
+        push_decimal_u32(out, u32::from(mod_param));
     }
+    out.push(b'~');
 }
 
-fn encode_ss3_or_csi(final_ch: u8, mod_param: u8) -> Vec<u8> {
+fn encode_ss3_or_csi_into(final_ch: u8, mod_param: u8, out: &mut Vec<u8>) {
     if mod_param > 1 {
-        format!("\x1b[1;{mod_param}{}", final_ch as char).into_bytes()
+        out.extend_from_slice(b"\x1b[1;");
+        push_decimal_u32(out, u32::from(mod_param));
+        out.push(final_ch);
     } else {
-        vec![0x1B, b'O', final_ch]
+        out.extend_from_slice(&[0x1B, b'O', final_ch]);
     }
 }
 
@@ -1420,4 +1826,473 @@ const fn key_to_ascii_pair(key: Key) -> Option<(char, char)> {
         Key::CloseCurlyBracket => ('}', '}'),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{CentralPanel, Context, Frame, RawInput, pos2, vec2};
+    use egui_xterm_core::CoreConfig;
+
+    use super::*;
+
+    fn run_mapper_frame(
+        ctx: &Context,
+        mapper: &mut InputMapperState,
+        terminal: &mut Terminal,
+        config: &TerminalConfig,
+        events: Vec<Event>,
+    ) -> Vec<u8> {
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+        let raw = RawInput {
+            screen_rect: Some(screen),
+            time: Some(0.1),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        let mut written = Vec::new();
+        let out = ctx.run_ui(raw, |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let resp = ui.allocate_response(vec2(640.0, 400.0), egui::Sense::click_and_drag());
+                let id = resp.id;
+                ui.memory_mut(|m| m.request_focus(id));
+                let outcome = mapper.process_frame_events(
+                    ui,
+                    id,
+                    &resp,
+                    screen,
+                    vec2(8.0, 16.0),
+                    80,
+                    25,
+                    0.1,
+                    config,
+                    terminal,
+                    false,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                );
+                written.extend_from_slice(&outcome.bytes_to_write);
+            });
+        });
+        out.drop_without_applying_deltas();
+        written
+    }
+
+    #[test]
+    fn key_clear_maps_to_legacy_kp_begin_and_kitty() {
+        let term = Terminal::new(80, 24, CoreConfig::default());
+        let mut out = Vec::new();
+        let modes = *term.active_snapshot().modes;
+
+        assert!(encode_egui_key_legacy_into(
+            &modes,
+            Key::Clear,
+            Modifiers::NONE,
+            &mut out
+        ));
+        assert_eq!(out, b"\x1b[E");
+
+        out.clear();
+        assert!(encode_egui_key_legacy_into(
+            &modes,
+            Key::Clear,
+            Modifiers::SHIFT,
+            &mut out
+        ));
+        assert_eq!(out, b"\x1b[1;2E");
+
+        #[cfg(feature = "kitty-keyboard")]
+        {
+            let mut term = term;
+            term.advance(b"\x1b[>1u");
+            out.clear();
+            let flags = term.kitty_keyboard_flags();
+            assert!(encode_egui_key_kitty_into(
+                flags,
+                &modes,
+                Key::Clear,
+                true,
+                false,
+                Modifiers::NONE,
+                None,
+                false,
+                false,
+                &mut out,
+            ));
+            assert_eq!(out, b"\x1b[57427u");
+        }
+    }
+
+    #[test]
+    fn modify_other_keys_mode_1_mode_2_and_kitty_precedence() {
+        let ctx = Context::default();
+        let cfg = TerminalConfig::default();
+        let mut mapper = InputMapperState::default();
+        let mut term = Terminal::new(80, 24, CoreConfig::default());
+
+        // Warm frame to acquire focus.
+        let _ = run_mapper_frame(&ctx, &mut mapper, &mut term, &cfg, Vec::new());
+
+        // Mode 1: Shift+Enter -> CSI 27;2;13~, Ctrl+1 -> CSI 27;5;49~, Ctrl+a -> 0x01.
+        term.advance(b"\x1b[>4;1m");
+        let b1 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::SHIFT,
+            }],
+        );
+        assert_eq!(b1, b"\x1b[27;2;13~");
+
+        let b2 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::Num1,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(b2, b"\x1b[27;5;49~");
+
+        let b3 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(b3, b"\x01");
+
+        // Mode 2: Ctrl+a -> CSI 27;5;97~, Shift+Space -> CSI 27;2;32~ (suppresses Text), Shift+A -> "A".
+        term.advance(b"\x1b[>4;2m");
+        let b4 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(b4, b"\x1b[27;5;97~");
+
+        let b5 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![
+                Event::Key {
+                    key: Key::Space,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::SHIFT,
+                },
+                Event::Text(" ".to_owned()),
+            ],
+        );
+        assert_eq!(b5, b"\x1b[27;2;32~");
+
+        let b6 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![
+                Event::Key {
+                    key: Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::SHIFT,
+                },
+                Event::Text("A".to_owned()),
+            ],
+        );
+        assert_eq!(b6, b"A");
+
+        // Ctrl+C without selection under Mode 2 -> CSI 27;5;99~.
+        let b7 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(b7, b"\x1b[27;5;99~");
+
+        // Kitty keyboard takes strict precedence over modifyOtherKeys=2.
+        #[cfg(feature = "kitty-keyboard")]
+        {
+            term.advance(b"\x1b[>1u");
+            let b8 = run_mapper_frame(
+                &ctx,
+                &mut mapper,
+                &mut term,
+                &cfg,
+                vec![Event::Key {
+                    key: Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::CTRL,
+                }],
+            );
+            assert_eq!(b8, b"\x1b[97;5u");
+        }
+    }
+
+    #[test]
+    fn lock_modifiers_toggle_case_sync_and_explicit_setter() {
+        let ctx = Context::default();
+        let cfg = TerminalConfig::default();
+        let mut mapper = InputMapperState::default();
+        let mut term = Terminal::new(80, 24, CoreConfig::default());
+        #[cfg(feature = "kitty-keyboard")]
+        term.advance(b"\x1b[>9u"); // DISAMBIGUATE | REPORT_ALL_KEYS_AS_ESCAPE_CODES
+
+        let _ = run_mapper_frame(&ctx, &mut mapper, &mut term, &cfg, Vec::new());
+
+        // Toggle NumLock and CapsLock via key presses.
+        let _ = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![
+                Event::Key {
+                    key: Key::CapsLock,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::Key {
+                    key: Key::NumLock,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(mapper.caps_lock());
+        assert!(mapper.num_lock());
+
+        // Enter with CapsLock (64) + NumLock (128) -> 1 + 192 = 193 under Kitty.
+        let bytes = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        #[cfg(feature = "kitty-keyboard")]
+        assert_eq!(bytes, b"\x1b[13;193u");
+        #[cfg(not(feature = "kitty-keyboard"))]
+        assert_eq!(bytes, b"\r");
+
+        // Explicit setter clears both; Key/Text case-sync detects CapsLock from unshifted uppercase.
+        mapper.set_lock_modifiers(false, false);
+        assert!(!mapper.caps_lock());
+        assert!(!mapper.num_lock());
+
+        let synced = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![
+                Event::Key {
+                    key: Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::Text("A".to_owned()),
+            ],
+        );
+        assert!(mapper.caps_lock());
+        #[cfg(feature = "kitty-keyboard")]
+        assert_eq!(synced, b"\x1b[97;65u");
+        #[cfg(not(feature = "kitty-keyboard"))]
+        assert_eq!(synced, b"A");
+
+        let synced_off = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![
+                Event::Key {
+                    key: Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::Text("a".to_owned()),
+            ],
+        );
+        assert!(!mapper.caps_lock());
+        #[cfg(feature = "kitty-keyboard")]
+        assert_eq!(synced_off, b"\x1b[97u");
+        #[cfg(not(feature = "kitty-keyboard"))]
+        assert_eq!(synced_off, b"a");
+    }
+
+    #[test]
+    fn outgoing_scratch_reuses_capacity_across_frames() {
+        let ctx = Context::default();
+        let cfg = TerminalConfig::default();
+        let mut mapper = InputMapperState::default();
+        let mut term = Terminal::new(80, 24, CoreConfig::default());
+
+        let _ = run_mapper_frame(&ctx, &mut mapper, &mut term, &cfg, Vec::new());
+        let b1 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(b1, b"\x1b[A");
+        let cap1 = mapper.outgoing_scratch.capacity();
+        let ptr1 = mapper.outgoing_scratch.as_ptr();
+        assert!(cap1 > 0);
+
+        let b2 = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert_eq!(b2, b"\x1b[B");
+        assert_eq!(mapper.outgoing_scratch.capacity(), cap1);
+        assert_eq!(mapper.outgoing_scratch.as_ptr(), ptr1);
+    }
+
+    #[test]
+    fn event_copy_and_sgr_pixels_and_punctuation_keys_zero_alloc() {
+        let ctx = Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Windows);
+        let cfg = TerminalConfig::default();
+        let mut mapper = InputMapperState::default();
+        let mut term = Terminal::new(80, 24, CoreConfig::default());
+        term.advance(b"hello world\x1b[>4;2m\x1b[?1003;1016h");
+
+        let _ = run_mapper_frame(&ctx, &mut mapper, &mut term, &cfg, Vec::new());
+
+        // Event::Copy without selection in modifyOtherKeys=2 -> CSI 27;5;99~.
+        let copy_no_sel = run_mapper_frame(&ctx, &mut mapper, &mut term, &cfg, vec![Event::Copy]);
+        assert_eq!(copy_no_sel, b"\x1b[27;5;99~");
+
+        // Punctuation keys under modifyOtherKeys=2 + Ctrl.
+        for (key, code) in [
+            (Key::Plus, 43),
+            (Key::Equals, 61),
+            (Key::Comma, 44),
+            (Key::Period, 46),
+            (Key::Minus, 45),
+            (Key::Slash, 47),
+        ] {
+            let encoded = run_mapper_frame(
+                &ctx,
+                &mut mapper,
+                &mut term,
+                &cfg,
+                vec![Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::CTRL,
+                }],
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&encoded),
+                format!("\x1b[27;5;{code}~"),
+                "failed for key {key:?}"
+            );
+        }
+
+        // SGR-Pixels (?1016) mouse press and sub-cell motion.
+        let mouse_bytes = run_mapper_frame(
+            &ctx,
+            &mut mapper,
+            &mut term,
+            &cfg,
+            vec![
+                Event::PointerButton {
+                    pos: pos2(12.0, 20.0),
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerMoved(pos2(14.0, 21.0)),
+                Event::PointerButton {
+                    pos: pos2(14.0, 21.0),
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let mouse_str = String::from_utf8_lossy(&mouse_bytes);
+        assert!(mouse_str.contains("\x1b[<0;12;20M"), "got {mouse_str:?}");
+        assert!(mouse_str.contains("\x1b[<32;14;21M"), "got {mouse_str:?}");
+        assert!(mouse_str.contains("\x1b[<0;14;21m"), "got {mouse_str:?}");
+    }
 }

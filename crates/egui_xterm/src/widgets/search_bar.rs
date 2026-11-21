@@ -14,7 +14,7 @@ pub struct SearchBarState {
     pub is_regex: bool,
     /// Match case-sensitively when `true`.
     pub case_sensitive: bool,
-    /// Match whole words only (`\b...\b`) when `true`.
+    /// Match whole words only when `true`.
     pub whole_word: bool,
     /// Last regex compilation error, if any.
     pub last_error: Option<String>,
@@ -101,39 +101,15 @@ pub(crate) fn compute_bar_rect(term_rect: Rect, clip_rect: Rect, has_error: bool
     (bar_rect.width() >= 104.0 && bar_rect.height() >= 24.0).then_some(bar_rect)
 }
 
-fn escape_regex_literal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 fn apply_search_query(state: &mut SearchBarState, terminal: &mut Terminal) {
     if state.query_text.is_empty() {
         terminal.clear_search();
         state.last_error = None;
-    } else if state.whole_word {
-        let pattern = if state.is_regex {
-            format!(r"\b(?:{})\b", state.query_text)
-        } else {
-            format!(r"\b{}\b", escape_regex_literal(&state.query_text))
-        };
-        let query = SearchQuery::regex(pattern).with_case_sensitive(state.case_sensitive);
-        match terminal.search(&query) {
-            Ok(_) => state.last_error = None,
-            Err(err) => state.last_error = Some(err.to_string()),
-        }
     } else {
         let query = SearchQuery::literal(&state.query_text)
             .with_regex(state.is_regex)
-            .with_case_sensitive(state.case_sensitive);
+            .with_case_sensitive(state.case_sensitive)
+            .with_whole_word(state.whole_word);
         match terminal.search(&query) {
             Ok(_) => state.last_error = None,
             Err(err) => state.last_error = Some(err.to_string()),
@@ -518,13 +494,7 @@ pub(crate) fn show_search_bar(
                                 if show_count {
                                     let total = terminal.search_matches().len();
                                     let active_1based = terminal
-                                        .active_search_match()
-                                        .and_then(|active| {
-                                            terminal
-                                                .search_matches()
-                                                .iter()
-                                                .position(|m| m == active)
-                                        })
+                                        .active_search_match_index()
                                         .map_or(0, |idx| idx + 1);
                                     let label = format!("{active_1based}/{total}");
                                     let label_w = measure_body_text_w(ui, &body_font, &label);

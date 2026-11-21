@@ -1,9 +1,11 @@
 //! Optional UI chrome widgets (`search_bar`, `prompt_gutter`, `hyperlink`, `scrollbar`,
-//! `context_menu`) layered cleanly onto the terminal grid without shifting `response.rect.min`.
+//! `context_menu`, `progress_bar`) layered cleanly onto the terminal grid without shifting
+//! `response.rect.min`.
 
 pub(crate) mod context_menu;
 #[cfg(feature = "hyperlinks")]
 pub(crate) mod hyperlink;
+pub mod progress_bar;
 #[cfg(feature = "shell-integration")]
 pub(crate) mod prompt_gutter;
 pub(crate) mod scrollbar;

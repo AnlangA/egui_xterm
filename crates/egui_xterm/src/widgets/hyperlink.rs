@@ -21,15 +21,44 @@ pub(crate) fn update_hyperlink_interaction(
     require_ctrl: bool,
     ctrl_or_cmd_held: bool,
 ) -> Vec<HyperlinkSpan> {
+    update_hyperlink_interaction_with_cursor(
+        ui,
+        terminal,
+        pointer_pos,
+        layout,
+        allow_click_activation,
+        clicked_primary,
+        require_ctrl,
+        ctrl_or_cmd_held,
+    )
+    .0
+}
+
+/// Evaluates pointer hover over `OSC 8` and implicit hyperlinks strictly inside the cell grid,
+/// returning visible spans and whether the cursor icon was overridden to `PointingHand`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hyperlink interaction parameters"
+)]
+pub(crate) fn update_hyperlink_interaction_with_cursor(
+    ui: &Ui,
+    terminal: &mut Terminal,
+    pointer_pos: Option<Pos2>,
+    layout: &FrameLayout,
+    allow_click_activation: bool,
+    clicked_primary: bool,
+    require_ctrl: bool,
+    ctrl_or_cmd_held: bool,
+) -> (Vec<HyperlinkSpan>, bool) {
     let Some(pos) = pointer_pos else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let origin = layout.term_rect.min;
     let cell_size = layout.cell_size;
     let cols = layout.cols;
     let rows = layout.rows;
     if cols == 0 || rows == 0 || cell_size.x <= 0.0 || cell_size.y <= 0.0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let grid_rect = Rect::from_min_size(
@@ -40,19 +69,19 @@ pub(crate) fn update_hyperlink_interaction(
         || !layout.response.rect.contains(pos)
         || !grid_rect.contains(pos)
     {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let rel_x = ((pos.x - origin.x) / cell_size.x).floor();
     let rel_y = ((pos.y - origin.y) / cell_size.y).floor();
     if rel_x < 0.0 || rel_y < 0.0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let col = (rel_x as u16).min(cols - 1);
     let row = (rel_y as u16).min(rows - 1);
 
     let Some((info, spans)) = terminal.hyperlink_visible_spans_at(col, row) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
 
     let uri = info.uri.clone();
@@ -85,7 +114,7 @@ pub(crate) fn update_hyperlink_interaction(
         ui.ctx().open_url(OpenUrl::new_tab(uri));
     }
 
-    spans
+    (spans, activation_allowed)
 }
 
 /// Paints pixel-snapped hover underlines for active hyperlink spans into `overlay_mesh`.
