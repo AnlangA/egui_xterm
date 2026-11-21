@@ -20,12 +20,16 @@ default = [
     "hyperlinks",
     "shell-integration",
     "kitty-keyboard",
+    "kitty-graphics",
+    "sixel",
     "vector-glyphs",
 ]
 search = ["egui_xterm_core/search"]
 hyperlinks = ["egui_xterm_core/hyperlinks"]
 shell-integration = ["egui_xterm_core/shell-integration"]
 kitty-keyboard = ["egui_xterm_core/kitty-keyboard"]
+kitty-graphics = ["egui_xterm_core/kitty-graphics"]
+sixel = ["egui_xterm_core/sixel"]
 vector-glyphs = []
 pty = ["dep:egui_xterm_pty"]
 native-clipboard = ["dep:arboard"]

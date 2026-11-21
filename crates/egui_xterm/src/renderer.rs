@@ -144,6 +144,17 @@ impl AsciiGlyphCache {
     }
 }
 
+#[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+const MAX_CACHED_IMAGE_TEXTURES: usize = 256;
+
+#[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+struct CachedImageTexture {
+    handle: egui::TextureHandle,
+    width: u32,
+    height: u32,
+    last_used_frame: u64,
+}
+
 /// Persistent per-runtime 4-stage cached renderer.
 pub(crate) struct TerminalRenderer {
     bg_mesh: Arc<Mesh>,
@@ -173,6 +184,14 @@ pub(crate) struct TerminalRenderer {
     effective_cursor_blink: bool,
     last_input_time_secs: f64,
     bell_until_secs: Option<f64>,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    image_textures: HashMap<u32, CachedImageTexture>,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    image_frame_seq: u64,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    scratch_images_behind: Vec<(i32, Mesh)>,
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    scratch_images_above: Vec<(i32, Mesh)>,
 }
 
 impl Default for TerminalRenderer {
@@ -204,6 +223,14 @@ impl Default for TerminalRenderer {
             effective_cursor_blink: true,
             last_input_time_secs: f64::NEG_INFINITY,
             bell_until_secs: None,
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            image_textures: HashMap::new(),
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            image_frame_seq: 0,
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            scratch_images_behind: Vec::new(),
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            scratch_images_above: Vec::new(),
         }
     }
 }
@@ -1202,6 +1229,9 @@ impl TerminalRenderer {
                 }
             }
 
+            #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+            self.prepare_inline_images(ui.ctx(), &snapshot, layout, origin, cell_w, cell_h, ppp);
+
             let base_cursor_rect = cursor_cell_rect(
                 origin,
                 cursor_pos.0.min(layout.cols.saturating_sub(1)),
@@ -1227,6 +1257,11 @@ impl TerminalRenderer {
                 .push(egui::Shape::Mesh(Arc::clone(&self.bg_mesh)));
         }
 
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        for (_, mesh) in self.scratch_images_behind.drain(..) {
+            self.scratch_shapes.push(egui::Shape::Mesh(Arc::new(mesh)));
+        }
+
         for (vp_row, slot) in self.slots.iter().enumerate() {
             if let Some(galley) = &slot.galley {
                 let text_pos = pos2(
@@ -1247,6 +1282,11 @@ impl TerminalRenderer {
         }
         for path in self.scratch_paths.drain(..) {
             self.scratch_shapes.push(egui::Shape::Path(path));
+        }
+
+        #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+        for (_, mesh) in self.scratch_images_above.drain(..) {
+            self.scratch_shapes.push(egui::Shape::Mesh(Arc::new(mesh)));
         }
 
         // Render active IME preedit inline at cursor and compute IME cursor_rect.
@@ -1414,6 +1454,147 @@ impl TerminalRenderer {
 
         painter.extend(self.scratch_shapes.drain(..));
         ime_cursor_rect
+    }
+
+    #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "inline image layout & texture cache"
+    )]
+    fn prepare_inline_images(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: &RenderSnapshot<'_>,
+        layout: &FrameLayout,
+        origin: Pos2,
+        cell_w: f32,
+        cell_h: f32,
+        ppp: f32,
+    ) {
+        self.scratch_images_behind.clear();
+        self.scratch_images_above.clear();
+        self.image_frame_seq = self.image_frame_seq.wrapping_add(1);
+        let frame_seq = self.image_frame_seq;
+
+        let placements = snapshot.image_placements();
+        for placement in placements {
+            let Some(stored) = snapshot.image_data(placement.image_id) else {
+                continue;
+            };
+            if stored.width == 0 || stored.height == 0 {
+                continue;
+            }
+
+            let crop_x = placement.src_x.min(stored.width);
+            let crop_y = placement.src_y.min(stored.height);
+            let crop_w = if placement.src_w == 0 {
+                stored.width.saturating_sub(crop_x)
+            } else {
+                placement.src_w.min(stored.width.saturating_sub(crop_x))
+            };
+            let crop_h = if placement.src_h == 0 {
+                stored.height.saturating_sub(crop_y)
+            } else {
+                placement.src_h.min(stored.height.saturating_sub(crop_y))
+            };
+            if crop_w == 0 || crop_h == 0 {
+                continue;
+            }
+
+            let rel_row = placement.abs_line.0 as i64 - snapshot.top_abs_line.0 as i64;
+            let x = origin.x + f32::from(placement.col) * cell_w;
+            let y = origin.y + (rel_row as f32) * cell_h;
+            let disp_w = if placement.cols > 0 {
+                f32::from(placement.cols) * cell_w
+            } else {
+                (crop_w as f32) / ppp
+            };
+            let disp_h = if placement.rows > 0 {
+                f32::from(placement.rows) * cell_h
+            } else {
+                (crop_h as f32) / ppp
+            };
+            let dest_rect = snap_rect(
+                Rect::from_min_size(pos2(x, y), egui::vec2(disp_w, disp_h)),
+                ppp,
+            );
+            let clipped_rect = dest_rect.intersect(layout.term_rect);
+            if !clipped_rect.is_positive() || !dest_rect.is_positive() {
+                continue;
+            }
+
+            let img_w = stored.width as f32;
+            let img_h = stored.height as f32;
+            let u_min = crop_x as f32 / img_w;
+            let v_min = crop_y as f32 / img_h;
+            let u_max = (crop_x + crop_w) as f32 / img_w;
+            let v_max = (crop_y + crop_h) as f32 / img_h;
+
+            let dw = dest_rect.width().max(f32::EPSILON);
+            let dh = dest_rect.height().max(f32::EPSILON);
+            let u0 = egui::lerp(u_min..=u_max, (clipped_rect.min.x - dest_rect.min.x) / dw);
+            let u1 = egui::lerp(u_min..=u_max, (clipped_rect.max.x - dest_rect.min.x) / dw);
+            let v0 = egui::lerp(v_min..=v_max, (clipped_rect.min.y - dest_rect.min.y) / dh);
+            let v1 = egui::lerp(v_min..=v_max, (clipped_rect.max.y - dest_rect.min.y) / dh);
+            let uv_rect = Rect::from_min_max(pos2(u0, v0), pos2(u1, v1));
+
+            let needs_upload = self
+                .image_textures
+                .get(&stored.id)
+                .is_none_or(|e| e.width != stored.width || e.height != stored.height);
+            if needs_upload {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [stored.width as usize, stored.height as usize],
+                    &stored.rgba,
+                );
+                let handle = ctx.load_texture(
+                    format!("egui_xterm_img_{}", stored.id),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.image_textures.insert(
+                    stored.id,
+                    CachedImageTexture {
+                        handle,
+                        width: stored.width,
+                        height: stored.height,
+                        last_used_frame: frame_seq,
+                    },
+                );
+            } else if let Some(entry) = self.image_textures.get_mut(&stored.id) {
+                entry.last_used_frame = frame_seq;
+            }
+
+            if let Some(entry) = self.image_textures.get(&stored.id) {
+                let mut mesh = Mesh::with_texture(entry.handle.id());
+                mesh.add_rect_with_uv(clipped_rect, uv_rect, Color32::WHITE);
+                if placement.z_index < 0 {
+                    self.scratch_images_behind.push((placement.z_index, mesh));
+                } else {
+                    self.scratch_images_above.push((placement.z_index, mesh));
+                }
+            }
+        }
+
+        self.scratch_images_behind.sort_by_key(|(z, _)| *z);
+        self.scratch_images_above.sort_by_key(|(z, _)| *z);
+
+        // Evict textures no longer present in the terminal's ImageStore.
+        self.image_textures
+            .retain(|id, _| snapshot.image_data(*id).is_some());
+
+        // Enforce bounded texture cache cap by evicting least-recently-used entries.
+        while self.image_textures.len() > MAX_CACHED_IMAGE_TEXTURES {
+            let Some(oldest_id) = self
+                .image_textures
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_frame)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.image_textures.remove(&oldest_id);
+        }
     }
 }
 

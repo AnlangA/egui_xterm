@@ -390,6 +390,9 @@ impl TerminalLayoutState {
         let pixel_height = ((f32::from(rows) * cell_size.y) * ppp)
             .round()
             .clamp(0.0, f32::from(u16::MAX)) as u16;
+        if terminal.pixel_size() != (pixel_width, pixel_height) {
+            terminal.set_pixel_size(pixel_width, pixel_height);
+        }
         let term_size = TerminalSize::with_pixels(cols, rows, pixel_width, pixel_height);
 
         self.propagate_backend_resize(

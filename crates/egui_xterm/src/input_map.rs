@@ -6,8 +6,8 @@ use egui::{
     Pos2, Rect, Ui, Vec2,
 };
 use egui_xterm_core::{
-    MouseButton, MouseEventKind, MouseInputEvent, MouseModifiers, MouseProtocol, SelectionKind,
-    Terminal,
+    MouseButton, MouseEncoding, MouseEventKind, MouseInputEvent, MouseModifiers, MouseProtocol,
+    SelectionKind, Terminal,
 };
 
 use crate::config::{CopyBehavior, TerminalConfig};
@@ -37,6 +37,7 @@ pub(crate) struct InputMapperState {
     active_mouse_button: Option<MouseButton>,
     pressed_mouse_buttons: u8,
     last_reported_cell: Option<(u16, u16)>,
+    last_reported_pixel: Option<(u32, u32)>,
     last_pointer_pos: Option<Pos2>,
 }
 
@@ -119,7 +120,11 @@ impl InputMapperState {
                 || scrollbar_rect.is_some_and(|r| r.contains(pos))
         };
 
-        let mouse_protocol = terminal.active_snapshot().modes.mouse_protocol;
+        let (mouse_protocol, mouse_encoding) = {
+            let modes = terminal.active_snapshot().modes;
+            (modes.mouse_protocol, modes.mouse_encoding)
+        };
+        let ppp = crate::layout::sanitize_ppp(ui.ctx().pixels_per_point());
 
         // Acquire focus on click or initial pointer press/drag inside the terminal grid
         // (excluding overlay widgets like the search bar, scrollbar, and open context menu).
@@ -299,6 +304,7 @@ impl InputMapperState {
             self.active_mouse_button = None;
             self.pressed_mouse_buttons = 0;
             self.last_reported_cell = None;
+            self.last_reported_pixel = None;
         }
 
         // Reconcile latched pointer-button state if a release event was missed (e.g. released
@@ -389,19 +395,28 @@ impl InputMapperState {
                             } else {
                                 clamp_pos_to_cell(*pos, term_rect, cell_size, cols, rows)
                             };
-                            if let Some((col, row)) = cell
-                                && self.last_reported_cell != Some((col, row))
-                            {
-                                self.last_reported_cell = Some((col, row));
-                                let mev = MouseInputEvent {
-                                    kind: MouseEventKind::Motion,
-                                    button: self.active_mouse_button,
-                                    col,
-                                    row,
-                                    modifiers: to_mouse_mods(mods),
+                            if let Some((col, row)) = cell {
+                                let (px, py) = pos_to_pixels(*pos, term_rect, ppp);
+                                let changed = if mouse_encoding == MouseEncoding::SgrPixels {
+                                    self.last_reported_pixel != Some((px, py))
+                                } else {
+                                    self.last_reported_cell != Some((col, row))
                                 };
-                                if let Some(bytes) = terminal.encode_mouse_event(mev) {
-                                    out.bytes_to_write.extend_from_slice(&bytes);
+                                if changed {
+                                    self.last_reported_cell = Some((col, row));
+                                    self.last_reported_pixel = Some((px, py));
+                                    let mev = MouseInputEvent {
+                                        kind: MouseEventKind::Motion,
+                                        button: self.active_mouse_button,
+                                        col,
+                                        row,
+                                        modifiers: to_mouse_mods(mods),
+                                    };
+                                    if let Some(bytes) =
+                                        terminal.encode_mouse_event_pixels(mev, px, py)
+                                    {
+                                        out.bytes_to_write.extend_from_slice(&bytes);
+                                    }
                                 }
                             }
                         }
@@ -459,6 +474,7 @@ impl InputMapperState {
                                         clamp_pos_to_cell(*pos, term_rect, cell_size, cols, rows)
                                     };
                                     if let Some((col, row)) = cell {
+                                        let (px, py) = pos_to_pixels(*pos, term_rect, ppp);
                                         let mev = MouseInputEvent {
                                             kind: MouseEventKind::Release,
                                             button: Some(m_btn),
@@ -466,7 +482,9 @@ impl InputMapperState {
                                             row,
                                             modifiers: to_mouse_mods(*modifiers),
                                         };
-                                        if let Some(bytes) = terminal.encode_mouse_event(mev) {
+                                        if let Some(bytes) =
+                                            terminal.encode_mouse_event_pixels(mev, px, py)
+                                        {
                                             out.bytes_to_write.extend_from_slice(&bytes);
                                         }
                                     }
@@ -491,7 +509,9 @@ impl InputMapperState {
                                 let m_btn = to_mouse_button(*button);
                                 self.active_mouse_button = Some(m_btn);
                                 self.pressed_mouse_buttons |= mouse_button_bit(m_btn);
+                                let (px, py) = pos_to_pixels(*pos, term_rect, ppp);
                                 self.last_reported_cell = Some((col, row));
+                                self.last_reported_pixel = Some((px, py));
                                 let mev = MouseInputEvent {
                                     kind: MouseEventKind::Press,
                                     button: Some(m_btn),
@@ -499,7 +519,8 @@ impl InputMapperState {
                                     row,
                                     modifiers: to_mouse_mods(*modifiers),
                                 };
-                                if let Some(bytes) = terminal.encode_mouse_event(mev) {
+                                if let Some(bytes) = terminal.encode_mouse_event_pixels(mev, px, py)
+                                {
                                     out.bytes_to_write.extend_from_slice(&bytes);
                                 }
                             }
@@ -554,6 +575,8 @@ impl InputMapperState {
                         let (col, row) = hover_pos
                             .and_then(|p| pos_to_cell(p, term_rect, cell_size, cols, rows))
                             .unwrap_or((0, 0));
+                        let (px, py) =
+                            hover_pos.map_or((0, 0), |p| pos_to_pixels(p, term_rect, ppp));
 
                         let steps_y = match unit {
                             MouseWheelUnit::Line => delta.y.abs().round().max(1.0) as usize,
@@ -581,7 +604,9 @@ impl InputMapperState {
                                         row,
                                         modifiers: to_mouse_mods(*modifiers),
                                     };
-                                    if let Some(bytes) = terminal.encode_mouse_event(mev) {
+                                    if let Some(bytes) =
+                                        terminal.encode_mouse_event_pixels(mev, px, py)
+                                    {
                                         out.bytes_to_write.extend_from_slice(&bytes);
                                     }
                                 }
@@ -600,7 +625,8 @@ impl InputMapperState {
                                     row,
                                     modifiers: to_mouse_mods(*modifiers),
                                 };
-                                if let Some(bytes) = terminal.encode_mouse_event(mev) {
+                                if let Some(bytes) = terminal.encode_mouse_event_pixels(mev, px, py)
+                                {
                                     out.bytes_to_write.extend_from_slice(&bytes);
                                 }
                             }
@@ -945,6 +971,24 @@ fn pos_to_cell(
     let col = (((pos.x - term_rect.min.x) / cell_size.x).floor() as u16).min(cols - 1);
     let row = (((pos.y - term_rect.min.y) / cell_size.y).floor() as u16).min(rows - 1);
     Some((col, row))
+}
+
+fn pos_to_pixels(pos: Pos2, term_rect: Rect, ppp: f32) -> (u32, u32) {
+    let clamped_x = pos.x.clamp(term_rect.min.x, term_rect.max.x);
+    let clamped_y = pos.y.clamp(term_rect.min.y, term_rect.max.y);
+    let rel_x = ((clamped_x - term_rect.min.x).max(0.0) * ppp).round();
+    let rel_y = ((clamped_y - term_rect.min.y).max(0.0) * ppp).round();
+    let px = if rel_x.is_finite() {
+        rel_x.clamp(0.0, u32::MAX as f32) as u32
+    } else {
+        0
+    };
+    let py = if rel_y.is_finite() {
+        rel_y.clamp(0.0, u32::MAX as f32) as u32
+    } else {
+        0
+    };
+    (px, py)
 }
 
 fn clamp_pos_to_cell(

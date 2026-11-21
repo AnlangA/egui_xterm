@@ -32,6 +32,8 @@ pub use egui_xterm_core::TerminalMetrics;
 pub use egui_xterm_core::TerminalSnapshot;
 #[cfg(feature = "hyperlinks")]
 pub use egui_xterm_core::{HyperlinkInfo, HyperlinkSpan};
+#[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
+pub use egui_xterm_core::{ImageFormat, ImagePlacement, StoredImage};
 #[cfg(feature = "kitty-keyboard")]
 pub use egui_xterm_core::{
     KITTY_STACK_CAP, KittyEventType, KittyKey, KittyKeyEvent, KittyKeyboardFlags, KittyModifiers,

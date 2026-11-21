@@ -32,6 +32,7 @@ pub struct TerminalRuntime<I: TerminalInput> {
     poll_scratch: Vec<u8>,
     secondary_press_in_search_bar: bool,
     scrollbar_secondary_press_in_track: bool,
+    mouse_cursor_icon: Option<egui::CursorIcon>,
     #[cfg(feature = "search")]
     search_bar: crate::widgets::search_bar::SearchBarState,
 }
@@ -65,6 +66,7 @@ impl<I: TerminalInput> TerminalRuntime<I> {
             poll_scratch: vec![0u8; POLL_CHUNK_BYTES],
             secondary_press_in_search_bar: false,
             scrollbar_secondary_press_in_track: false,
+            mouse_cursor_icon: None,
             #[cfg(feature = "search")]
             search_bar: crate::widgets::search_bar::SearchBarState::default(),
         }
@@ -358,12 +360,38 @@ impl<I: TerminalInput> TerminalRuntime<I> {
         }
 
         let events = self.terminal.drain_events();
-        if events
-            .iter()
-            .any(|ev| matches!(ev, egui_xterm_core::TerminalEvent::Bell))
+        for ev in &events {
+            match ev {
+                egui_xterm_core::TerminalEvent::Bell => {
+                    self.renderer
+                        .trigger_visual_bell(now_secs, config.visual_bell_duration_ms);
+                }
+                egui_xterm_core::TerminalEvent::MouseShape(shape) => {
+                    self.mouse_cursor_icon = map_mouse_shape(shape);
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(feature = "hyperlinks")]
+        let hyperlink_hovered = !hovered_spans.is_empty();
+        #[cfg(not(feature = "hyperlinks"))]
+        let hyperlink_hovered = false;
+
+        if !hyperlink_hovered
+            && let Some(icon) = self.mouse_cursor_icon
+            && layout.response.hovered()
+            && !context_menu_open
+            && !scrollbar_dragging
+            && !scrollbar_pointer_active
         {
-            self.renderer
-                .trigger_visual_bell(now_secs, config.visual_bell_duration_ms);
+            let pointer_over_overlay = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| {
+                search_bar_rect.is_some_and(|r| r.contains(p))
+                    || scrollbar_rect.is_some_and(|r| r.contains(p))
+            });
+            if !pointer_over_overlay {
+                ui.ctx().set_cursor_icon(icon);
+            }
         }
 
         // 6. 4-stage cached rendering.
@@ -577,4 +605,25 @@ fn track_secondary_press_in_rect(
         *latched = false;
     }
     started_in_rect
+}
+
+fn map_mouse_shape(shape: &str) -> Option<egui::CursorIcon> {
+    let normalized = shape.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => None,
+        "default" | "left_ptr" | "arrow" => Some(egui::CursorIcon::Default),
+        "pointer" | "hand" | "hand2" => Some(egui::CursorIcon::PointingHand),
+        "text" | "xterm" | "ibeam" => Some(egui::CursorIcon::Text),
+        "crosshair" | "cross" | "tcross" => Some(egui::CursorIcon::Crosshair),
+        "grab" | "openhand" => Some(egui::CursorIcon::Grab),
+        "grabbing" | "closedhand" => Some(egui::CursorIcon::Grabbing),
+        "move" | "fleur" | "all-scroll" => Some(egui::CursorIcon::AllScroll),
+        "not-allowed" | "no-drop" | "pirate" => Some(egui::CursorIcon::NotAllowed),
+        "wait" | "watch" => Some(egui::CursorIcon::Wait),
+        "progress" => Some(egui::CursorIcon::Progress),
+        "help" | "question_arrow" => Some(egui::CursorIcon::Help),
+        "ew-resize" | "col-resize" => Some(egui::CursorIcon::ResizeHorizontal),
+        "ns-resize" | "row-resize" => Some(egui::CursorIcon::ResizeVertical),
+        _ => None,
+    }
 }

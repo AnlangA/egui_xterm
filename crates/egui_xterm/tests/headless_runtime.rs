@@ -8555,3 +8555,221 @@ fn hyperlink_tooltip_and_require_ctrl_click() {
         "Ctrl+Click must open URL when hyperlink_require_ctrl=true"
     );
 }
+
+#[cfg(feature = "kitty-graphics")]
+#[test]
+fn kitty_graphics_renders_cached_texture_and_evicts_on_delete() {
+    let ctx = Context::default();
+    let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(b""));
+    rt.config_mut().cursor_blink = false;
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    // 2x2 RGBA (16 bytes of 0xFF = white) base64-encoded = "/////////////////////w=="? Wait:
+    // 16 bytes of 0xFF: 15 bytes = 20 '////////////', 1 byte 0xFF = '/w==', total 24 chars: "/////////////////////w=="
+    rt.terminal_mut()
+        .advance(b"\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1;/////////////////////w==\x1b\\");
+    assert_eq!(rt.terminal().image_placements().len(), 1);
+
+    let (clipped1, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes1 = Vec::new();
+    collect_shapes(&clipped1, &mut shapes1);
+    let tex_ids_1: Vec<egui::TextureId> = shapes1
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Mesh(m) if m.texture_id != egui::TextureId::Managed(0) => Some(m.texture_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tex_ids_1.len(), 1, "expected 1 inline image mesh");
+
+    // Second frame: same image must reuse the exact same TextureId (no per-frame reload).
+    let (clipped2, _) = run_frame_with(&ctx, screen, 1.0, 0.1, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes2 = Vec::new();
+    collect_shapes(&clipped2, &mut shapes2);
+    let tex_ids_2: Vec<egui::TextureId> = shapes2
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Mesh(m) if m.texture_id != egui::TextureId::Managed(0) => Some(m.texture_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tex_ids_2, tex_ids_1,
+        "texture handle must be cached across frames"
+    );
+
+    // Delete all images: mesh must disappear.
+    rt.terminal_mut().advance(b"\x1b_Ga=d,d=a\x1b\\");
+    assert!(rt.terminal().image_placements().is_empty());
+    let (clipped3, _) = run_frame_with(&ctx, screen, 1.0, 0.2, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes3 = Vec::new();
+    collect_shapes(&clipped3, &mut shapes3);
+    let tex_ids_3: Vec<egui::TextureId> = shapes3
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Mesh(m) if m.texture_id != egui::TextureId::Managed(0) => Some(m.texture_id),
+            _ => None,
+        })
+        .collect();
+    assert!(tex_ids_3.is_empty(), "deleted image must no longer render");
+}
+
+#[cfg(feature = "sixel")]
+#[test]
+fn sixel_graphics_renders_textured_mesh() {
+    let ctx = Context::default();
+    let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(b""));
+    rt.config_mut().cursor_blink = false;
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    rt.terminal_mut().advance(b"\x1bPq#0;2;100;0;0#0~~-\x1b\\");
+    assert_eq!(rt.terminal().image_placements().len(), 1);
+
+    let (clipped, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes = Vec::new();
+    collect_shapes(&clipped, &mut shapes);
+    let has_image_mesh = shapes.iter().any(|s| match s {
+        Shape::Mesh(m) => m.texture_id != egui::TextureId::Managed(0),
+        _ => false,
+    });
+    assert!(
+        has_image_mesh,
+        "expected Sixel image to render as a textured mesh"
+    );
+}
+
+#[test]
+fn sgr_pixels_1016_encodes_pixel_coordinates_and_subcell_motion() {
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingInput(Arc<Mutex<Vec<u8>>>);
+    impl TerminalInput for RecordingInput {
+        fn poll_read(&mut self, _buf: &mut [u8]) -> Result<usize, TerminalIoError> {
+            Ok(0)
+        }
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), TerminalIoError> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    let written = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let ctx = Context::default();
+    let mut rt = TerminalRuntime::new(RecordingInput(Arc::clone(&written)));
+    rt.config_mut().cursor_blink = false;
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    // Enable AnyEvent (1003) + SGR-Pixels (1016).
+    rt.terminal_mut().advance(b"\x1b[?1003;1016h");
+
+    // Frame 1: establish layout.
+    run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    written.lock().unwrap().clear();
+
+    // Frame 2: press at (12, 20), move 2px within same cell to (14, 21), release at (14, 21).
+    run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.1,
+        vec![
+            Event::PointerButton {
+                pos: pos2(12.0, 20.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            Event::PointerMoved(pos2(14.0, 21.0)),
+            Event::PointerButton {
+                pos: pos2(14.0, 21.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+
+    let out = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+    assert!(
+        out.contains("\x1b[<0;12;20M"),
+        "expected SGR-Pixels press at (12, 20), got {out:?}"
+    );
+    assert!(
+        out.contains("\x1b[<32;14;21M"),
+        "expected SGR-Pixels sub-cell drag motion at (14, 21), got {out:?}"
+    );
+    assert!(
+        out.contains("\x1b[<0;14;21m"),
+        "expected SGR-Pixels release at (14, 21), got {out:?}"
+    );
+}
+
+#[test]
+fn osc_22_mouse_shape_and_osc_9_events_flow_through_runtime() {
+    let ctx = Context::default();
+    let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(b""));
+    rt.config_mut().cursor_blink = false;
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    // Emit OSC 22 cursor shape, OSC 9 notification, and OSC 9;4 progress.
+    rt.terminal_mut()
+        .advance(b"\x1b]22;crosshair\x07\x1b]9;Build done\x07\x1b]9;4;1;75\x07");
+
+    // Frame 1: establish layout and drain OSC events.
+    let mut events_out = Vec::new();
+    run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            events_out = rt.show(ui).events;
+        });
+    });
+
+    // Frame 2: hover over the terminal grid to observe the mapped cursor icon.
+    let (_, plat) = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.1,
+        vec![Event::PointerMoved(pos2(100.0, 100.0))],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+
+    assert!(events_out.contains(&TerminalEvent::MouseShape("crosshair".to_owned())));
+    assert!(events_out.contains(&TerminalEvent::Notification {
+        title: String::new(),
+        body: "Build done".to_owned(),
+    }));
+    assert!(events_out.contains(&TerminalEvent::Progress {
+        state: 1,
+        progress: 75,
+    }));
+    assert_eq!(plat.cursor_icon, CursorIcon::Crosshair);
+}
