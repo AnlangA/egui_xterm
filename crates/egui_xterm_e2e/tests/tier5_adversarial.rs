@@ -408,7 +408,7 @@ fn t5_f3_parser_overflow_utf8_invalid_subparts_and_c1_split_chunks() {
         ..CoreConfig::default()
     };
     let mut c1_term = Terminal::new(40, 4, c1_cfg);
-    let c1_stream = b"\x9D2;c1\x9C\x9B1;3H\x90qpayload\x9CHi\x85Next";
+    let c1_stream = b"\x9D2;c1\x9C\x9B1;3H\x90|payload\x9CHi\x85Next";
     for &b in c1_stream {
         c1_term.advance(&[b]);
     }

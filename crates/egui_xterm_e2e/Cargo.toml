@@ -15,12 +15,16 @@ default = [
     "hyperlinks",
     "shell-integration",
     "kitty-keyboard",
+    "kitty-graphics",
+    "sixel",
     "vector-glyphs",
 ]
 search = ["egui_xterm_core/search", "egui_xterm/search"]
 hyperlinks = ["egui_xterm_core/hyperlinks", "egui_xterm/hyperlinks"]
 shell-integration = ["egui_xterm_core/shell-integration", "egui_xterm/shell-integration"]
 kitty-keyboard = ["egui_xterm_core/kitty-keyboard", "egui_xterm/kitty-keyboard"]
+kitty-graphics = ["egui_xterm_core/kitty-graphics"]
+sixel = ["egui_xterm_core/sixel"]
 vector-glyphs = ["egui_xterm/vector-glyphs"]
 serde = ["egui_xterm_core/serde", "egui_xterm/serde", "dep:serde_json"]
 metrics = ["egui_xterm_core/metrics", "egui_xterm/metrics"]
