@@ -13,7 +13,8 @@ fn w1_fullscreen_modal_tui_editor() {
     let mut h = HeadlessTermHarness::scripted();
     h.set_viewport_size(800.0, 600.0);
     h.runtime.input_mut().push_str("user@host:~/proj$ ");
-    let _ = h.run_frame();
+    let primary_verts = h.run_frame().inspect_shapes().text_mesh_vertices().to_vec();
+    assert!(!primary_verts.is_empty());
 
     // Enter alt screen, enable button-event + SGR mouse, bracketed paste, Kitty flags 3, bar cursor.
     h.runtime
@@ -29,12 +30,19 @@ fn w1_fullscreen_modal_tui_editor() {
     );
     let mid_sync = h.run_frame().inspect_shapes();
     assert!(h.runtime.terminal().is_synchronized_output());
-    assert!(!mid_sync.contains_text("main()"));
+    assert!(mid_sync.text_mesh_vertices().is_empty());
 
     h.runtime.input_mut().push_str("\r\n}\x1b[?2026l");
     let committed = h.run_frame().inspect_shapes();
     assert!(!h.runtime.terminal().is_synchronized_output());
-    assert!(committed.contains_text("main()"));
+    assert!(
+        h.runtime
+            .terminal()
+            .visible_line_text(0)
+            .as_deref()
+            .is_some_and(|l| l.contains("main()"))
+    );
+    assert!(!committed.text_mesh_vertices().is_empty());
     assert!(committed.has_text_fg_color(Color32::from_rgb(86, 156, 214)));
 
     h.focus_terminal();
@@ -72,7 +80,14 @@ fn w1_fullscreen_modal_tui_editor() {
     h.runtime.input_mut().push_str("\x1b[?1049l");
     let restored = h.run_frame();
     assert!(!h.runtime.terminal().is_alt_screen());
-    assert!(restored.inspect_shapes().contains_text("user@host:~/proj$"));
+    assert_eq!(
+        h.runtime.terminal().visible_line_text(0).as_deref(),
+        Some("user@host:~/proj$")
+    );
+    assert_eq!(
+        restored.inspect_shapes().text_mesh_vertices(),
+        primary_verts.as_slice()
+    );
 }
 
 #[cfg(feature = "vector-glyphs")]
@@ -94,12 +109,19 @@ fn w2_60fps_system_monitor() {
         .input_mut()
         .push_str("\x1b[?2026h\x1b[H┌──CPU_00──┐\r\n│▁▃▅▇█ ⣿│");
     let latched = h.run_frame().inspect_shapes();
-    assert!(!latched.contains_text("CPU_00"));
+    assert!(latched.text_mesh_vertices().is_empty());
     h.runtime
         .input_mut()
         .push_str("\r\n└──────────┘\x1b[?2026l");
     let committed = h.run_frame().inspect_shapes();
-    assert!(committed.contains_text("CPU_00"));
+    assert!(
+        h.runtime
+            .terminal()
+            .visible_line_text(0)
+            .as_deref()
+            .is_some_and(|l| l.contains("CPU_00"))
+    );
+    assert!(!committed.text_mesh_vertices().is_empty());
 
     for frame in 0..60usize {
         h.advance_time(1.0 / 60.0);
@@ -132,7 +154,12 @@ fn w2_60fps_system_monitor() {
             out.pixels_per_point,
         );
         assert!(
-            insp.contains_text(&format!("F{frame:02}")),
+            h.runtime
+                .terminal()
+                .visible_line_text(0)
+                .as_deref()
+                .is_some_and(|l| l.contains(&format!("F{frame:02}")))
+                && !insp.text_mesh_vertices().is_empty(),
             "missing rendered frame label F{frame:02}"
         );
         assert!(
@@ -314,6 +341,8 @@ fn w4_multipane_split_ide_workspace_resize_and_dpi() {
     let (l1, r1, m1) = panes.run_split_frame();
     let expected_left_full = panes.left.terminal().full_text();
     assert_eq!((r1.cols, r1.rows), (80, 24));
+    assert!((m1.pixels_per_point - 1.0).abs() < 1e-6);
+    assert!(!m1.inspect_shapes().text_mesh_vertices().is_empty());
     assert!(
         m1.inspect_shapes()
             .text_entries
@@ -328,6 +357,8 @@ fn w4_multipane_split_ide_workspace_resize_and_dpi() {
     assert_eq!(panes.left.terminal().full_text(), expected_left_full);
     assert_eq!((r2.cols, r2.rows), (80, 24));
     assert!(r2.effective_font_size < r1.effective_font_size);
+    assert!((m2.pixels_per_point - 2.0).abs() < 1e-6);
+    assert!(!m2.inspect_shapes().text_mesh_vertices().is_empty());
     assert!(
         m2.inspect_shapes()
             .text_entries
@@ -342,6 +373,8 @@ fn w4_multipane_split_ide_workspace_resize_and_dpi() {
     assert_eq!(panes.left.terminal().full_text(), expected_left_full);
     assert_eq!((r3.cols, r3.rows), (80, 24));
     assert!(r3.effective_font_size > r2.effective_font_size);
+    assert!((m3.pixels_per_point - 1.25).abs() < 1e-6);
+    assert!(!m3.inspect_shapes().text_mesh_vertices().is_empty());
     assert!(
         m3.inspect_shapes()
             .text_entries
@@ -589,7 +622,10 @@ fn w6_ime_cjk_composition_session_repl() {
         h.runtime.terminal().visible_line_text(0),
         Some("> 中文输入".to_owned())
     );
-    assert!(echoed.inspect_shapes().contains_text("> 中文输入"));
+    assert!(
+        echoed.inspect_shapes().text_mesh_vertices().len()
+            > committed.inspect_shapes().text_mesh_vertices().len()
+    );
 }
 
 #[test]
@@ -790,15 +826,23 @@ fn w9_wasm_safe_trait_driven_echo_console() {
 
     shared.borrow_mut().push_str("help\r\nCOMMANDS: clear\r\n");
     let echoed = h.run_frame().inspect_shapes();
-    assert!(echoed.contains_text("COMMANDS: clear"));
+    assert_eq!(
+        h.runtime.terminal().visible_line_text(1).as_deref(),
+        Some("COMMANDS: clear")
+    );
+    assert!(!echoed.text_mesh_vertices().is_empty());
 
     shared.borrow_mut().push_str("\x1b[2J\x1b[H$ ");
     let cleared = h.run_frame().inspect_shapes();
-    assert!(!cleared.contains_text("COMMANDS: clear"));
     assert_eq!(
         h.runtime.terminal().visible_line_text(0),
         Some("$".to_owned())
     );
+    assert_eq!(
+        h.runtime.terminal().visible_line_text(1),
+        Some(String::new())
+    );
+    assert!(cleared.text_mesh_vertices().len() < echoed.text_mesh_vertices().len());
 }
 
 #[test]

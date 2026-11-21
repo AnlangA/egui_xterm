@@ -62,7 +62,7 @@ fn t1_item3_01_sl_sr_full_page_and_bce() {
         }
     }
     let sl_shapes = sl_frame.inspect_shapes();
-    assert!(sl_shapes.contains_text("CDEFGH"));
+    assert!(!sl_shapes.text_mesh_vertices().is_empty());
     assert!(sl_shapes.has_rect_or_mesh_color(Color32::from_rgb(10, 20, 30)));
 
     // Set a distinct BCE bg and shift right by 3 (`CSI 3 SP A`).
@@ -234,7 +234,9 @@ fn t1_item3_03_rect_ops_decfra_decera_decsera_deccra() {
         }
         assert_eq!(term.cell_at(1, 1).expect("outside left").ch, ' ');
     }
-    assert!(fill_frame.inspect_shapes().contains_text("####"));
+    let fill_insp = fill_frame.inspect_shapes();
+    assert!(!fill_insp.text_mesh_vertices().is_empty());
+    assert!(fill_insp.has_rect_or_mesh_color(rgb_to_c32(h.config.theme.scheme.ansi[4])));
 
     // Overwrite 1-based row 3 (0-based row 2) with unprotected "UNPROT" across cols 1..=6.
     // Then DECSERA (`CSI 2;3;4;6 $ {`) preserves protected '#' on rows 1 & 3, erases PROT in box.
@@ -807,8 +809,10 @@ fn t1_item4_05_osc66_text_sizing() {
             h_align: 1,
         })
     );
-    let rendered = frame.inspect_shapes().rendered_lines().join("\n");
-    assert!(rendered.contains('H') && rendered.contains('1') && rendered.contains("sub"));
+    let insp66 = frame.inspect_shapes();
+    assert!(!insp66.text_mesh_vertices().is_empty());
+    let bounds66 = insp66.text_mesh_bounds().expect("OSC 66 mesh bounds");
+    assert!(bounds66.height() > frame.terminal_response.cell_size.y * 2.0);
 }
 
 #[test]
@@ -2089,8 +2093,21 @@ fn t4_workload_01_tui_spreadsheet_editor_declrmm_deccra_decsca() {
     h.runtime.input_mut().clear_written();
 
     let insp = rendered.inspect_shapes();
-    assert!(insp.contains_text("COL_A"));
-    assert!(insp.contains_text("100.5"));
+    assert!(!insp.text_mesh_vertices().is_empty());
+    assert!(
+        h.runtime
+            .terminal()
+            .visible_line_text(0)
+            .as_deref()
+            .is_some_and(|l| l.contains("COL_A"))
+    );
+    assert!(
+        h.runtime
+            .terminal()
+            .visible_line_text(2)
+            .as_deref()
+            .is_some_and(|l| l.contains("100.5"))
+    );
 
     // Protected header & gutter stay intact under DECSERA and DECSED 2 across entire viewport.
     h.runtime
@@ -2202,13 +2219,12 @@ fn t4_workload_02_modern_ci_build_runner_osc_suite() {
         h.runtime.terminal().visible_line_text(0).as_deref(),
         Some("BUILD")
     );
-    let build_rendered = build_frame.inspect_shapes().rendered_lines().join("\n");
+    let build_insp = build_frame.inspect_shapes();
+    assert!(!build_insp.text_mesh_vertices().is_empty());
     assert!(
-        build_rendered.contains('B')
-            && build_rendered.contains('U')
-            && build_rendered.contains('I')
-            && build_rendered.contains('L')
-            && build_rendered.contains('D')
+        build_insp
+            .text_mesh_bounds()
+            .is_some_and(|b| b.height() > build_frame.terminal_response.cell_size.y)
     );
 
     // Phase 2: Build completes -> clear progress, restore default cursor, emit chunked base64 OSC 99,

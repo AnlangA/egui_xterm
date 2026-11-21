@@ -737,17 +737,30 @@ fn t5_c2_02_osc12_cursor_and_osc4_extended_256_palette_render() {
         .input_mut()
         .push_str("\x1b]12;#00ff00\x07\x1b]4;196;rgb:00/ff/00\x07\x1b[48;5;196mX\x1b[0m");
 
-    let shapes = h.run_frame().inspect_shapes();
+    let out = h.run_frame();
+    let shapes = out.inspect_shapes();
     let green = Color32::from_rgb(0, 255, 0);
     let red_196 = Color32::from_rgb(255, 0, 0);
     assert!(shapes.has_rect_or_mesh_color(green));
     assert!(!shapes.has_rect_or_mesh_color(red_196));
 
-    // Confirm both cell (0,0) and cursor at (1,0) emit green mesh quads (>= 8 green vertices).
-    let green_verts = shapes.mesh_colors().iter().filter(|&&c| c == green).count();
+    // Confirm cell (0,0) emits a green bg mesh quad (>= 4 vertices) and cursor at (1,0) emits a green Shape::Rect.
+    let green_verts = shapes
+        .non_text_mesh_colors()
+        .iter()
+        .filter(|&&c| c == green)
+        .count();
     assert!(
-        green_verts >= 8,
-        "expected >= 8 green vertices (cell 196 + cursor), got {green_verts}"
+        green_verts >= 4,
+        "expected >= 4 green bg mesh vertices for cell 196, got {green_verts}"
+    );
+    let origin = out.terminal_response.response.rect.min;
+    let cell_size = out.terminal_response.cell_size;
+    let cursor_cell = Rect::from_min_size(pos2(origin.x + cell_size.x, origin.y), cell_size);
+    assert_eq!(
+        shapes.rect_fills_in_rect(cursor_cell, green).len(),
+        1,
+        "expected green cursor rect at cell (1,0)"
     );
 
     // Reset via OSC 112 and OSC 104;196 restores defaults.
@@ -781,8 +794,11 @@ fn t5_c2_03_vector_glyph_disabled_falls_back_to_text() {
         .input_mut()
         .push_str("\u{E0B0}\x1b[4:1;58:2::255:0:0m\u{2588}\x1b[0m");
     let shapes = h.run_frame().inspect_shapes();
-    assert!(shapes.contains_text("\u{E0B0}"));
-    assert!(shapes.contains_text("\u{2588}"));
+    assert_eq!(
+        h.runtime.terminal().visible_line_text(0).as_deref(),
+        Some("\u{E0B0}\u{2588}")
+    );
+    assert!(!shapes.text_mesh_vertices().is_empty());
     assert!(shapes.has_rect_or_mesh_color(Color32::from_rgb(255, 0, 0)));
 }
 
@@ -862,26 +878,38 @@ fn t5_c2_05_slow_path_bidi_and_combining_cluster_grid_alignment() {
     h.runtime
         .input_mut()
         .push_str("لاABCD\r\n  ABCD\r\n🏳\u{FE0F}\u{200D}🌈ABCD\r\n  ABCD");
-    let shapes = h.run_frame().inspect_shapes();
+    let out = h.run_frame();
+    let origin = out.terminal_response.response.rect.min;
+    let term_w = out.terminal_response.response.rect.width();
+    let cell_h = out.terminal_response.cell_size.y;
+    let shapes = out.inspect_shapes();
 
-    let mut entries = shapes.text_entries;
-    entries.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
-    assert_eq!(entries.len(), 4, "expected 4 rendered text rows");
-
-    let extract_abcd_xs = |entry: &egui_xterm_e2e::RenderedTextEntry| -> Vec<f32> {
-        entry.galley.rows[0]
-            .row
-            .glyphs
+    let extract_abcd_xs = |row: usize| -> Vec<f32> {
+        let row_rect = Rect::from_min_max(
+            pos2(origin.x, origin.y + row as f32 * cell_h + 0.1),
+            pos2(
+                origin.x + term_w,
+                origin.y + (row + 1) as f32 * cell_h - 0.1,
+            ),
+        );
+        let verts = shapes.text_mesh_vertices_in_rect(row_rect);
+        assert!(
+            verts.len() >= 16,
+            "expected at least 4 trailing ASCII quads (16 verts) on row {row}, got {}",
+            verts.len()
+        );
+        let tail = &verts[verts.len() - 16..];
+        tail.as_chunks::<4>()
+            .0
             .iter()
-            .filter(|g| matches!(g.chr, 'A'..='D'))
-            .map(|g| entry.pos.x + g.pos.x)
+            .map(|q| q.iter().map(|v| v.pos.x).fold(f32::INFINITY, f32::min))
             .collect()
     };
 
-    let xs_row0 = extract_abcd_xs(&entries[0]);
-    let xs_row1 = extract_abcd_xs(&entries[1]);
-    let xs_row2 = extract_abcd_xs(&entries[2]);
-    let xs_row3 = extract_abcd_xs(&entries[3]);
+    let xs_row0 = extract_abcd_xs(0);
+    let xs_row1 = extract_abcd_xs(1);
+    let xs_row2 = extract_abcd_xs(2);
+    let xs_row3 = extract_abcd_xs(3);
 
     assert_eq!(xs_row0.len(), 4);
     assert_eq!(xs_row1.len(), 4);
@@ -1015,13 +1043,10 @@ fn t5_c2_08_two_byte_read_budget_splits_utf8_and_csi_and_font_reset() {
     let _ = h.run_frame();
     let outcome = h.run_frame();
     let shapes = outcome.inspect_shapes();
-    assert!(shapes.contains_text("中文🚀"));
-    for entry in &shapes.text_entries {
-        assert!(!entry.galley.rows.is_empty());
-        let row = &entry.galley.rows[0].row;
-        for v in &row.visuals.mesh.vertices {
-            assert!(v.uv.x.is_finite() && v.uv.y.is_finite());
-        }
+    assert!(!shapes.text_mesh_vertices().is_empty());
+    for v in shapes.text_mesh_vertices() {
+        assert!(v.uv.x.is_finite() && v.uv.y.is_finite());
+        assert!((0.0..=1.0).contains(&v.uv.x) && (0.0..=1.0).contains(&v.uv.y));
     }
 }
 
@@ -2327,8 +2352,12 @@ fn t5_m2_malformed_osc_9_4_66_99_and_progress_widget() {
             h_align: 0,
         })
     );
-    assert!(edge66_frame.inspect_shapes().contains_text("W"));
-    assert!(edge66_frame.inspect_shapes().contains_text("X"));
+    let edge66_insp = edge66_frame.inspect_shapes();
+    assert!(!edge66_insp.text_mesh_vertices().is_empty());
+    let edge66_bounds = edge66_insp
+        .text_mesh_bounds()
+        .expect("OSC 66 s=7 glyphs rendered");
+    assert!(edge66_bounds.height() > edge66_frame.terminal_response.cell_size.y * 2.0);
 
     // 3. Malformed & flood OSC 99 payloads:
     //    bad IDs, >64-byte ID, invalid base64, invalid UTF-8 base64, >64 KiB multi-chunk overflow,
@@ -2530,7 +2559,7 @@ fn t5_m2_out_of_bounds_deccra_decfra_decsera_and_wide_invariants() {
         h.runtime.terminal().visible_line_text(0).as_deref(),
         Some("ABCDEFGH")
     );
-    assert!(final_frame.inspect_shapes().contains_text("ABCDEFGH"));
+    assert!(!final_frame.inspect_shapes().text_mesh_vertices().is_empty());
 }
 
 #[test]

@@ -19,7 +19,7 @@ use egui_xterm::{
 };
 use epaint::{
     ClippedPrimitive, ClippedShape, Color32, Galley, ImageData, PaintStats, Primitive, Shape,
-    TextureId, textures::TexturesDelta,
+    TextureId, Vertex, WHITE_UV, textures::TexturesDelta,
 };
 
 // ---------------------------------------------------------------------------
@@ -442,8 +442,11 @@ pub struct ShapeInspection {
     /// Count of non-transparent/stroked `Shape::Rect` edges not aligned to physical pixels.
     pub non_snapped_rect_count: usize,
     text_fg_colors: Vec<Color32>,
+    text_mesh_vertices: Vec<Vertex>,
     mesh_colors: Vec<Color32>,
     mesh_vertex_positions: Vec<Pos2>,
+    non_text_mesh_colors: Vec<Color32>,
+    non_text_mesh_vertex_positions: Vec<Pos2>,
 }
 
 impl ShapeInspection {
@@ -505,16 +508,63 @@ impl ShapeInspection {
         self.text_entries.iter().any(|e| e.text.contains(needle))
     }
 
-    /// Returns `true` if any rendered text section or override color equals `color`.
+    /// Returns `true` if any rendered text section, override color, or coalesced text-mesh
+    /// vertex equals `color`.
     #[must_use]
     pub fn has_text_fg_color(&self, color: Color32) -> bool {
         self.text_fg_colors.contains(&color)
+    }
+
+    /// Returns `true` when either `Shape::Text` galleys or coalesced font-atlas `Shape::Mesh`
+    /// text vertices were emitted in scope.
+    #[must_use]
+    pub fn has_rendered_text_geometry(&self) -> bool {
+        !self.text_entries.is_empty() || !self.text_mesh_vertices.is_empty()
+    }
+
+    /// Returns all vertices captured from coalesced font-atlas `Shape::Mesh` text shapes.
+    #[must_use]
+    pub fn text_mesh_vertices(&self) -> &[Vertex] {
+        &self.text_mesh_vertices
+    }
+
+    /// Returns all coalesced text-mesh vertices whose positions lie inside `bounds`.
+    #[must_use]
+    pub fn text_mesh_vertices_in_rect(&self, bounds: Rect) -> Vec<Vertex> {
+        self.text_mesh_vertices
+            .iter()
+            .copied()
+            .filter(|v| bounds.contains(v.pos))
+            .collect()
+    }
+
+    /// Returns the tight axis-aligned bounding rectangle of coalesced text-mesh vertices, if any.
+    #[must_use]
+    pub fn text_mesh_bounds(&self) -> Option<Rect> {
+        let mut iter = self.text_mesh_vertices.iter();
+        let first = iter.next()?;
+        let mut bounds = Rect::from_min_size(first.pos, Vec2::ZERO);
+        for v in iter {
+            bounds.extend_with(v.pos);
+        }
+        Some(bounds)
     }
 
     /// Returns `true` if any `Shape::Rect` fill or `Shape::Mesh` vertex color equals `color`.
     #[must_use]
     pub fn has_rect_or_mesh_color(&self, color: Color32) -> bool {
         self.rect_fills.iter().any(|(_, c)| *c == color) || self.mesh_colors.contains(&color)
+    }
+
+    /// Returns non-transparent `Shape::Rect` `(rect, fill)` pairs matching `color` whose
+    /// rectangles intersect `bounds` with positive area.
+    #[must_use]
+    pub fn rect_fills_in_rect(&self, bounds: Rect, color: Color32) -> Vec<(Rect, Color32)> {
+        self.rect_fills
+            .iter()
+            .copied()
+            .filter(|&(rect, fill)| fill == color && rect.intersect(bounds).is_positive())
+            .collect()
     }
 
     /// Returns all vertex colors captured from `Shape::Mesh` shapes in scope.
@@ -527,6 +577,18 @@ impl ShapeInspection {
     #[must_use]
     pub fn mesh_vertex_positions(&self) -> &[Pos2] {
         &self.mesh_vertex_positions
+    }
+
+    /// Returns vertex colors from non-text `Shape::Mesh` shapes (backgrounds, overlays, images).
+    #[must_use]
+    pub fn non_text_mesh_colors(&self) -> &[Color32] {
+        &self.non_text_mesh_colors
+    }
+
+    /// Returns vertex positions from non-text `Shape::Mesh` shapes (backgrounds, overlays, images).
+    #[must_use]
+    pub fn non_text_mesh_vertex_positions(&self) -> &[Pos2] {
+        &self.non_text_mesh_vertex_positions
     }
 }
 
@@ -639,9 +701,20 @@ fn visit_shape(
             out.mesh_shape_count += 1;
             out.mesh_texture_ids.push(mesh.texture_id);
             out.mesh_vertices_total += mesh.vertices.len();
+            let is_text_mesh = mesh.texture_id == TextureId::default()
+                && mesh.vertices.iter().any(|v| v.uv != WHITE_UV);
             for v in &mesh.vertices {
                 out.mesh_colors.push(v.color);
                 out.mesh_vertex_positions.push(v.pos);
+                if is_text_mesh {
+                    out.text_mesh_vertices.push(*v);
+                    if v.color != Color32::TRANSPARENT {
+                        out.text_fg_colors.push(v.color);
+                    }
+                } else {
+                    out.non_text_mesh_colors.push(v.color);
+                    out.non_text_mesh_vertex_positions.push(v.pos);
+                }
             }
         }
         Shape::Noop
@@ -1878,5 +1951,48 @@ mod tests {
         assert!(insp.clip_rects.is_empty());
         assert!(!insp.has_rect_or_mesh_color(Color32::from_rgb(220, 40, 40)));
         assert!(!insp.has_rect_or_mesh_color(Color32::from_rgb(40, 220, 40)));
+    }
+
+    #[test]
+    fn shape_inspection_distinguishes_text_mesh_from_bg_overlay_and_rect_fills() {
+        let mut h = HeadlessTermHarness::scripted();
+        h.config.cursor_blink = false;
+        h.focus_terminal();
+        h.runtime
+            .input_mut()
+            .push_str("\x1b[38;2;12;200;90;48;2;30;40;50mHI\x1b[0m\x1b[4 q");
+        let outcome = h.run_frame();
+        let term_rect = outcome.terminal_response.response.rect;
+        let cell_size = outcome.terminal_response.cell_size;
+        let insp = ShapeInspection::from_terminal_shapes(
+            &outcome.shapes,
+            term_rect,
+            outcome.pixels_per_point,
+        );
+
+        let fg = Color32::from_rgb(12, 200, 90);
+        let bg = Color32::from_rgb(30, 40, 50);
+        let cursor = Color32::from_rgb(
+            h.config.theme.scheme.cursor[0],
+            h.config.theme.scheme.cursor[1],
+            h.config.theme.scheme.cursor[2],
+        );
+
+        assert!(insp.has_rendered_text_geometry());
+        assert!(!insp.text_mesh_vertices().is_empty());
+        assert!(insp.has_text_fg_color(fg));
+        assert!(!insp.has_text_fg_color(bg));
+        assert!(insp.non_text_mesh_colors().contains(&bg));
+        assert!(!insp.non_text_mesh_colors().contains(&fg));
+        assert!(insp.text_mesh_bounds().is_some());
+
+        let row0_rect = Rect::from_min_size(term_rect.min, vec2(2.0 * cell_size.x, cell_size.y));
+        assert!(!insp.text_mesh_vertices_in_rect(row0_rect).is_empty());
+
+        let cursor_cell = Rect::from_min_size(
+            pos2(term_rect.min.x + 2.0 * cell_size.x, term_rect.min.y),
+            cell_size,
+        );
+        assert_eq!(insp.rect_fills_in_rect(cursor_cell, cursor).len(), 1);
     }
 }

@@ -723,7 +723,7 @@ fn w1_osc8_wrapped_id_hover_spans_click_and_clear() {
     h.inject_pointer_move(blank_pos);
     let base_frame = h.run_frame();
     let base_insp = base_frame.inspect_shapes();
-    let base_mesh_verts = base_insp.mesh_vertex_positions().len();
+    let base_mesh_verts = base_insp.non_text_mesh_vertex_positions().len();
 
     let row0_bot = origin.y + cell_size.y;
     let row1_bot = origin.y + 2.0 * cell_size.y;
@@ -732,7 +732,7 @@ fn w1_osc8_wrapped_id_hover_spans_click_and_clear() {
 
     assert!(
         !base_insp
-            .mesh_vertex_positions()
+            .non_text_mesh_vertex_positions()
             .iter()
             .any(|p| is_row0_ul_y(p.y) || is_row1_ul_y(p.y)),
         "base frame without hover must emit zero underline quads on rows 0 and 1"
@@ -747,7 +747,7 @@ fn w1_osc8_wrapped_id_hover_spans_click_and_clear() {
         CursorIcon::PointingHand
     );
     let hover_insp = hover_frame.inspect_shapes();
-    let hover_verts = hover_insp.mesh_vertex_positions();
+    let hover_verts = hover_insp.non_text_mesh_vertex_positions();
     assert_eq!(
         hover_verts.len(),
         base_mesh_verts + 12,
@@ -821,7 +821,10 @@ fn w1_osc8_wrapped_id_hover_spans_click_and_clear() {
         CursorIcon::PointingHand
     );
     assert_eq!(
-        clear_frame.inspect_shapes().mesh_vertex_positions().len(),
+        clear_frame
+            .inspect_shapes()
+            .non_text_mesh_vertex_positions()
+            .len(),
         base_mesh_verts
     );
 }
@@ -1009,17 +1012,11 @@ fn w1_da1_da2_xtversion_nonzero_param_handling_and_decscusr_e2e() {
     let cell_size = h.last_outcome().expect("warm").terminal_response.cell_size;
     let cursor_c32 = rgb_to_c32(h.config.theme.scheme.cursor);
 
-    let cursor_verts_in_cell0 = |insp: &egui_xterm_e2e::ShapeInspection| -> Vec<Pos2> {
-        insp.mesh_vertex_positions()
-            .iter()
-            .zip(insp.mesh_colors().iter())
-            .filter_map(|(&p, &c)| {
-                let in_cell = p.x >= origin.x - 0.5
-                    && p.x <= origin.x + cell_size.x + 0.5
-                    && p.y >= origin.y - 0.5
-                    && p.y <= origin.y + cell_size.y + 0.5;
-                (c == cursor_c32 && in_cell).then_some(p)
-            })
+    let cell_zero_rect = egui::Rect::from_min_size(origin, cell_size);
+    let cursor_rects_in_cell0 = |insp: &egui_xterm_e2e::ShapeInspection| -> Vec<egui::Rect> {
+        insp.rect_fills_in_rect(cell_zero_rect, cursor_c32)
+            .into_iter()
+            .map(|(rect, _)| rect)
             .collect()
     };
 
@@ -1044,33 +1041,32 @@ fn w1_da1_da2_xtversion_nonzero_param_handling_and_decscusr_e2e() {
         if matches!(expected_shape, CursorShape::Underline | CursorShape::Bar) && !expected_blink {
             let insp = frame.inspect_shapes();
             assert!(insp.has_rect_or_mesh_color(cursor_c32));
-            let verts = cursor_verts_in_cell0(&insp);
+            let rects = cursor_rects_in_cell0(&insp);
             assert_eq!(
-                verts.len(),
-                4,
-                "DECSCUSR {code} must render 1 cursor overlay quad (4 vertices) in cell (0,0)"
+                rects.len(),
+                1,
+                "DECSCUSR {code} must render 1 cursor overlay rect in cell (0,0)"
             );
-            let has_bottom_ul_interior = verts
-                .iter()
-                .any(|p| p.y > origin.y + cell_size.y * 0.5 && p.y < origin.y + cell_size.y - 0.25);
-            let has_left_bar_interior = verts
-                .iter()
-                .any(|p| p.x > origin.x + 0.25 && p.x < origin.x + cell_size.x * 0.5);
+            let r = rects[0];
             match expected_shape {
                 CursorShape::Underline => {
-                    let spans_width = verts.iter().any(|p| p.x <= origin.x + 0.5)
-                        && verts.iter().any(|p| p.x >= origin.x + cell_size.x * 0.5);
                     assert!(
-                        has_bottom_ul_interior && spans_width && !has_left_bar_interior,
-                        "DECSCUSR {code} (Underline) must render bottom strip across cell width, not left bar; verts={verts:?}"
+                        r.min.y > origin.y + cell_size.y * 0.5
+                            && r.max.y <= origin.y + cell_size.y + 0.5
+                            && r.min.x <= origin.x + 0.5
+                            && r.max.x >= origin.x + cell_size.x * 0.5
+                            && r.height() < cell_size.y * 0.5,
+                        "DECSCUSR {code} (Underline) must render bottom strip across cell width, not left bar; rect={r:?}"
                     );
                 }
                 CursorShape::Bar => {
-                    let spans_height = verts.iter().any(|p| p.y <= origin.y + 0.5)
-                        && verts.iter().any(|p| p.y >= origin.y + cell_size.y * 0.5);
                     assert!(
-                        has_left_bar_interior && spans_height && !has_bottom_ul_interior,
-                        "DECSCUSR {code} (Bar) must render left strip across cell height, not bottom underline; verts={verts:?}"
+                        r.max.x < origin.x + cell_size.x * 0.5
+                            && r.min.x >= origin.x - 0.5
+                            && r.min.y <= origin.y + 0.5
+                            && r.max.y >= origin.y + cell_size.y * 0.5
+                            && r.width() < cell_size.x * 0.5,
+                        "DECSCUSR {code} (Bar) must render left strip across cell height, not bottom underline; rect={r:?}"
                     );
                 }
                 CursorShape::Block => {}
@@ -1078,13 +1074,13 @@ fn w1_da1_da2_xtversion_nonzero_param_handling_and_decscusr_e2e() {
         }
     }
 
-    // Confirm cursor-geometry checks are non-vacuous: hiding cursor (?25l) removes all cursor vertices.
+    // Confirm cursor-geometry checks are non-vacuous: hiding cursor (?25l) removes all cursor rects.
     h.runtime.input_mut().push_str("\x1b[4 q\x1b[?25l");
     let hidden_frame = h.run_frame();
     let hidden_insp = hidden_frame.inspect_shapes();
     assert!(
-        cursor_verts_in_cell0(&hidden_insp).is_empty(),
-        "hiding cursor with ?25l must emit zero cursor-colored vertices in cell (0,0)"
+        cursor_rects_in_cell0(&hidden_insp).is_empty(),
+        "hiding cursor with ?25l must emit zero cursor-colored rects in cell (0,0)"
     );
 }
 
@@ -1383,11 +1379,8 @@ fn w1_irm_resets_editing_ops_and_powerline_vector_glyphs_e2e() {
             "Powerline glyphs must tessellate into vector mesh with active fg color"
         );
         assert!(
-            pl_insp
-                .text_entries
-                .iter()
-                .all(|e| !e.text.contains('\u{E0B0}')),
-            "Powerline glyphs must bypass Shape::Text font fallback"
+            pl_insp.text_entries.is_empty() && pl_insp.text_mesh_vertices().is_empty(),
+            "Powerline glyphs must bypass Shape::Text and font-atlas text_mesh"
         );
     }
 }

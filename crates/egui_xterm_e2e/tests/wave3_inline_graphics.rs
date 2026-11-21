@@ -598,29 +598,29 @@ mod item8_tier1 {
         assert!(term.next_animation_deadline().is_some());
         let epoch0 = term.damage_epoch();
 
-        // First tick at t=1.000 anchors deadline at 1.050 without switching frames.
-        assert!(!term.tick_animations(1.000));
+        // `run_frame()` already ticked once at sim_time=0.0, arming deadline at 0.050.
+        assert!(!term.tick_animations(0.010));
         let d1 = term.next_animation_deadline().expect("deadline armed");
-        assert!((d1 - 1.050).abs() < 1e-6);
+        assert!((d1 - 0.050).abs() < 1e-6);
 
-        // Tick at t=1.050 advances to frame 2 (red, green), bumps revision & damage_epoch.
-        assert!(term.tick_animations(1.050));
+        // Tick at t=0.050 advances to frame 2 (red, green), bumps revision & damage_epoch.
+        assert!(term.tick_animations(0.050));
         let img_f2 = term.image_data(20).expect("frame 2");
         assert!(img_f2.revision > rev1);
         let rev2 = img_f2.revision;
         assert_eq!(img_f2.active_rgba(), &[255, 0, 0, 255, 0, 255, 0, 255]);
         assert!(term.damage_epoch() > epoch0);
-        assert!((term.next_animation_deadline().expect("d2") - 1.130).abs() < 1e-6);
+        assert!((term.next_animation_deadline().expect("d2") - 0.130).abs() < 1e-6);
 
-        // Tick at t=1.130 advances to frame 3 (blue, red) and bumps revision again.
-        assert!(term.tick_animations(1.130));
+        // Tick at t=0.130 advances to frame 3 (blue, red) and bumps revision again.
+        assert!(term.tick_animations(0.130));
         let img_f3 = term.image_data(20).expect("frame 3");
         assert!(img_f3.revision > rev2);
         let rev3 = img_f3.revision;
         assert_eq!(img_f3.active_rgba(), &[0, 0, 255, 255, 255, 0, 0, 255]);
 
-        // Tick at t=1.200 completes the single loop and stops.
-        assert!(!term.tick_animations(1.200));
+        // Tick at t=0.200 completes the single loop and stops.
+        assert!(!term.tick_animations(0.200));
         assert!(term.next_animation_deadline().is_none());
 
         // Manual frame selection a=a,c=2 switches active frame and bumps revision.
@@ -2302,10 +2302,16 @@ fn t3_item9_02_sixel_and_kitty_z_layering_clipping_and_multi_pane() {
 
     assert!(left_insp.mesh_shape_count >= 2);
     assert!(right_insp.mesh_shape_count >= 1);
-    assert!(left_insp.contains_text("LEFT_TEXT"));
-    assert!(!left_insp.contains_text("RIGHT_TEXT"));
-    assert!(right_insp.contains_text("RIGHT_TEXT"));
-    assert!(!right_insp.contains_text("LEFT_TEXT"));
+    assert_eq!(
+        mp.left.terminal().visible_line_text(0).as_deref(),
+        Some("LEFT_TEXT")
+    );
+    assert_eq!(
+        mp.right.terminal().visible_line_text(0).as_deref(),
+        Some("RIGHT_TEXT")
+    );
+    assert!(!left_insp.text_mesh_vertices().is_empty());
+    assert!(!right_insp.text_mesh_vertices().is_empty());
 
     assert!(
         left_insp
@@ -2424,16 +2430,16 @@ fn w_gfx_01_terminal_image_viewer_animation_sixel_and_reflow() {
         &[255, 255, 255, 255],
     ));
 
-    // Tick animation across frames and confirm revision monotonically increments.
+    // `phase1 = h.run_frame()` already ticked at sim_time=0.0, arming deadline at 0.040.
     let rev_init = h.runtime.terminal().image_data(3).expect("sprite").revision;
-    assert!(!h.runtime.terminal_mut().tick_animations(2.000));
+    assert!(!h.runtime.terminal_mut().tick_animations(0.010));
     let next_dl = h
         .runtime
         .terminal()
         .next_animation_deadline()
         .expect("animation armed");
-    assert!((next_dl - 2.040).abs() < 1e-6);
-    assert!(h.runtime.terminal_mut().tick_animations(2.050));
+    assert!((next_dl - 0.040).abs() < 1e-6);
+    assert!(h.runtime.terminal_mut().tick_animations(0.050));
     let rev_f2 = h.runtime.terminal().image_data(3).expect("f2").revision;
     assert!(rev_f2 > rev_init);
     assert_eq!(

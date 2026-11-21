@@ -494,7 +494,8 @@ mod stage_m4_core {
 
         let out1 = h1.run_frame();
         let insp1 = out1.inspect_shapes();
-        assert!(insp1.contains_text("你好🚀OK"));
+        assert!(insp1.has_rendered_text_geometry());
+        assert!(!insp1.text_mesh_vertices().is_empty());
         assert!(insp1.has_text_fg_color(Color32::from_rgb(12, 34, 56)));
     }
 
@@ -544,7 +545,14 @@ mod stage_m4_core {
         let out_back = h.run_frame();
         assert_eq!(out_back.terminal_response.cols, 80);
         assert_eq!(h.runtime.terminal().full_text(), expected_full);
-        assert!(out_back.inspect_shapes().contains_text("中文测试"));
+        assert!(
+            h.runtime
+                .terminal()
+                .visible_line_text(0)
+                .as_deref()
+                .is_some_and(|l| l.contains("中文测试"))
+        );
+        assert!(!out_back.inspect_shapes().text_mesh_vertices().is_empty());
     }
 
     #[test]
@@ -613,11 +621,17 @@ mod stage_m4_core {
     fn t3_06_runtime_f7_f9_alt_screen_decstbm_and_sync_output() {
         let mut h = HeadlessTermHarness::scripted();
         h.runtime.input_mut().push_str("MAIN");
-        let _ = h.run_frame();
+        let main_verts = h.run_frame().inspect_shapes().text_mesh_vertices().to_vec();
+        assert!(!main_verts.is_empty());
 
         h.runtime.input_mut().push_str("\x1b[?1049hPRE_SYNC");
         let pre = h.run_frame().inspect_shapes();
-        assert!(pre.contains_text("PRE_SYNC"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("PRE_SYNC")
+        );
+        let pre_verts = pre.text_mesh_vertices().to_vec();
+        assert!(!pre_verts.is_empty());
 
         h.runtime.input_mut().push_str(
             "\x1b[?2026h\x1b[2;5r\x1b[HSTATUS_PARTIAL\x1b[2;1HL2\r\nL3\r\nL4\r\nL5\r\nL6",
@@ -625,22 +639,30 @@ mod stage_m4_core {
         for _ in 0..2 {
             h.advance_time(0.02);
             let mid = h.run_frame().inspect_shapes();
-            assert!(mid.contains_text("PRE_SYNC"));
-            assert!(!mid.contains_text("STATUS_PARTIAL"));
-            assert!(!mid.contains_text("L6"));
+            assert_eq!(mid.text_mesh_vertices(), pre_verts.as_slice());
         }
 
         h.runtime.input_mut().push_str("\x1b[?2026l");
         let committed = h.run_frame().inspect_shapes();
-        assert!(committed.contains_text("STATUS_PARTIAL"));
-        assert!(committed.contains_text("L3"));
-        assert!(committed.contains_text("L6"));
-        assert!(!committed.contains_text("L2"));
+        assert!(!committed.text_mesh_vertices().is_empty());
+        assert_ne!(committed.text_mesh_vertices(), pre_verts.as_slice());
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("STATUS_PARTIAL")
+        );
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(1).as_deref(),
+            Some("L3")
+        );
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(4).as_deref(),
+            Some("L6")
+        );
 
         h.runtime.input_mut().push_str("\x1b[?1049l");
         let restored = h.run_frame().inspect_shapes();
         assert!(!h.runtime.terminal().is_alt_screen());
-        assert!(restored.contains_text("MAIN"));
+        assert_eq!(restored.text_mesh_vertices(), main_verts.as_slice());
         assert_eq!(
             h.runtime.terminal().visible_line_text(0),
             Some("MAIN".to_owned())
@@ -657,9 +679,11 @@ mod stage_m4_core {
         let insp = out.inspect_shapes();
         let stats = h.render_to_mesh_stats();
 
-        assert!(insp.contains_text("FG_BG"));
-        assert!(insp.contains_text("CURLY"));
-        assert!(insp.contains_text("INV"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("FG_BGCURLYINV")
+        );
+        assert!(!insp.text_mesh_vertices().is_empty());
         assert!(insp.has_rect_or_mesh_color(Color32::from_rgb(0x11, 0x22, 0x33)));
         assert!(insp.has_rect_or_mesh_color(Color32::from_rgb(30, 10, 40)));
         assert!(insp.has_text_fg_color(Color32::from_rgb(10, 200, 50)));
@@ -680,44 +704,51 @@ mod stage_m4_core {
 
         // Part A: 250ms DEC 2026 watchdog auto-flushes frozen snapshot when 2026 l is absent.
         h.runtime.input_mut().push_str("FRAME_OLD");
-        let _ = h.run_frame();
+        let old_verts = h.run_frame().inspect_shapes().text_mesh_vertices().to_vec();
+        assert!(!old_verts.is_empty());
         h.runtime
             .input_mut()
             .push_str("\x1b[?2026h\x1b[2J\x1b[HFRAME_NEW");
         let latched = h.run_frame().inspect_shapes();
         assert!(h.runtime.terminal().is_synchronized_output());
-        assert!(latched.contains_text("FRAME_OLD") && !latched.contains_text("FRAME_NEW"));
+        assert_eq!(latched.text_mesh_vertices(), old_verts.as_slice());
 
         h.advance_time(0.10);
         let mid = h.run_frame().inspect_shapes();
         assert!(h.runtime.terminal().is_synchronized_output());
-        assert!(mid.contains_text("FRAME_OLD") && !mid.contains_text("FRAME_NEW"));
+        assert_eq!(mid.text_mesh_vertices(), old_verts.as_slice());
 
         h.advance_time(0.20);
         let flushed = h.run_frame().inspect_shapes();
         assert!(!h.runtime.terminal().is_synchronized_output());
-        assert!(flushed.contains_text("FRAME_NEW"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("FRAME_NEW")
+        );
+        assert!(!flushed.text_mesh_vertices().is_empty());
+        assert_ne!(flushed.text_mesh_vertices(), old_verts.as_slice());
 
         // Part B: resize() mid-sync cleanly exits Mode 2026 (term/mod.rs:409-411) and renders reflowed content immediately.
         h.runtime.input_mut().push_str("\x1b[2J\x1b[HBEFORE_RESIZE");
-        let _ = h.run_frame();
+        let before_verts = h.run_frame().inspect_shapes().text_mesh_vertices().to_vec();
         h.runtime
             .input_mut()
             .push_str("\x1b[?2026h\x1b[2J\x1b[HREFLOWED_MID_SYNC");
         let before_resize = h.run_frame().inspect_shapes();
         assert!(h.runtime.terminal().is_synchronized_output());
-        assert!(before_resize.contains_text("BEFORE_RESIZE"));
-        assert!(!before_resize.contains_text("REFLOWED_MID_SYNC"));
+        assert_eq!(before_resize.text_mesh_vertices(), before_verts.as_slice());
 
         h.set_viewport_size(320.0, 240.0);
         let after_resize = h.run_frame();
         assert!(after_resize.terminal_response.resized_this_frame);
         assert!(!h.runtime.terminal().is_synchronized_output());
-        assert!(
-            after_resize
-                .inspect_shapes()
-                .contains_text("REFLOWED_MID_SYNC")
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("REFLOWED_MID_SYNC")
         );
+        let after_insp = after_resize.inspect_shapes();
+        assert!(!after_insp.text_mesh_vertices().is_empty());
+        assert_ne!(after_insp.text_mesh_vertices(), before_verts.as_slice());
     }
 
     #[test]
@@ -874,7 +905,11 @@ mod stage_m4_core {
         // Sanity check ShapeInspection helper import is actively exercised
         let (_, _, meta) = panes.run_split_frame();
         let insp: ShapeInspection = meta.inspect_shapes();
-        assert!(insp.contains_text("RIGHT_FIXED"));
+        assert_eq!(
+            panes.right.terminal().visible_line_text(0).as_deref(),
+            Some("RIGHT_FIXED")
+        );
+        assert!(!insp.text_mesh_vertices().is_empty());
     }
 
     #[test]
@@ -920,7 +955,7 @@ mod stage_m4_core {
         // Paste "cmdB" into focused right pane while pushing background output to left pane.
         panes.left.input_mut().push_str("BG_LEFT");
         panes.queue_event(egui::Event::Paste("cmdB".to_owned()));
-        let (_, _, meta) = panes.run_split_frame();
+        let (left_resp, _, meta) = panes.run_split_frame();
 
         assert_eq!(panes.left.input().written_bytes(), b"cmdA");
         assert_eq!(panes.right.input().written_bytes(), b"cmdB");
@@ -928,7 +963,12 @@ mod stage_m4_core {
             panes.left.terminal().visible_line_text(0).as_deref(),
             Some("BG_LEFT")
         );
-        assert!(meta.inspect_shapes().contains_text("BG_LEFT"));
+        let left_insp = ShapeInspection::from_terminal_shapes(
+            &meta.shapes,
+            left_resp.response.rect,
+            meta.pixels_per_point,
+        );
+        assert!(!left_insp.text_mesh_vertices().is_empty());
     }
 }
 
@@ -1289,6 +1329,11 @@ fn t3_18_f16_f17_dpi_pixel_snapped_vector_glyphs() {
                 insp.non_snapped_rect_count, 0,
                 "unsnapped terminal rects at ppp={ppp} mode={mode:?}"
             );
+            assert!(
+                (out.pixels_per_point - ppp).abs() < 1e-6,
+                "stale DPI at ppp={ppp}"
+            );
+            assert!(!insp.text_mesh_vertices().is_empty());
             assert!(
                 insp.text_entries
                     .iter()

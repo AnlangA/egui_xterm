@@ -10,9 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "hyperlinks")]
-use egui::pos2;
-use egui::{Event, ImeEvent, Modifiers, PointerButton};
+use egui::{Event, ImeEvent, Modifiers, PointerButton, pos2};
 use egui_xterm::{TerminalConfig, TerminalEvent, Theme};
 use egui_xterm_core::{
     CoreConfig, MouseButton, MouseEncoding, MouseEventKind, MouseInputEvent, MouseModifiers,
@@ -364,8 +362,21 @@ fn decslrm_and_xtwinops_e2e() {
         Some("  XFGH")
     );
     let shapes = margined.inspect_shapes();
-    assert!(shapes.contains_text("ABCD"));
-    assert!(shapes.contains_text("XFGH"));
+    let origin = margined.terminal_response.response.rect.min;
+    let cw = margined.terminal_response.cell_size.x;
+    let ch = margined.terminal_response.cell_size.y;
+    let margin_row0 = egui::Rect::from_min_size(
+        pos2(origin.x + 1.9 * cw, origin.y),
+        egui::vec2(4.2 * cw, ch),
+    );
+    let margin_row1 = egui::Rect::from_min_size(
+        pos2(origin.x + 1.9 * cw, origin.y + ch),
+        egui::vec2(4.2 * cw, ch),
+    );
+    let left_gutter = egui::Rect::from_min_size(origin, egui::vec2(1.8 * cw, 2.0 * ch));
+    assert!(!shapes.text_mesh_vertices_in_rect(margin_row0).is_empty());
+    assert!(!shapes.text_mesh_vertices_in_rect(margin_row1).is_empty());
+    assert!(shapes.text_mesh_vertices_in_rect(left_gutter).is_empty());
 
     // ?69l resets horizontal margins and disables DECSLRM.
     h.runtime
@@ -500,27 +511,27 @@ fn sgr_blink_and_visual_bell_e2e() {
     let mut h = HeadlessTermHarness::scripted_with_config(cfg);
     h.runtime.input_mut().push_str("\x1b[5mBLINKME\x1b[0m");
 
-    // At t=0.0 (on phase), BLINKME text has opaque vertices.
+    // At t=0.0 (on phase), BLINKME text has opaque glyph vertices in text_mesh.
     let on_outcome = h.run_frame();
-    let on_visible = on_outcome.inspect_shapes().text_entries.iter().any(|e| {
-        e.text.contains("BLINKME")
-            && e.galley
-                .rows
-                .iter()
-                .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
-    });
+    assert_eq!(
+        h.runtime.terminal().visible_line_text(0).as_deref(),
+        Some("BLINKME")
+    );
+    let on_visible = on_outcome
+        .inspect_shapes()
+        .text_mesh_vertices()
+        .iter()
+        .any(|v| v.color.a() > 0);
     assert!(on_visible, "SGR 5 text must be visible in on phase");
 
-    // At t=0.6 (off phase), BLINKME text vertices are transparent.
+    // At t=0.6 (off phase), BLINKME text vertices are hidden/omitted.
     h.advance_time(0.6);
     let off_outcome = h.run_frame();
-    let off_opaque = off_outcome.inspect_shapes().text_entries.iter().any(|e| {
-        e.text.contains("BLINKME")
-            && e.galley
-                .rows
-                .iter()
-                .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
-    });
+    let off_opaque = off_outcome
+        .inspect_shapes()
+        .text_mesh_vertices()
+        .iter()
+        .any(|v| v.color.a() > 0);
     assert!(!off_opaque, "SGR 5 text must be hidden in off phase");
 
     // Visual bell: BEL triggers a translucent overlay rect that decays and disappears.
@@ -658,11 +669,12 @@ fn hyperlink_ctrl_click_e2e() {
         ev,
         TerminalEvent::HyperlinkActivated { uri, .. } if uri == "https://example.org/e2e"
     )));
-    // Also verify Shape::Rect/Text inspection works cleanly on hyperlink frame.
-    assert!(
-        ctrl.inspect_shapes()
-            .text_entries
-            .iter()
-            .any(|e| matches!(e.text.as_str(), t if t.contains("clickme")))
+    // Also verify coalesced mesh & terminal text inspection works cleanly on hyperlink frame.
+    assert_eq!(
+        h.runtime.terminal().visible_line_text(0).as_deref(),
+        Some("clickme")
     );
+    let ctrl_insp = ctrl.inspect_shapes();
+    assert!(ctrl_insp.has_rendered_text_geometry());
+    assert!(!ctrl_insp.text_mesh_vertices().is_empty());
 }

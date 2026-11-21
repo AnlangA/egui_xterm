@@ -2040,7 +2040,11 @@ mod stage_m4_f16 {
 
         assert!(r2.cols < r1.cols && r2.rows < r1.rows);
         assert_eq!(h.runtime.terminal().size(), (r2.cols, r2.rows));
-        assert!(outcome.inspect_shapes().contains_text("ALIVE"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("ALIVE")
+        );
+        assert!(!outcome.inspect_shapes().text_mesh_vertices().is_empty());
     }
 
     #[test]
@@ -2077,6 +2081,7 @@ mod stage_m4_f17 {
         let insp = outcome.inspect_shapes();
 
         assert!(insp.text_entries.iter().all(|e| e.text.trim().is_empty()));
+        assert!(insp.text_mesh_vertices().is_empty());
         assert!(insp.rect_count >= 1 || insp.mesh_shape_count >= 1);
         let stats = h.render_to_mesh_stats();
         assert!(stats.primitive_count > 0 && stats.total_vertices > 0);
@@ -2088,38 +2093,40 @@ mod stage_m4_f17 {
         h.runtime
             .input_mut()
             .push_str("\x1b[8mSECRET\x1b[0mVISIBLE");
-        let insp = h.run_frame().inspect_shapes();
+        let outcome = h.run_frame();
+        let resp = &outcome.terminal_response;
+        let insp = outcome.inspect_shapes();
 
-        assert!(insp.contains_text("VISIBLE"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("SECRETVISIBLE")
+        );
         let theme = Theme::dark();
         let default_fg = Color32::from_rgb(
             theme.scheme.foreground[0],
             theme.scheme.foreground[1],
             theme.scheme.foreground[2],
         );
-        let default_bg = Color32::from_rgb(
-            theme.scheme.background[0],
-            theme.scheme.background[1],
-            theme.scheme.background[2],
-        );
 
-        for entry in &insp.text_entries {
-            if let Some(byte_idx) = entry.text.find("SECRET") {
-                let end_idx = byte_idx + "SECRET".len();
-                for section in &entry.galley.job.sections {
-                    let overlaps =
-                        section.byte_range.start.0 < end_idx && section.byte_range.end.0 > byte_idx;
-                    if overlaps {
-                        let c = section.format.color;
-                        assert_ne!(c, default_fg, "SGR 8 SECRET must not use visible fg");
-                        assert!(
-                            c.a() == 0 || c == default_bg,
-                            "SGR 8 SECRET section color must be transparent or bg, got {c:?}"
-                        );
-                    }
-                }
-            }
-        }
+        let origin = resp.response.rect.min;
+        let secret_rect = egui::Rect::from_min_size(
+            origin,
+            egui::vec2(5.75 * resp.cell_size.x, resp.cell_size.y),
+        );
+        let visible_rect = egui::Rect::from_min_size(
+            egui::pos2(origin.x + 5.75 * resp.cell_size.x, origin.y),
+            egui::vec2(7.5 * resp.cell_size.x, resp.cell_size.y),
+        );
+        let secret_verts = insp.text_mesh_vertices_in_rect(secret_rect);
+        assert!(
+            secret_verts.iter().all(|v| v.color.a() == 0),
+            "SGR 8 SECRET must emit no visible glyph vertices, got {secret_verts:?}"
+        );
+        let visible_verts = insp.text_mesh_vertices_in_rect(visible_rect);
+        assert!(
+            visible_verts.iter().any(|v| v.color == default_fg),
+            "VISIBLE cells must emit glyph vertices in default_fg"
+        );
     }
 
     #[test]
@@ -2244,44 +2251,38 @@ mod stage_m4_f17 {
         let resp = &out.terminal_response;
         let insp = out.inspect_shapes();
 
-        assert!(insp.contains_text("A") && insp.contains_text("B"));
-        let origin_x = resp.response.rect.min.x;
-        let a_entry = insp
-            .text_entries
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("👨‍👩‍👧‍👦AB")
+        );
+        let origin = resp.response.rect.min;
+        let row0_rect = egui::Rect::from_min_size(
+            origin,
+            egui::vec2(resp.response.rect.width(), resp.cell_size.y + 1.0),
+        );
+        let row_verts = insp.text_mesh_vertices_in_rect(row0_rect);
+        assert!(
+            row_verts.len() >= 8,
+            "expected glyph quads for emoji + AB, got {} vertices",
+            row_verts.len()
+        );
+        let a_x = row_verts[row_verts.len() - 8..row_verts.len() - 4]
             .iter()
-            .find(|e| e.text.contains('A'))
-            .expect("galley for A");
-        let b_entry = insp
-            .text_entries
+            .map(|v| v.pos.x)
+            .fold(f32::INFINITY, f32::min);
+        let b_x = row_verts[row_verts.len() - 4..]
             .iter()
-            .find(|e| e.text.contains('B'))
-            .expect("galley for B");
-
-        let a_byte = a_entry.text.find('A').expect("'A' inside galley");
-        let a_char_idx = a_entry.text[..a_byte].chars().count();
-        let a_x = a_entry.pos.x
-            + a_entry
-                .galley
-                .pos_from_cursor(egui::text::CCursor::new(a_char_idx))
-                .min
-                .x;
-
-        let b_byte = b_entry.text.find('B').expect("'B' inside galley");
-        let b_char_idx = b_entry.text[..b_byte].chars().count();
-        let b_x = b_entry.pos.x
-            + b_entry
-                .galley
-                .pos_from_cursor(egui::text::CCursor::new(b_char_idx))
-                .min
-                .x;
+            .map(|v| v.pos.x)
+            .fold(f32::INFINITY, f32::min);
 
         assert!(
-            a_x >= origin_x + 1.5 * resp.cell_size.x,
-            "expected 'A' at x={a_x} to start after 2-cell emoji (origin_x={origin_x}, cell_w={})",
+            a_x >= origin.x + 1.5 * resp.cell_size.x,
+            "expected 'A' at x={a_x} to start after 2-cell emoji (origin_x={}, cell_w={})",
+            origin.x,
             resp.cell_size.x
         );
         assert!(
-            b_x > a_x,
+            b_x > a_x + 0.5 * resp.cell_size.x,
             "expected 'B' at x={b_x} strictly after 'A' at x={a_x}"
         );
         assert!(!h.tessellate_last_frame().is_empty());
@@ -2299,27 +2300,39 @@ mod stage_m4_f17 {
         h.set_viewport_size(800.0, 400.0);
         let f1 = h.run_frame();
         let font1 = f1.terminal_response.effective_font_size;
+        let insp1 = f1.inspect_shapes();
+        let bounds1 = insp1.text_mesh_bounds().expect("f1 text mesh bounds");
 
         h.set_viewport_size(400.0, 200.0);
         let f2 = h.run_frame();
         let font2 = f2.terminal_response.effective_font_size;
         assert!(font2 < font1 * 0.7);
         let insp2 = f2.inspect_shapes();
-        assert!(insp2.contains_text("ROW_0"));
-        for entry in &insp2.text_entries {
-            for sec in &entry.galley.job.sections {
-                assert!((sec.format.font_id.size - font2).abs() <= 0.5);
-            }
-        }
+        let bounds2 = insp2.text_mesh_bounds().expect("f2 text mesh bounds");
+        assert!(bounds2.height() < bounds1.height() * 0.75);
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("ROW_0")
+        );
 
         h.set_viewport_size(800.0, 400.0);
         let f3 = h.run_frame();
         let font3 = f3.terminal_response.effective_font_size;
         assert!((font3 - font1).abs() <= 0.5);
         let insp3 = f3.inspect_shapes();
-        assert!(insp3.contains_text("ROW_0"));
-        assert!(insp3.contains_text("ROW_1"));
-        assert!(insp3.contains_text("ROW_2"));
+        assert_eq!(insp3.text_mesh_vertices(), insp1.text_mesh_vertices());
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("ROW_0")
+        );
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(1).as_deref(),
+            Some("ROW_1")
+        );
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(2).as_deref(),
+            Some("ROW_2")
+        );
     }
 }
 
@@ -2672,7 +2685,14 @@ mod stage_m4_f19 {
 
         let out = h.run_frame();
         assert!(h.runtime.input().is_drained());
-        assert!(out.inspect_shapes().contains_text("A"));
+        assert!(
+            h.runtime
+                .terminal()
+                .visible_line_text(0)
+                .as_deref()
+                .is_some_and(|l| l.starts_with("AAAA"))
+        );
+        assert!(!out.inspect_shapes().text_mesh_vertices().is_empty());
     }
 
     #[test]
@@ -2718,7 +2738,11 @@ mod stage_m4_f19 {
         for _ in 0..5 {
             let out = h.run_frame();
             assert!(h.runtime.input().is_closed());
-            assert!(out.inspect_shapes().contains_text("hello"));
+            assert_eq!(
+                h.runtime.terminal().visible_line_text(0).as_deref(),
+                Some("hello")
+            );
+            assert!(!out.inspect_shapes().text_mesh_vertices().is_empty());
         }
     }
 
@@ -2726,26 +2750,30 @@ mod stage_m4_f19 {
     fn f19_t2_06_dec_2026_watchdog_unlatches_render_after_250ms() {
         let mut h = HeadlessTermHarness::scripted();
         h.runtime.input_mut().push_str("STALE");
-        let _ = h.run_frame();
+        let stale_verts = h.run_frame().inspect_shapes().text_mesh_vertices().to_vec();
+        assert!(!stale_verts.is_empty());
 
         // Latch ?2026h at t = 0.0 before advancing time.
         h.runtime
             .input_mut()
             .push_str("\x1b[?2026h\x1b[2J\x1b[HLIVE");
         let latched = h.run_frame().inspect_shapes();
-        assert!(latched.contains_text("STALE"));
-        assert!(!latched.contains_text("LIVE"));
+        assert_eq!(latched.text_mesh_vertices(), stale_verts.as_slice());
 
         // At t = 0.10 (100ms < 250ms), snapshot remains latched.
         h.advance_time(0.10);
         let mid = h.run_frame().inspect_shapes();
-        assert!(mid.contains_text("STALE"));
-        assert!(!mid.contains_text("LIVE"));
+        assert_eq!(mid.text_mesh_vertices(), stale_verts.as_slice());
 
         // At t = 0.30 (300ms > 250ms), watchdog unlatches and renders LIVE.
         h.advance_time(0.20);
         let after = h.run_frame().inspect_shapes();
-        assert!(after.contains_text("LIVE"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("LIVE")
+        );
+        assert!(!after.text_mesh_vertices().is_empty());
+        assert_ne!(after.text_mesh_vertices(), stale_verts.as_slice());
     }
 }
 

@@ -1926,7 +1926,16 @@ mod stage_m4_f17 {
             .push_str("\x1b[31;44mHello\x1b[0m World\r\n");
         let outcome = h.run_frame();
         let inspection = outcome.inspect_shapes();
-        assert!(inspection.contains_text("Hello"));
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(0).as_deref(),
+            Some("Hello World")
+        );
+        assert!(inspection.has_rendered_text_geometry());
+        assert!(!inspection.text_mesh_vertices().is_empty());
+        assert!(
+            inspection.has_rect_or_mesh_color(Color32::from_rgb(0, 0, 170))
+                || inspection.mesh_shape_count >= 2
+        );
 
         let stats = h.render_to_mesh_stats();
         assert!(stats.primitive_count > 0);
@@ -1964,11 +1973,28 @@ mod stage_m4_f17 {
         h.runtime.input_mut().push_str("line 0\r\nline 1\r\n");
         let f1 = h.run_frame().inspect_shapes();
         let f2 = h.run_frame().inspect_shapes();
-        assert_eq!(f1.rendered_lines(), f2.rendered_lines());
+        assert!(!f1.text_mesh_vertices().is_empty());
+        assert_eq!(f1.text_mesh_vertices(), f2.text_mesh_vertices());
 
         h.runtime.input_mut().push_str("\x1b[6;1Hline 5");
-        let f3 = h.run_frame().inspect_shapes();
-        assert!(f3.contains_text("line 5"));
+        let o3 = h.run_frame();
+        let f3 = o3.inspect_shapes();
+        assert_eq!(
+            h.runtime.terminal().visible_line_text(5).as_deref(),
+            Some("line 5")
+        );
+        assert!(f3.text_mesh_vertices().len() > f2.text_mesh_vertices().len());
+        let row5_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                o3.terminal_response.response.rect.min.x,
+                o3.terminal_response.response.rect.min.y + 5.0 * o3.terminal_response.cell_size.y,
+            ),
+            egui::vec2(
+                o3.terminal_response.response.rect.width(),
+                o3.terminal_response.cell_size.y,
+            ),
+        );
+        assert!(!f3.text_mesh_vertices_in_rect(row5_rect).is_empty());
     }
 
     #[test]
@@ -1987,7 +2013,11 @@ mod stage_m4_f17 {
         assert!(f2.has_rect_or_mesh_color(light_bg));
 
         h.set_pixels_per_point(2.0);
-        let f3 = h.run_frame().inspect_shapes();
+        let o3 = h.run_frame();
+        assert!((o3.pixels_per_point - 2.0).abs() < 1e-6);
+        let f3 = o3.inspect_shapes();
+        assert!(!f3.text_mesh_vertices().is_empty());
+        assert_eq!(f3.non_snapped_rect_count, 0);
         assert!(
             f3.text_entries
                 .iter()
