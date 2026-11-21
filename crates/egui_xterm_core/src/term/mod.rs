@@ -4327,6 +4327,7 @@ impl VtHandler for TerminalState {
                     height: h,
                     format: crate::features::inline_images::ImageFormat::Rgba8,
                     rgba,
+                    revision: 0,
                 };
                 if self.image_store.insert_image(stored) {
                     let (place_row, place_col) = if self.modes.sixel_display_mode {
@@ -4352,6 +4353,13 @@ impl VtHandler for TerminalState {
                             src_w: 0,
                             src_h: 0,
                             z_index: 0,
+                            is_virtual: false,
+                            sub_x: 0,
+                            sub_y: 0,
+                            parent_image_id: 0,
+                            parent_placement_id: 0,
+                            offset_cols: 0,
+                            offset_rows: 0,
                         },
                     );
                     if !self.modes.sixel_display_mode {

@@ -12,8 +12,15 @@ mod png;
 pub mod sixel;
 pub mod store;
 
+#[cfg(feature = "kitty-graphics")]
+pub use self::kitty::{
+    KITTY_DIACRITICS, KITTY_PLACEHOLDER_CHAR, KittyApcContext, KittyFileMediumPolicy, KittyOutcome,
+    KittyPlaceholderCell, KittyShmReader, KittyTransportPolicy, decode_placeholder_cell,
+    diacritic_index, handle_kitty_apc_with_context,
+};
 pub use self::store::{
-    DEFAULT_IMAGE_MEMORY_BUDGET, ImageFormat, ImagePlacement, ImageStore, StoredImage,
+    AnimationPlaybackState, DEFAULT_IMAGE_MEMORY_BUDGET, ImageFormat, ImagePlacement, ImageStore,
+    MAX_IMAGE_DIMENSION, StoredImage,
 };
 
 #[cfg(test)]

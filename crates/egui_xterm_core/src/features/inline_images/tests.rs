@@ -235,6 +235,7 @@ fn image_store_lru_eviction_and_pruning() {
         height: 1,
         format: ImageFormat::Rgba8,
         rgba: vec![1; 8],
+        revision: 0,
     };
     let img2 = StoredImage {
         id: 2,
@@ -242,6 +243,7 @@ fn image_store_lru_eviction_and_pruning() {
         height: 1,
         format: ImageFormat::Rgba8,
         rgba: vec![2; 8],
+        revision: 0,
     };
     let img3 = StoredImage {
         id: 3,
@@ -249,6 +251,7 @@ fn image_store_lru_eviction_and_pruning() {
         height: 1,
         format: ImageFormat::Rgba8,
         rgba: vec![3; 8],
+        revision: 0,
     };
     assert!(store.insert_image(img1));
     assert!(store.insert_image(img2));
@@ -275,6 +278,13 @@ fn image_store_lru_eviction_and_pruning() {
             src_w: 0,
             src_h: 0,
             z_index: 0,
+            is_virtual: false,
+            sub_x: 0,
+            sub_y: 0,
+            parent_image_id: 0,
+            parent_placement_id: 0,
+            offset_cols: 0,
+            offset_rows: 0,
         },
     );
     store.add_placement(
@@ -291,6 +301,13 @@ fn image_store_lru_eviction_and_pruning() {
             src_w: 0,
             src_h: 0,
             z_index: 0,
+            is_virtual: false,
+            sub_x: 0,
+            sub_y: 0,
+            parent_image_id: 0,
+            parent_placement_id: 0,
+            offset_cols: 0,
+            offset_rows: 0,
         },
     );
     store.prune_before(ScreenKind::Primary, AbsLine(5));
