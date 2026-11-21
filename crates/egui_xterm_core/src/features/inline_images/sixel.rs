@@ -486,6 +486,16 @@ impl SixelDecoder {
             return;
         };
         if bits == 0 {
+            if !self.bg_transparent {
+                let Some(req_h) = self.y.checked_add(6) else {
+                    self.overflow = true;
+                    return;
+                };
+                self.ensure_canvas(req_w, req_h);
+                if self.overflow {
+                    return;
+                }
+            }
             self.x = req_w;
             return;
         }

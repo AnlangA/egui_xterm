@@ -1470,8 +1470,7 @@ fn resolve_target_image_id(store: &ImageStore, image_id: u32, image_number: u32)
 }
 
 fn validate_relative_placement(
-    store: &ImageStore,
-    screen: ScreenKind,
+    base_slice: &[ImagePlacement],
     image_id: u32,
     placement_id: u32,
     is_virtual: bool,
@@ -1484,32 +1483,132 @@ fn validate_relative_placement(
     if is_virtual {
         return Err("EINVAL:virtual placement cannot be relative");
     }
-    let all = store.placements(screen);
-    let Some(mut cur) =
-        ImageStore::find_parent_in_slice(all, parent_image_id, parent_placement_id).copied()
-    else {
-        return Err("ENOPARENT:parent placement not found");
-    };
-
-    for depth in 1..=MAX_RELATIVE_PLACEMENT_DEPTH {
-        if placement_id != 0 && cur.image_id == image_id && cur.placement_id == placement_id {
+    if placement_id != 0 && parent_image_id == image_id && parent_placement_id == placement_id {
+        if base_slice
+            .iter()
+            .any(|p| p.image_id == image_id && p.placement_id == placement_id)
+        {
             return Err("ECYCLE:relative placement cycle");
         }
-        if cur.parent_image_id == 0 {
-            return Ok(());
+        return Err("ENOPARENT:parent placement not found");
+    }
+    if !base_slice.iter().any(|p| p.image_id == parent_image_id) {
+        return Err("ENOPARENT:parent placement not found");
+    }
+
+    let candidate = ImagePlacement {
+        image_id,
+        placement_id,
+        abs_line: AbsLine(0),
+        col: 0,
+        cols: 0,
+        rows: 0,
+        src_x: 0,
+        src_y: 0,
+        src_w: 0,
+        src_h: 0,
+        z_index: 0,
+        is_virtual,
+        sub_x: 0,
+        sub_y: 0,
+        parent_image_id,
+        parent_placement_id,
+        offset_cols: 0,
+        offset_rows: 0,
+    };
+
+    let mut sim = Vec::with_capacity(base_slice.len() + 1);
+    sim.extend_from_slice(base_slice);
+    let new_idx = if placement_id != 0
+        && let Some(pos) = sim
+            .iter()
+            .position(|p| p.image_id == image_id && p.placement_id == placement_id)
+    {
+        sim[pos] = candidate;
+        pos
+    } else {
+        sim.push(candidate);
+        sim.len() - 1
+    };
+
+    // Walk from the candidate itself first so direct ENOPARENT / ECYCLE / ETOODEEP errors
+    // report accurately for the newly requested placement.
+    let mut visited = [0usize; MAX_RELATIVE_PLACEMENT_DEPTH + 2];
+    visited[0] = new_idx;
+    let mut cur_idx = new_idx;
+    for depth in 1..=MAX_RELATIVE_PLACEMENT_DEPTH {
+        let cur = sim[cur_idx];
+        let Some(p_idx) = ImageStore::find_parent_index_in_slice(
+            &sim,
+            Some(cur_idx),
+            cur.parent_image_id,
+            cur.parent_placement_id,
+        ) else {
+            return Err("ENOPARENT:parent placement not found");
+        };
+        if visited[..depth].contains(&p_idx) {
+            return Err("ECYCLE:relative placement cycle");
+        }
+        if sim[p_idx].parent_image_id == 0 {
+            break;
         }
         if depth == MAX_RELATIVE_PLACEMENT_DEPTH {
             return Err("ETOODEEP:relative placement chain too deep");
         }
-        let Some(next) =
-            ImageStore::find_parent_in_slice(all, cur.parent_image_id, cur.parent_placement_id)
-                .copied()
-        else {
-            return Err("ENOPARENT:parent placement not found");
-        };
-        cur = next;
+        visited[depth] = p_idx;
+        cur_idx = p_idx;
     }
-    Err("ECYCLE:relative placement cycle")
+
+    // Adding a `placement_id == 0` placement or replacing an existing parent can dynamically
+    // re-bind existing `Q=0` (or `Q=placement_id`) dependents into a cycle or excess depth.
+    if sim
+        .iter()
+        .enumerate()
+        .any(|(idx, p)| idx != new_idx && p.parent_image_id == image_id)
+    {
+        let mut state = vec![0u8; sim.len()];
+        let mut depths = vec![0u8; sim.len()];
+        let mut path = Vec::with_capacity(MAX_RELATIVE_PLACEMENT_DEPTH + 1);
+        for start in 0..sim.len() {
+            if sim[start].parent_image_id == 0 || state[start] == 2 {
+                continue;
+            }
+            path.clear();
+            let mut cur = start;
+            let base_depth: usize = loop {
+                if sim[cur].parent_image_id == 0 {
+                    break 0;
+                }
+                if state[cur] == 2 {
+                    break usize::from(depths[cur]);
+                }
+                if state[cur] == 1 {
+                    return Err("ECYCLE:relative placement cycle");
+                }
+                state[cur] = 1;
+                path.push(cur);
+                let Some(p_idx) = ImageStore::find_parent_index_in_slice(
+                    &sim,
+                    Some(cur),
+                    sim[cur].parent_image_id,
+                    sim[cur].parent_placement_id,
+                ) else {
+                    break 0;
+                };
+                cur = p_idx;
+            };
+            for (offset, &node) in path.iter().rev().enumerate() {
+                let d = base_depth + offset + 1;
+                if d > MAX_RELATIVE_PLACEMENT_DEPTH {
+                    return Err("ETOODEEP:relative placement chain too deep");
+                }
+                state[node] = 2;
+                depths[node] = u8::try_from(d).unwrap_or(u8::MAX);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn alpha_blend_pixel(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
@@ -1582,6 +1681,7 @@ pub fn handle_kitty_apc_with_context(
     if !data.starts_with(b"G") {
         return KittyOutcome::default();
     }
+    store.set_cell_pixel_size(ctx.cell_px.0, ctx.cell_px.1);
     let rest = &data[1..];
     let (header, payload_b64) = match rest.iter().position(|&b| b == b';') {
         Some(idx) => (&rest[..idx], &rest[idx + 1..]),
@@ -1890,8 +1990,7 @@ fn execute_put(
 
     let is_virtual = params.u_val == 1;
     if let Err(err) = validate_relative_placement(
-        store,
-        ctx.screen,
+        store.placements(ctx.screen),
         img_id,
         params.placement_id,
         is_virtual,
@@ -1991,30 +2090,53 @@ fn finish_transmit(
         store.allocate_id()
     };
 
-    if pending.action == KittyAction::TransmitAndDisplay
-        && let Err(err) = validate_relative_placement(
-            store,
-            ctx.screen,
+    let replacing_existing = pending.image_id != 0 && store.get_image(image_id).is_some();
+    if pending.action == KittyAction::TransmitAndDisplay && pending.parent_image_id != 0 {
+        let post_buf: Vec<ImagePlacement>;
+        let validation_slice = if replacing_existing
+            && store
+                .placements(ctx.screen)
+                .iter()
+                .any(|p| p.image_id == image_id)
+        {
+            let current = store.placements(ctx.screen);
+            let mut next = Vec::with_capacity(current.len());
+            let mut removed_keys = Vec::new();
+            for &p in current {
+                if p.image_id == image_id {
+                    removed_keys.push((p.image_id, p.placement_id));
+                } else {
+                    next.push(p);
+                }
+            }
+            ImageStore::cascade_delete_children_in_vec(&mut next, &removed_keys);
+            post_buf = next;
+            &post_buf[..]
+        } else {
+            store.placements(ctx.screen)
+        };
+        if let Err(err) = validate_relative_placement(
+            validation_slice,
             image_id,
             pending.placement_id,
             pending.is_virtual,
             pending.parent_image_id,
             pending.parent_placement_id,
-        )
-    {
-        write_response(
-            outgoing,
-            image_id,
-            pending.image_number,
-            pending.placement_id,
-            pending.quiet,
-            Err(err),
-        );
-        return KittyOutcome::default();
+        ) {
+            write_response(
+                outgoing,
+                image_id,
+                pending.image_number,
+                pending.placement_id,
+                pending.quiet,
+                Err(err),
+            );
+            return KittyOutcome::default();
+        }
     }
 
     // Per Kitty protocol: replacing an existing `image_id` deletes its old placements.
-    if pending.image_id != 0 && store.get_image(image_id).is_some() {
+    if replacing_existing {
         store.delete_placements_where(ScreenKind::Primary, false, |p| p.image_id == image_id);
         store.delete_placements_where(ScreenKind::Alternate, false, |p| p.image_id == image_id);
     }
@@ -2639,63 +2761,74 @@ fn execute_delete(
             }
         }
         b'c' | b'C' => {
-            store.delete_placements_where(screen, free_images, |p| {
-                if p.is_virtual {
-                    return false;
-                }
-                let end_line = p.abs_line.0.saturating_add(u64::from(p.rows.max(1)));
-                let end_col = p.col.saturating_add(p.cols.max(1));
-                cursor_abs_line.0 >= p.abs_line.0
-                    && cursor_abs_line.0 < end_line
-                    && cursor_col >= p.col
-                    && cursor_col < end_col
-            });
+            store.delete_placements_where_with_ctx(
+                screen,
+                free_images,
+                |p, (eff_cols, eff_rows)| {
+                    if p.is_virtual {
+                        return false;
+                    }
+                    let end_line = p.abs_line.0.saturating_add(u64::from(eff_rows));
+                    let end_col = u32::from(p.col) + u32::from(eff_cols);
+                    let cur_col = u32::from(cursor_col);
+                    cursor_abs_line.0 >= p.abs_line.0
+                        && cursor_abs_line.0 < end_line
+                        && cur_col >= u32::from(p.col)
+                        && cur_col < end_col
+                },
+            );
         }
         b'p' | b'P' => {
             let pid = params.placement_id;
             let img_filter = params.image_id;
             if params.src_x == 0 && params.src_y == 0 && pid != 0 {
                 store.delete_placements_where(screen, free_images, |p| {
-                    !p.is_virtual
-                        && p.placement_id == pid
-                        && (img_filter == 0 || p.image_id == img_filter)
+                    p.placement_id == pid && (img_filter == 0 || p.image_id == img_filter)
                 });
             } else {
-                let target_col = u16::try_from(params.src_x.saturating_sub(1)).unwrap_or(0);
+                let target_col = params.src_x.saturating_sub(1);
                 let target_line = viewport_top_abs_line
                     .0
                     .saturating_add(u64::from(params.src_y.saturating_sub(1)));
-                store.delete_placements_where(screen, free_images, |p| {
-                    if p.is_virtual {
-                        return false;
-                    }
-                    let end_line = p.abs_line.0.saturating_add(u64::from(p.rows.max(1)));
-                    let end_col = p.col.saturating_add(p.cols.max(1));
-                    target_line >= p.abs_line.0
-                        && target_line < end_line
-                        && target_col >= p.col
-                        && target_col < end_col
-                        && (pid == 0 || p.placement_id == pid)
-                });
+                store.delete_placements_where_with_ctx(
+                    screen,
+                    free_images,
+                    |p, (eff_cols, eff_rows)| {
+                        if p.is_virtual {
+                            return false;
+                        }
+                        let end_line = p.abs_line.0.saturating_add(u64::from(eff_rows));
+                        let end_col = u32::from(p.col) + u32::from(eff_cols);
+                        target_line >= p.abs_line.0
+                            && target_line < end_line
+                            && target_col >= u32::from(p.col)
+                            && target_col < end_col
+                            && (pid == 0 || p.placement_id == pid)
+                    },
+                );
             }
         }
         b'q' | b'Q' => {
-            let target_col = u16::try_from(params.src_x.saturating_sub(1)).unwrap_or(0);
+            let target_col = params.src_x.saturating_sub(1);
             let target_line = viewport_top_abs_line
                 .0
                 .saturating_add(u64::from(params.src_y.saturating_sub(1)));
             let z = params.z_val;
-            store.delete_placements_where(screen, free_images, |p| {
-                if p.is_virtual || p.z_index != z {
-                    return false;
-                }
-                let end_line = p.abs_line.0.saturating_add(u64::from(p.rows.max(1)));
-                let end_col = p.col.saturating_add(p.cols.max(1));
-                target_line >= p.abs_line.0
-                    && target_line < end_line
-                    && target_col >= p.col
-                    && target_col < end_col
-            });
+            store.delete_placements_where_with_ctx(
+                screen,
+                free_images,
+                |p, (eff_cols, eff_rows)| {
+                    if p.is_virtual || p.z_index != z {
+                        return false;
+                    }
+                    let end_line = p.abs_line.0.saturating_add(u64::from(eff_rows));
+                    let end_col = u32::from(p.col) + u32::from(eff_cols);
+                    target_line >= p.abs_line.0
+                        && target_line < end_line
+                        && target_col >= u32::from(p.col)
+                        && target_col < end_col
+                },
+            );
         }
         b'r' | b'R' => {
             let min_id = params.src_x;
@@ -2705,24 +2838,24 @@ fn execute_delete(
             });
         }
         b'x' | b'X' => {
-            let target_col = u16::try_from(params.src_x.saturating_sub(1)).unwrap_or(0);
-            store.delete_placements_where(screen, free_images, |p| {
+            let target_col = params.src_x.saturating_sub(1);
+            store.delete_placements_where_with_ctx(screen, free_images, |p, (eff_cols, _)| {
                 if p.is_virtual {
                     return false;
                 }
-                let end_col = p.col.saturating_add(p.cols.max(1));
-                target_col >= p.col && target_col < end_col
+                let end_col = u32::from(p.col) + u32::from(eff_cols);
+                target_col >= u32::from(p.col) && target_col < end_col
             });
         }
         b'y' | b'Y' => {
             let target_line = viewport_top_abs_line
                 .0
                 .saturating_add(u64::from(params.src_y.saturating_sub(1)));
-            store.delete_placements_where(screen, free_images, |p| {
+            store.delete_placements_where_with_ctx(screen, free_images, |p, (_, eff_rows)| {
                 if p.is_virtual {
                     return false;
                 }
-                let end_line = p.abs_line.0.saturating_add(u64::from(p.rows.max(1)));
+                let end_line = p.abs_line.0.saturating_add(u64::from(eff_rows));
                 target_line >= p.abs_line.0 && target_line < end_line
             });
         }

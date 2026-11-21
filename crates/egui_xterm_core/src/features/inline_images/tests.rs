@@ -859,3 +859,464 @@ fn m4_sixel_modes_1070_and_8452() {
     term.advance(b"\x1b[3;4H\x1bPq\"1;1;16;24#1~\x1b\\");
     assert_eq!((term.cursor().row, term.cursor().col), (3, 5));
 }
+
+fn make_plain_placement(
+    image_id: u32,
+    placement_id: u32,
+    abs_line: u64,
+    col: u16,
+) -> ImagePlacement {
+    ImagePlacement {
+        image_id,
+        placement_id,
+        abs_line: AbsLine(abs_line),
+        col,
+        cols: 0,
+        rows: 0,
+        src_x: 0,
+        src_y: 0,
+        src_w: 0,
+        src_h: 0,
+        z_index: 0,
+        is_virtual: false,
+        sub_x: 0,
+        sub_y: 0,
+        parent_image_id: 0,
+        parent_placement_id: 0,
+        offset_cols: 0,
+        offset_rows: 0,
+    }
+}
+
+#[test]
+fn audit_fix1_placement_cap_evicts_oldest_and_bounds_screens() {
+    let mut store = ImageStore::default();
+    assert!(store.insert_image(StoredImage {
+        id: 1,
+        width: 1,
+        height: 1,
+        format: ImageFormat::Rgba8,
+        rgba: vec![1, 2, 3, 255],
+        revision: 0,
+    }));
+    assert!(store.insert_image(StoredImage {
+        id: 2,
+        width: 1,
+        height: 1,
+        format: ImageFormat::Rgba8,
+        rgba: vec![4, 5, 6, 255],
+        revision: 0,
+    }));
+
+    let cap = store::MAX_PLACEMENTS_PER_SCREEN;
+    assert_eq!(cap, 4096);
+
+    // Flood 5000 anonymous placements (placement_id == 0) on Primary.
+    for i in 0..5000u64 {
+        store.add_placement(ScreenKind::Primary, make_plain_placement(1, 0, i, 0));
+    }
+    let pri = store.placements(ScreenKind::Primary);
+    assert_eq!(pri.len(), cap);
+    assert_eq!(pri[0].abs_line, AbsLine(5000 - cap as u64));
+    assert_eq!(pri[cap - 1].abs_line, AbsLine(4999));
+
+    // Distinct non-zero placement_ids on Alternate also cap at MAX_PLACEMENTS_PER_SCREEN,
+    // and replacing an existing placement_id does not evict or exceed the cap.
+    for i in 1..=(cap as u32 + 100) {
+        store.add_placement(
+            ScreenKind::Alternate,
+            make_plain_placement(1, i, u64::from(i), 0),
+        );
+    }
+    let alt = store.placements(ScreenKind::Alternate);
+    assert_eq!(alt.len(), cap);
+    assert_eq!(alt[0].placement_id, 101);
+    assert_eq!(alt[cap - 1].placement_id, cap as u32 + 100);
+
+    // Replacing an existing placement_id keeps count at cap without eviction.
+    store.add_placement(ScreenKind::Alternate, make_plain_placement(1, 101, 9999, 5));
+    assert_eq!(store.placements(ScreenKind::Alternate).len(), cap);
+    assert_eq!(
+        store.placements(ScreenKind::Alternate)[0].abs_line,
+        AbsLine(9999)
+    );
+
+    // Adding a child placement with Q=0 when 4096 anonymous placements exist must evict only the
+    // oldest placement and keep the child attached to the newest remaining placement.
+    store.clear_screen(ScreenKind::Primary);
+    assert!(store.insert_image(StoredImage {
+        id: 1,
+        width: 1,
+        height: 1,
+        format: ImageFormat::Rgba8,
+        rgba: vec![1, 2, 3, 255],
+        revision: 0,
+    }));
+    assert!(store.insert_image(StoredImage {
+        id: 2,
+        width: 1,
+        height: 1,
+        format: ImageFormat::Rgba8,
+        rgba: vec![4, 5, 6, 255],
+        revision: 0,
+    }));
+    for i in 0..cap as u64 {
+        store.add_placement(ScreenKind::Primary, make_plain_placement(1, 0, i, 0));
+    }
+    let mut child = make_plain_placement(2, 1, 0, 0);
+    child.parent_image_id = 1;
+    child.parent_placement_id = 0;
+    child.offset_rows = 2;
+    store.add_placement(ScreenKind::Primary, child);
+    assert_eq!(store.placements(ScreenKind::Primary).len(), cap);
+    let stored_child = store
+        .placements(ScreenKind::Primary)
+        .iter()
+        .find(|p| p.image_id == 2)
+        .expect("child survives eviction of older anonymous parent");
+    assert_eq!(stored_child.abs_line, AbsLine(cap as u64 - 1 + 2));
+}
+
+#[cfg(feature = "kitty-graphics")]
+#[test]
+fn audit_fix1_kitty_ap_flood_is_capped() {
+    let mut term = Terminal::new(80, 24, CoreConfig::default());
+    term.advance(&kitty_rgba_apc("a=t,i=1,f=32,s=1,v=1,q=2", &[1, 2, 3, 255]));
+    for i in 1..=4200u32 {
+        term.advance(format!("\x1b_Ga=p,i=1,p={i},C=1,q=2\x1b\\").as_bytes());
+    }
+    assert_eq!(
+        term.image_placements().len(),
+        store::MAX_PLACEMENTS_PER_SCREEN
+    );
+    assert_eq!(term.image_placements()[0].placement_id, 105);
+    assert_eq!(term.image_placements()[4095].placement_id, 4200);
+}
+
+#[cfg(feature = "kitty-graphics")]
+#[test]
+fn audit_fix2_kitty_relative_cycles_with_p0_and_transmit_replacement() {
+    let mut term = Terminal::new(80, 24, CoreConfig::default());
+    term.advance(&kitty_rgba_apc("a=t,i=1,f=32,s=1,v=1,q=2", &[1, 0, 0, 255]));
+    term.advance(&kitty_rgba_apc("a=t,i=2,f=32,s=1,v=1,q=2", &[0, 2, 0, 255]));
+    term.advance(&kitty_rgba_apc("a=t,i=3,f=32,s=1,v=1,q=2", &[0, 0, 3, 255]));
+
+    // (a) Adding (2, 22) with P=2, Q=0 when (2, 21) exists must NOT self-parent; both remain visible.
+    term.advance(b"\x1b[2;4H\x1b_Ga=p,i=2,p=21,c=1,r=1,C=1,q=2\x1b\\");
+    term.advance(b"\x1b_Ga=p,i=2,p=22,P=2,Q=0,H=2,V=1,c=1,r=1,C=1\x1b\\");
+    let reply_22 = String::from_utf8(term.drain_outgoing()).unwrap();
+    assert_eq!(reply_22, "\x1b_Gi=2,p=22;OK\x1b\\");
+    let vis_2 = term.active_snapshot().image_placements().to_vec();
+    assert_eq!(vis_2.len(), 2);
+    let p22 = vis_2
+        .iter()
+        .find(|p| p.image_id == 2 && p.placement_id == 22)
+        .expect("(2, 22) visible");
+    assert_eq!((p22.abs_line, p22.col), (AbsLine(2), 5));
+
+    // (b) Dynamic cycle via placement_id == 0:
+    // (1, 1) is root, (1, 2) has P=1, Q=0 (resolves to (1, 1)).
+    // Adding (1, 0) pointing to (1, 2) dynamically creates (1, 0) <-> (1, 2) and must fail ECYCLE.
+    term.advance(b"\x1b[1;1H\x1b_Ga=p,i=1,p=1,c=1,r=1,C=1,q=2\x1b\\");
+    term.advance(b"\x1b_Ga=p,i=1,p=2,P=1,Q=0,H=1,V=0,c=1,r=1,C=1,q=2\x1b\\");
+    term.advance(b"\x1b_Ga=p,i=1,p=0,P=1,Q=2,H=1,V=0,c=1,r=1,C=1\x1b\\");
+    let reply_cycle_p0 = String::from_utf8(term.drain_outgoing()).unwrap();
+    assert!(reply_cycle_p0.contains("ECYCLE"), "got {reply_cycle_p0:?}");
+    assert_eq!(
+        term.active_snapshot()
+            .image_placements()
+            .iter()
+            .filter(|p| p.image_id == 1)
+            .count(),
+        2
+    );
+
+    // (c) Adding (1, 3) with P=1, Q=2 when (1, 2) has P=1, Q=0 also forms a dynamic cycle.
+    term.advance(b"\x1b_Ga=p,i=1,p=3,P=1,Q=2,c=1,r=1,C=1\x1b\\");
+    let reply_cycle_p3 = String::from_utf8(term.drain_outgoing()).unwrap();
+    assert!(reply_cycle_p3.contains("ECYCLE"), "got {reply_cycle_p3:?}");
+
+    // (d) finish_transmit replacement validation against post-replacement placements:
+    // Clean setup: root (1, 1), dependent (2, 1) -> (1, 1), independent root (3, 1).
+    term.advance(b"\x1b_Ga=d,d=a;\x1b\\");
+    term.advance(b"\x1b[1;1H\x1b_Ga=p,i=1,p=1,c=1,r=1,C=1,q=2\x1b\\");
+    term.advance(b"\x1b_Ga=p,i=2,p=1,P=1,Q=1,H=1,V=0,c=1,r=1,C=1,q=2\x1b\\");
+    term.advance(b"\x1b[5;2H\x1b_Ga=p,i=3,p=1,c=1,r=1,C=1,q=2\x1b\\");
+
+    // Replacing i=1 with P=1, Q=1 must NOT validate against old (1, 1) -> ENOPARENT & preserves old.
+    term.advance(&kitty_rgba_apc(
+        "a=T,i=1,p=2,P=1,Q=1,f=32,s=1,v=1",
+        &[9, 9, 9, 255],
+    ));
+    let reply_rep1 = String::from_utf8(term.drain_outgoing()).unwrap();
+    assert!(reply_rep1.contains("ENOPARENT"), "got {reply_rep1:?}");
+    assert_eq!(term.image_data(1).unwrap().rgba, &[1, 0, 0, 255]);
+    assert_eq!(term.image_placements().len(), 3);
+
+    // Replacing i=1 with P=2, Q=1 (where old (2, 1) depended on old (1, 1) and will be
+    // cascade-deleted) must return ENOPARENT (NOT ECYCLE) and leave old state intact.
+    term.advance(&kitty_rgba_apc(
+        "a=T,i=1,p=1,P=2,Q=1,f=32,s=1,v=1",
+        &[9, 9, 9, 255],
+    ));
+    let reply_rep2 = String::from_utf8(term.drain_outgoing()).unwrap();
+    assert!(reply_rep2.contains("ENOPARENT"), "got {reply_rep2:?}");
+    assert_eq!(term.image_placements().len(), 3);
+
+    // Replacing i=1 relative to surviving independent (3, 1) succeeds and cascade-deletes (2, 1).
+    term.advance(&kitty_rgba_apc(
+        "a=T,i=1,p=1,P=3,Q=1,H=2,V=1,f=32,s=1,v=1",
+        &[7, 7, 7, 255],
+    ));
+    let reply_rep3 = String::from_utf8(term.drain_outgoing()).unwrap();
+    assert_eq!(reply_rep3, "\x1b_Gi=1,p=1;OK\x1b\\");
+    assert_eq!(term.image_data(1).unwrap().rgba, &[7, 7, 7, 255]);
+    let remaining = term.active_snapshot().image_placements().to_vec();
+    assert_eq!(remaining.len(), 2);
+    let new_1 = remaining.iter().find(|p| p.image_id == 1).unwrap();
+    assert_eq!((new_1.abs_line, new_1.col), (AbsLine(5), 3));
+}
+
+#[test]
+fn audit_fix3_autosized_store_visibility_prune_clear_and_shift() {
+    let mut store = ImageStore::default();
+    store.set_cell_pixel_size(8, 16);
+    // 24x48 image -> 3 cols x 3 rows when cols=0, rows=0.
+    assert!(store.insert_image(StoredImage {
+        id: 1,
+        width: 24,
+        height: 48,
+        format: ImageFormat::Rgba8,
+        rgba: vec![255; 24 * 48 * 4],
+        revision: 0,
+    }));
+    store.add_placement(ScreenKind::Primary, make_plain_placement(1, 1, 0, 0));
+    assert_eq!(
+        store.effective_placement_span(&store.placements(ScreenKind::Primary)[0]),
+        (3, 3)
+    );
+    // Placement cols/rows fields stay 0 until clipped.
+    assert_eq!(
+        (
+            store.placements(ScreenKind::Primary)[0].cols,
+            store.placements(ScreenKind::Primary)[0].rows
+        ),
+        (0, 0)
+    );
+
+    // Viewport [2, 26) intersects row 2 of placement (lines 0..3) -> still visible!
+    let vis = store.visible_placements(ScreenKind::Primary, AbsLine(2), 24);
+    assert_eq!(vis.len(), 1);
+    assert_eq!((vis[0].cols, vis[0].rows), (0, 0));
+    assert!(
+        store
+            .visible_placements(ScreenKind::Primary, AbsLine(3), 24)
+            .is_empty()
+    );
+
+    // prune_before(1) and (2) keep the 3-row placement; prune_before(3) removes it.
+    store.prune_before(ScreenKind::Primary, AbsLine(2));
+    assert_eq!(store.placements(ScreenKind::Primary).len(), 1);
+    store.prune_before(ScreenKind::Primary, AbsLine(3));
+    assert!(store.placements(ScreenKind::Primary).is_empty());
+
+    // clear_viewport_placements and clear_placements_from hit rows 1..3 of an auto-sized placement.
+    assert!(store.insert_image(StoredImage {
+        id: 1,
+        width: 24,
+        height: 48,
+        format: ImageFormat::Rgba8,
+        rgba: vec![255; 24 * 48 * 4],
+        revision: 0,
+    }));
+    store.add_placement(ScreenKind::Primary, make_plain_placement(1, 1, 8, 0)); // 8..11
+    store.clear_viewport_placements(ScreenKind::Primary, AbsLine(10), 24, false);
+    assert!(store.placements(ScreenKind::Primary).is_empty());
+
+    store.add_placement(ScreenKind::Primary, make_plain_placement(1, 1, 8, 0)); // 8..11
+    store.clear_placements_from(ScreenKind::Primary, AbsLine(10), false);
+    assert!(store.placements(ScreenKind::Primary).is_empty());
+
+    // shift_placements_in_region clips and eventually deletes an auto-sized 3-row placement.
+    store.add_placement(ScreenKind::Alternate, make_plain_placement(1, 1, 10, 0)); // 10..13
+    store.shift_placements_in_region(ScreenKind::Alternate, AbsLine(10), AbsLine(15), -2, false);
+    assert_eq!(store.placements(ScreenKind::Alternate).len(), 1);
+    assert_eq!(store.placements(ScreenKind::Alternate)[0].rows, 1);
+    store.shift_placements_in_region(ScreenKind::Alternate, AbsLine(10), AbsLine(15), -1, true);
+    assert!(store.placements(ScreenKind::Alternate).is_empty());
+    assert!(store.get_image(1).is_none());
+}
+
+#[cfg(feature = "kitty-graphics")]
+#[test]
+fn audit_fix3_kitty_autosized_deletes_x_overflow_and_virtual_dp() {
+    let mut term = Terminal::new(80, 24, CoreConfig::default());
+    term.set_cell_pixel_size(8, 16);
+
+    // 24x48 image (3 cols x 3 rows) with c=0, r=0 at row 1, col 2 (0-based lines 1..4, cols 2..5).
+    let rgba = vec![128u8; 24 * 48 * 4];
+    term.advance(b"\x1b[2;3H");
+    term.advance(&kitty_rgba_apc("a=T,i=1,p=1,f=32,s=24,v=48,C=1,q=2", &rgba));
+    assert_eq!(
+        (
+            term.image_placements()[0].cols,
+            term.image_placements()[0].rows
+        ),
+        (0, 0)
+    );
+
+    // x >= 65537 must NOT wrap to col 0 (even for an image at col 0)!
+    term.advance(b"\x1b[1;1H");
+    term.advance(&kitty_rgba_apc(
+        "a=T,i=2,p=2,f=32,s=8,v=16,C=1,q=2",
+        &vec![99u8; 8 * 16 * 4],
+    ));
+    term.advance(b"\x1b_Ga=d,d=p,x=65537,y=1;\x1b\\");
+    term.advance(b"\x1b_Ga=d,d=q,x=65537,y=1,z=0;\x1b\\");
+    term.advance(b"\x1b_Ga=d,d=x,x=65537;\x1b\\");
+    assert_eq!(term.image_placements().len(), 2);
+
+    // d=c hits bottom-right interior cell (row 3 -> 1-based 4, col 4 -> 1-based 5) of auto-sized i=1!
+    term.advance(b"\x1b[4;5H\x1b_Ga=d,d=c;\x1b\\");
+    assert_eq!(term.image_placements().len(), 1);
+    assert_eq!(term.image_placements()[0].image_id, 2);
+
+    // Re-place i=1 at (row 1, col 2) and test d=p, d=q, d=x, d=y on outer cells of auto-sized 3x3.
+    term.advance(b"\x1b[2;3H\x1b_Ga=p,i=1,p=1,z=7,C=1,q=2\x1b\\");
+    // d=p at 1-based x=5 (col 4), y=4 (line 3) hits i=1.
+    term.advance(b"\x1b_Ga=d,d=p,x=5,y=4;\x1b\\");
+    assert_eq!(term.image_placements().len(), 1);
+
+    term.advance(b"\x1b[2;3H\x1b_Ga=p,i=1,p=1,z=7,C=1,q=2\x1b\\");
+    // d=q at x=5, y=4, z=7 hits i=1.
+    term.advance(b"\x1b_Ga=d,d=q,x=5,y=4,z=7;\x1b\\");
+    assert_eq!(term.image_placements().len(), 1);
+
+    term.advance(b"\x1b[2;3H\x1b_Ga=p,i=1,p=1,C=1,q=2\x1b\\");
+    // d=x at x=5 (col 4) hits i=1.
+    term.advance(b"\x1b_Ga=d,d=x,x=5;\x1b\\");
+    assert_eq!(term.image_placements().len(), 1);
+
+    term.advance(b"\x1b[2;3H\x1b_Ga=p,i=1,p=1,C=1,q=2\x1b\\");
+    // d=y at y=4 (line 3) hits i=1.
+    term.advance(b"\x1b_Ga=d,d=y,y=4;\x1b\\");
+    assert_eq!(term.image_placements().len(), 1);
+
+    // d=p / d=P with x=0, y=0, p!=0 deletes virtual placements (U=1) too!
+    term.advance(&kitty_rgba_apc(
+        "a=T,i=10,p=77,U=1,c=2,r=2,f=32,s=1,v=1,q=2",
+        &[5, 6, 7, 255],
+    ));
+    assert!(term.active_snapshot().virtual_placement(10, 77).is_some());
+    term.advance(b"\x1b_Ga=d,d=p,p=77;\x1b\\");
+    assert!(term.active_snapshot().virtual_placement(10, 77).is_none());
+    assert!(term.image_data(10).is_some());
+
+    term.advance(b"\x1b_Ga=p,i=10,p=78,U=1,c=2,r=2,q=2\x1b\\");
+    assert!(term.active_snapshot().virtual_placement(10, 78).is_some());
+    term.advance(b"\x1b_Ga=d,d=P,p=78;\x1b\\");
+    assert!(term.active_snapshot().virtual_placement(10, 78).is_none());
+    assert!(term.image_data(10).is_none());
+}
+
+#[cfg(feature = "kitty-graphics")]
+#[test]
+fn audit_fix4_animation_root_gap_default_and_gapless_no_spin() {
+    // 1. Root frame 0 without explicit a=a r=1,z=... uses 40ms default so frame 0 isn't skipped.
+    let mut term = Terminal::new(40, 10, CoreConfig::default());
+    term.advance(&kitty_rgba_apc(
+        "a=T,f=32,s=1,v=1,i=1,q=2",
+        &[255, 0, 0, 255],
+    ));
+    term.advance(&kitty_rgba_apc(
+        "a=f,f=32,s=1,v=1,i=1,z=50,q=2",
+        &[0, 255, 0, 255],
+    ));
+    term.advance(b"\x1b_Ga=a,i=1,s=3,v=1,q=2\x1b\\");
+    assert!(!term.tick_animations(1.000));
+    assert_eq!(term.image_data(1).unwrap().rgba, &[255, 0, 0, 255]);
+    let d0 = term.next_animation_deadline().expect("deadline armed");
+    assert!(d0 > 1.000);
+    assert!((d0 - 1.040).abs() < 1e-6);
+    assert!(!term.tick_animations(1.020));
+    assert!(term.tick_animations(1.040));
+    assert_eq!(term.image_data(1).unwrap().rgba, &[0, 255, 0, 255]);
+
+    // 2. Gapless frames (z < 0 -> gap_ms < 0) do NOT spin 4096 steps or leave deadline <= now.
+    let mut term2 = Terminal::new(40, 10, CoreConfig::default());
+    term2.advance(&kitty_rgba_apc(
+        "a=T,f=32,s=1,v=1,i=2,q=2",
+        &[10, 0, 0, 255],
+    ));
+    term2.advance(&kitty_rgba_apc(
+        "a=f,f=32,s=1,v=1,i=2,z=-1,q=2",
+        &[0, 20, 0, 255],
+    ));
+    term2.advance(&kitty_rgba_apc(
+        "a=f,f=32,s=1,v=1,i=2,z=-1,q=2",
+        &[0, 0, 30, 255],
+    ));
+    term2.advance(b"\x1b_Ga=a,i=2,r=1,z=-1,s=3,v=1,q=2\x1b\\");
+
+    // First tick anchors frame 0 with strictly future deadline (> now_secs).
+    assert!(!term2.tick_animations(1.000));
+    assert_eq!(term2.image_data(2).unwrap().rgba, &[10, 0, 0, 255]);
+    let d_gapless = term2.next_animation_deadline().expect("gapless deadline");
+    assert!(d_gapless > 1.000);
+
+    // One step later advances to frame 1 (not spinning past it or leaving deadline <= now).
+    assert!(term2.tick_animations(d_gapless));
+    assert_eq!(term2.image_data(2).unwrap().rgba, &[0, 20, 0, 255]);
+    let d_next = term2.next_animation_deadline().expect("next deadline");
+    assert!(d_next > d_gapless);
+
+    // Large forward time jump also leaves deadline > now_secs without stalling.
+    let _ = term2.tick_animations(50.000);
+    assert!(term2.next_animation_deadline().expect("still playing") > 50.000);
+}
+
+#[cfg(feature = "sixel")]
+#[test]
+fn audit_fix5_sixel_p2_0_and_2_trailing_question_marks_expand_canvas() {
+    let mut term = Terminal::new(80, 24, CoreConfig::default());
+
+    // P2=0 (default): trailing `??` expands width to 4x6 and trailing `-???` expands to 4x12 with reg 0.
+    term.advance(b"\x1bP0;0;0q#0;2;0;100;0#1;2;100;0;0#1~~??\x1b\\");
+    let img0 = term
+        .image_data(term.image_placements()[0].image_id)
+        .expect("p2=0 trailing ?");
+    assert_eq!((img0.width, img0.height), (4, 6));
+    assert_eq!(&img0.rgba[0..4], &[255, 0, 0, 255]);
+    assert_eq!(&img0.rgba[2 * 4..3 * 4], &[0, 255, 0, 255]);
+    assert_eq!(&img0.rgba[3 * 4..4 * 4], &[0, 255, 0, 255]);
+
+    // P2=2 with trailing all-`?` second band (`#1~-???`): 3x12 filled with reg 0.
+    term.advance(b"\x1bP0;2;0q#0;2;0;0;100#1;2;100;0;0#1~-???\x1b\\");
+    let img2 = term
+        .image_data(term.image_placements()[1].image_id)
+        .expect("p2=2 trailing band ?");
+    assert_eq!((img2.width, img2.height), (3, 12));
+    assert_eq!(&img2.rgba[0..4], &[255, 0, 0, 255]);
+    let row6_off = 6 * 3 * 4;
+    assert_eq!(&img2.rgba[row6_off..row6_off + 4], &[0, 0, 255, 255]);
+
+    // All-`?` stream under P2=0 without raster dimensions emits opaque 3x6 background image.
+    term.advance(b"\x1bP0;0;0q#0;2;20;40;60???\x1b\\");
+    let img_all_q = term
+        .image_data(term.image_placements()[2].image_id)
+        .expect("all-? stream under P2=0");
+    assert_eq!((img_all_q.width, img_all_q.height), (3, 6));
+    let expected_bg = [51, 102, 153, 255];
+    assert_eq!(&img_all_q.rgba[0..4], &expected_bg);
+    assert_eq!(&img_all_q.rgba[(3 * 6 - 1) * 4..], &expected_bg);
+
+    // Under P2=1 (transparent), trailing `?` or all-`?` does NOT inflate canvas dimensions.
+    let count_before = term.image_placements().len();
+    term.advance(b"\x1bP0;1;0q#1;2;100;0;0#1~~??\x1b\\");
+    let img1 = term
+        .image_data(term.image_placements()[count_before].image_id)
+        .expect("p2=1 trailing ?");
+    assert_eq!((img1.width, img1.height), (2, 6));
+    term.advance(b"\x1bP0;1;0q???\x1b\\");
+    assert_eq!(term.image_placements().len(), count_before + 1);
+}

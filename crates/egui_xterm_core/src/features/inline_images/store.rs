@@ -14,8 +14,17 @@ pub const MAX_IMAGE_DIMENSION: u32 = 8192;
 /// Maximum depth supported for chains of relative image placements.
 pub const MAX_RELATIVE_PLACEMENT_DEPTH: usize = 32;
 
+/// Maximum number of placements stored per screen (`primary` or `alternate`).
+pub const MAX_PLACEMENTS_PER_SCREEN: usize = 4096;
+
 #[cfg(feature = "kitty-graphics")]
 const MAX_ANIMATION_STEPS_PER_TICK: usize = 4096;
+
+#[cfg(feature = "kitty-graphics")]
+const DEFAULT_ANIMATION_GAP_MS: i32 = 40;
+
+#[cfg(feature = "kitty-graphics")]
+const MIN_GAPLESS_ANIMATION_GAP_MS: u64 = 1;
 
 /// Pixel format of a decoded inline image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,11 +148,16 @@ impl ImageAnimation {
     }
 
     fn gap_ms_u64(&self, frame_idx: usize) -> u64 {
-        let gap_ms = self.frames.get(frame_idx).map_or(0, |f| f.gap_ms);
-        if gap_ms <= 0 {
-            0
+        let gap_ms = self
+            .frames
+            .get(frame_idx)
+            .map_or(DEFAULT_ANIMATION_GAP_MS, |f| f.gap_ms);
+        if gap_ms == 0 {
+            u64::try_from(DEFAULT_ANIMATION_GAP_MS).unwrap_or(40)
+        } else if gap_ms < 0 {
+            MIN_GAPLESS_ANIMATION_GAP_MS
         } else {
-            u64::try_from(gap_ms).unwrap_or(0)
+            u64::try_from(gap_ms).unwrap_or(1)
         }
     }
 
@@ -232,6 +246,7 @@ pub struct ImageStore {
     image_numbers: BTreeMap<u32, u32>,
     primary_placements: Vec<ImagePlacement>,
     alt_placements: Vec<ImagePlacement>,
+    cell_px: (u16, u16),
     #[cfg(feature = "kitty-graphics")]
     pub(crate) pending_kitty: BTreeMap<PendingChunkKey, PendingKittyUpload>,
     #[cfg(feature = "kitty-graphics")]
@@ -262,6 +277,7 @@ impl ImageStore {
             image_numbers: BTreeMap::new(),
             primary_placements: Vec::new(),
             alt_placements: Vec::new(),
+            cell_px: (8, 16),
             #[cfg(feature = "kitty-graphics")]
             pending_kitty: BTreeMap::new(),
             #[cfg(feature = "kitty-graphics")]
@@ -269,6 +285,70 @@ impl ImageStore {
             #[cfg(feature = "kitty-graphics")]
             pending_kitty_bytes: 0,
         }
+    }
+
+    /// Configures the cell pixel size `(width_px, height_px)` used to derive effective grid
+    /// spans for auto-sized placements (`cols == 0` or `rows == 0`).
+    pub fn set_cell_pixel_size(&mut self, width_px: u16, height_px: u16) {
+        self.cell_px = (width_px.max(1), height_px.max(1));
+    }
+
+    /// Returns the configured cell pixel size `(width_px, height_px)` used for auto-sized
+    /// placements.
+    #[must_use]
+    pub const fn cell_pixel_size(&self) -> (u16, u16) {
+        self.cell_px
+    }
+
+    /// Returns the effective `(cols, rows)` cell span of `placement`, resolving `0` dimensions
+    /// from the referenced image's cropped pixel size and [`Self::cell_pixel_size`].
+    #[must_use]
+    pub fn effective_placement_span(&self, placement: &ImagePlacement) -> (u16, u16) {
+        Self::effective_span_in(&self.images, self.cell_px, placement)
+    }
+
+    fn effective_span_in(
+        images: &BTreeMap<u32, StoredImage>,
+        cell_px: (u16, u16),
+        placement: &ImagePlacement,
+    ) -> (u16, u16) {
+        if placement.cols > 0 && placement.rows > 0 {
+            return (placement.cols, placement.rows);
+        }
+        let cw = u32::from(cell_px.0.max(1));
+        let ch = u32::from(cell_px.1.max(1));
+        let (crop_w, crop_h) = if let Some(img) = images.get(&placement.image_id) {
+            let cx = placement.src_x.min(img.width);
+            let cy = placement.src_y.min(img.height);
+            let cw_px = if placement.src_w == 0 {
+                img.width.saturating_sub(cx)
+            } else {
+                placement.src_w.min(img.width.saturating_sub(cx))
+            };
+            let ch_px = if placement.src_h == 0 {
+                img.height.saturating_sub(cy)
+            } else {
+                placement.src_h.min(img.height.saturating_sub(cy))
+            };
+            (cw_px, ch_px)
+        } else {
+            (1, 1)
+        };
+        let eff_cols = if placement.cols > 0 {
+            placement.cols
+        } else {
+            u16::try_from(crop_w.div_ceil(cw))
+                .unwrap_or(u16::MAX)
+                .max(1)
+        };
+        let eff_rows = if placement.rows > 0 {
+            placement.rows
+        } else {
+            u16::try_from(crop_h.div_ceil(ch))
+                .unwrap_or(u16::MAX)
+                .max(1)
+        };
+        (eff_cols, eff_rows)
     }
 
     /// Returns the total byte size of all currently stored images and animation frames.
@@ -380,23 +460,50 @@ impl ImageStore {
     /// children; instead, relative children are re-resolved to the updated position.
     pub fn add_placement(&mut self, screen: ScreenKind, mut placement: ImagePlacement) {
         self.touch_image(placement.image_id);
+        let replacing_idx = if placement.placement_id != 0 {
+            self.placements(screen).iter().position(|p| {
+                p.image_id == placement.image_id && p.placement_id == placement.placement_id
+            })
+        } else {
+            None
+        };
         if placement.parent_image_id != 0
-            && let Some((line, col)) = Self::resolve_coords_for(self.placements(screen), &placement)
+            && let Some((line, col)) = Self::resolve_coords_for_candidate(
+                self.placements(screen),
+                &placement,
+                replacing_idx,
+            )
         {
             placement.abs_line = AbsLine(line.max(0) as u64);
             placement.col = u16::try_from(col.clamp(0, i32::from(u16::MAX))).unwrap_or(0);
         }
-        let list = self.placements_mut(screen);
-        if placement.placement_id != 0
-            && let Some(existing) = list.iter_mut().find(|p| {
-                p.image_id == placement.image_id && p.placement_id == placement.placement_id
-            })
-        {
-            *existing = placement;
+        if let Some(idx) = replacing_idx {
+            self.placements_mut(screen)[idx] = placement;
             self.resolve_relative_placements(screen);
             return;
         }
-        list.push(placement);
+        let overflow = {
+            let list = self.placements_mut(screen);
+            list.push(placement);
+            if list.len() > MAX_PLACEMENTS_PER_SCREEN {
+                let excess = list.len() - MAX_PLACEMENTS_PER_SCREEN;
+                Some(
+                    list.drain(..excess)
+                        .map(|p| (p.image_id, p.placement_id))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(evicted) = overflow
+            && self
+                .placements(screen)
+                .iter()
+                .any(|p| p.parent_image_id != 0)
+        {
+            self.cascade_delete_children_of(screen, &evicted);
+        }
         self.resolve_relative_placements(screen);
     }
 
@@ -458,21 +565,23 @@ impl ImageStore {
         let view_end = view_start.saturating_add(i64::from(rows));
         let all = self.placements(screen);
         all.iter()
-            .copied()
-            .filter_map(|mut p| {
+            .enumerate()
+            .filter_map(|(idx, &original)| {
+                let mut p = original;
                 if p.is_virtual {
                     return None;
                 }
                 let (p_start, p_col) = if p.parent_image_id != 0 {
-                    Self::resolve_coords_for(all, &p)?
+                    Self::resolve_coords_for_index(all, idx)?
                 } else {
                     (
                         i64::try_from(p.abs_line.0).unwrap_or(i64::MAX),
                         i32::from(p.col),
                     )
                 };
-                let p_end = p_start.saturating_add(i64::from(p.rows.max(1)));
-                let p_col_end = p_col.saturating_add(i32::from(p.cols.max(1)));
+                let (eff_cols, eff_rows) = self.effective_placement_span(&p);
+                let p_end = p_start.saturating_add(i64::from(eff_rows));
+                let p_col_end = p_col.saturating_add(i32::from(eff_cols));
                 if p_end > view_start && p_start < view_end && p_col_end > 0 {
                     if p_start >= 0 && p_col >= 0 {
                         p.abs_line = AbsLine(p_start as u64);
@@ -486,6 +595,12 @@ impl ImageStore {
                             if p.rows == 0 {
                                 return None;
                             }
+                        } else {
+                            let rem = eff_rows.saturating_sub(clipped_top);
+                            if rem == 0 {
+                                return None;
+                            }
+                            p.rows = rem;
                         }
                         if p_col >= 0 {
                             p.col = u16::try_from(p_col).unwrap_or(u16::MAX);
@@ -508,11 +623,11 @@ impl ImageStore {
     /// Virtual placements (`is_virtual == true`) are never pruned by scrollback eviction.
     pub fn prune_before(&mut self, screen: ScreenKind, min_abs_line: AbsLine) {
         let before = self.placements(screen).len();
-        self.delete_placements_where(screen, false, |p| {
+        self.delete_placements_where_with_ctx(screen, false, |p, (_, eff_rows)| {
             if p.is_virtual || p.parent_image_id != 0 {
                 return false;
             }
-            let p_end = p.abs_line.0.saturating_add(u64::from(p.rows.max(1)));
+            let p_end = p.abs_line.0.saturating_add(u64::from(eff_rows));
             p_end <= min_abs_line.0
         });
         if self.placements(screen).len() != before {
@@ -546,12 +661,12 @@ impl ImageStore {
         }
         let view_start = top_abs_line.0;
         let view_end = view_start.saturating_add(u64::from(rows));
-        self.delete_placements_where(screen, free_images, |p| {
+        self.delete_placements_where_with_ctx(screen, free_images, |p, (_, eff_rows)| {
             if p.is_virtual {
                 return false;
             }
             let p_start = p.abs_line.0;
-            let p_end = p_start.saturating_add(u64::from(p.rows.max(1)));
+            let p_end = p_start.saturating_add(u64::from(eff_rows));
             p_end > view_start && p_start < view_end
         });
     }
@@ -565,11 +680,11 @@ impl ImageStore {
         min_abs_line: AbsLine,
         free_images: bool,
     ) {
-        self.delete_placements_where(screen, free_images, |p| {
+        self.delete_placements_where_with_ctx(screen, free_images, |p, (_, eff_rows)| {
             if p.is_virtual {
                 return false;
             }
-            let p_end = p.abs_line.0.saturating_add(u64::from(p.rows.max(1)));
+            let p_end = p.abs_line.0.saturating_add(u64::from(eff_rows));
             p_end > min_abs_line.0
         });
     }
@@ -659,14 +774,20 @@ impl ImageStore {
         let delta_i = i64::try_from(delta_rows).unwrap_or(0);
         let mut deleted_keys: Vec<(u32, u32)> = Vec::new();
         {
-            let list = self.placements_mut(screen);
+            let images = &self.images;
+            let cell_px = self.cell_px;
+            let list = match screen {
+                ScreenKind::Primary => &mut self.primary_placements,
+                ScreenKind::Alternate => &mut self.alt_placements,
+            };
             let mut keep = vec![true; list.len()];
             for (idx, p) in list.iter_mut().enumerate() {
                 if p.is_virtual || p.parent_image_id != 0 {
                     continue;
                 }
                 let p_start = i64::try_from(p.abs_line.0).unwrap_or(i64::MAX);
-                let p_rows = i64::from(p.rows.max(1));
+                let (_, eff_rows) = Self::effective_span_in(images, cell_px, p);
+                let p_rows = i64::from(eff_rows);
                 let p_end = p_start.saturating_add(p_rows);
                 // Only shift placements intersecting the scroll region.
                 if p_end <= top_i || p_start > bot_i {
@@ -688,7 +809,7 @@ impl ImageStore {
                     continue;
                 }
                 p.abs_line = AbsLine(clamped_start.max(0) as u64);
-                if p.rows > 0 {
+                if p.rows > 0 || visible_rows < p_rows {
                     p.rows = u16::try_from(visible_rows).unwrap_or(u16::MAX);
                 }
             }
@@ -734,11 +855,28 @@ impl ImageStore {
     where
         F: FnMut(&ImagePlacement) -> bool,
     {
+        self.delete_placements_where_with_ctx(screen, free_images, |p, _| pred(p));
+    }
+
+    pub(crate) fn delete_placements_where_with_ctx<F>(
+        &mut self,
+        screen: ScreenKind,
+        free_images: bool,
+        mut pred: F,
+    ) where
+        F: FnMut(&ImagePlacement, (u16, u16)) -> bool,
+    {
         let mut deleted_keys: Vec<(u32, u32)> = Vec::new();
         {
-            let list = self.placements_mut(screen);
+            let images = &self.images;
+            let cell_px = self.cell_px;
+            let list = match screen {
+                ScreenKind::Primary => &mut self.primary_placements,
+                ScreenKind::Alternate => &mut self.alt_placements,
+            };
             list.retain(|p| {
-                if pred(p) {
+                let span = Self::effective_span_in(images, cell_px, p);
+                if pred(p, span) {
                     deleted_keys.push((p.image_id, p.placement_id));
                     false
                 } else {
@@ -916,7 +1054,7 @@ impl ImageStore {
         Some(self.animations.entry(id).or_insert_with(|| ImageAnimation {
             frames: vec![AnimationFrame {
                 rgba: Vec::new(),
-                gap_ms: 0,
+                gap_ms: DEFAULT_ANIMATION_GAP_MS,
             }],
             current_frame: 0,
             state: AnimationPlaybackState::Stopped,
@@ -1162,11 +1300,18 @@ impl ImageStore {
     }
 
     fn cascade_delete_children_of(&mut self, screen: ScreenKind, initial_deleted: &[(u32, u32)]) {
+        let list = self.placements_mut(screen);
+        Self::cascade_delete_children_in_vec(list, initial_deleted);
+    }
+
+    pub(crate) fn cascade_delete_children_in_vec(
+        list: &mut Vec<ImagePlacement>,
+        initial_deleted: &[(u32, u32)],
+    ) {
         let mut deleted: Vec<(u32, u32)> = initial_deleted.to_vec();
         let mut cursor = 0usize;
         while cursor < deleted.len() {
             let batch_end = deleted.len();
-            let list = self.placements_mut(screen);
             let mut newly_deleted = Vec::new();
             let mut idx = 0usize;
             while idx < list.len() {
@@ -1174,14 +1319,16 @@ impl ImageStore {
                 if p.parent_image_id != 0
                     && deleted[cursor..batch_end].iter().any(|&(d_img, d_pid)| {
                         p.parent_image_id == d_img
-                            && (p.parent_placement_id == d_pid
+                            && ((d_pid != 0 && p.parent_placement_id == d_pid)
                                 || (p.parent_placement_id == 0
-                                    && (d_pid == 0
-                                        || !list.iter().any(|other| {
-                                            other.image_id == d_img
-                                                && !(other.image_id == p.image_id
-                                                    && other.placement_id == p.placement_id
-                                                    && p.placement_id != 0)
+                                    && ((d_pid == 0
+                                        && !list.iter().enumerate().any(|(o_idx, o)| {
+                                            o_idx != idx
+                                                && o.image_id == d_img
+                                                && o.placement_id == 0
+                                        }))
+                                        || !list.iter().enumerate().any(|(o_idx, o)| {
+                                            o_idx != idx && o.image_id == d_img
                                         }))))
                     })
                 {
@@ -1197,23 +1344,60 @@ impl ImageStore {
     }
 
     fn resolve_relative_placements(&mut self, screen: ScreenKind) {
+        if !self
+            .placements(screen)
+            .iter()
+            .any(|p| p.parent_image_id != 0)
+        {
+            return;
+        }
         let snapshot = self.placements(screen).to_vec();
         let list = self.placements_mut(screen);
-        for p in list.iter_mut() {
+        for (idx, p) in list.iter_mut().enumerate() {
             if p.parent_image_id == 0 {
                 continue;
             }
-            if let Some((line, col)) = Self::resolve_coords_for(&snapshot, p) {
+            if let Some((line, col)) = Self::resolve_coords_for_index(&snapshot, idx) {
                 p.abs_line = AbsLine(line.max(0) as u64);
                 p.col = u16::try_from(col.clamp(0, i32::from(u16::MAX))).unwrap_or(0);
             }
         }
     }
 
-    fn resolve_coords_for(all: &[ImagePlacement], target: &ImagePlacement) -> Option<(i64, i32)> {
-        let mut cur = *target;
+    fn resolve_coords_for_candidate(
+        all: &[ImagePlacement],
+        candidate: &ImagePlacement,
+        replacing_idx: Option<usize>,
+    ) -> Option<(i64, i32)> {
+        if candidate.parent_image_id == 0 {
+            let base_line = i64::try_from(candidate.abs_line.0).unwrap_or(i64::MAX);
+            let base_col = i32::from(candidate.col);
+            return Some((base_line, base_col));
+        }
+        let parent_idx = Self::find_parent_index_in_slice(
+            all,
+            replacing_idx,
+            candidate.parent_image_id,
+            candidate.parent_placement_id,
+        )?;
+        let (p_line, p_col) = Self::resolve_coords_for_index(all, parent_idx)?;
+        Some((
+            p_line.saturating_add(i64::from(candidate.offset_rows)),
+            p_col.saturating_add(candidate.offset_cols),
+        ))
+    }
+
+    fn resolve_coords_for_index(all: &[ImagePlacement], start_idx: usize) -> Option<(i64, i32)> {
+        let mut cur_idx = Some(start_idx);
+        let mut cur = *all.get(start_idx)?;
         let mut sum_rows: i64 = 0;
         let mut sum_cols: i32 = 0;
+        let mut visited = [0usize; MAX_RELATIVE_PLACEMENT_DEPTH + 1];
+        let mut visited_len = 0usize;
+        if cur.parent_image_id != 0 {
+            visited[visited_len] = start_idx;
+            visited_len += 1;
+        }
         for _ in 0..=MAX_RELATIVE_PLACEMENT_DEPTH {
             if cur.parent_image_id == 0 {
                 let base_line = i64::try_from(cur.abs_line.0).unwrap_or(i64::MAX);
@@ -1225,27 +1409,58 @@ impl ImageStore {
             }
             sum_rows = sum_rows.saturating_add(i64::from(cur.offset_rows));
             sum_cols = sum_cols.saturating_add(cur.offset_cols);
-            let parent =
-                Self::find_parent_in_slice(all, cur.parent_image_id, cur.parent_placement_id)?;
-            cur = *parent;
+            let p_idx = Self::find_parent_index_in_slice(
+                all,
+                cur_idx,
+                cur.parent_image_id,
+                cur.parent_placement_id,
+            )?;
+            if visited[..visited_len].contains(&p_idx) {
+                return None;
+            }
+            if visited_len < visited.len() {
+                visited[visited_len] = p_idx;
+                visited_len += 1;
+            }
+            cur_idx = Some(p_idx);
+            cur = all[p_idx];
         }
         None
     }
 
-    pub(crate) fn find_parent_in_slice(
+    pub(crate) fn find_parent_index_in_slice(
         all: &[ImagePlacement],
+        self_idx: Option<usize>,
         parent_image_id: u32,
         parent_placement_id: u32,
-    ) -> Option<&ImagePlacement> {
+    ) -> Option<usize> {
+        if parent_image_id == 0 {
+            return None;
+        }
         if parent_placement_id != 0 {
             all.iter()
+                .enumerate()
                 .rev()
-                .find(|p| p.image_id == parent_image_id && p.placement_id == parent_placement_id)
+                .find(|&(idx, p)| {
+                    Some(idx) != self_idx
+                        && p.image_id == parent_image_id
+                        && p.placement_id == parent_placement_id
+                })
+                .map(|(idx, _)| idx)
         } else {
             all.iter()
+                .enumerate()
                 .rev()
-                .find(|p| p.image_id == parent_image_id && p.placement_id == 0)
-                .or_else(|| all.iter().rev().find(|p| p.image_id == parent_image_id))
+                .find(|&(idx, p)| {
+                    Some(idx) != self_idx && p.image_id == parent_image_id && p.placement_id == 0
+                })
+                .or_else(|| {
+                    all.iter()
+                        .enumerate()
+                        .rev()
+                        .find(|&(idx, p)| Some(idx) != self_idx && p.image_id == parent_image_id)
+                })
+                .map(|(idx, _)| idx)
         }
     }
 
