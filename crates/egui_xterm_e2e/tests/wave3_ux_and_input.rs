@@ -35,15 +35,52 @@ fn progress_bar_fills(insp: &ShapeInspection, term_rect: Rect) -> Vec<(Rect, Col
         .collect()
 }
 
-fn visual_bell_flash_alphas(insp: &ShapeInspection, term_rect: Rect) -> Vec<u8> {
+fn covers_term_rect(rect: Rect, term_rect: Rect) -> bool {
+    (rect.width() - term_rect.width()).abs() <= 2.0
+        && (rect.height() - term_rect.height()).abs() <= 2.0
+}
+
+fn visual_bell_flash_colors(insp: &ShapeInspection, term_rect: Rect) -> Vec<Color32> {
     insp.rect_fills
         .iter()
         .filter_map(|(r, c)| {
-            let covers_term = (r.width() - term_rect.width()).abs() <= 2.0
-                && (r.height() - term_rect.height()).abs() <= 2.0;
-            (covers_term && c.a() > 0 && c.a() < 255).then_some(c.a())
+            (covers_term_rect(*r, term_rect) && c.a() > 0 && c.a() < 255).then_some(*c)
         })
         .collect()
+}
+
+fn visual_bell_flash_alphas(insp: &ShapeInspection, term_rect: Rect) -> Vec<u8> {
+    visual_bell_flash_colors(insp, term_rect)
+        .into_iter()
+        .map(|c| c.a())
+        .collect()
+}
+
+fn assert_bell_tint_and_alpha(
+    actual: Color32,
+    expected_rgb: Color32,
+    min_alpha: u8,
+    max_alpha: u8,
+) {
+    let alpha = actual.a();
+    assert!(
+        (min_alpha..=max_alpha).contains(&alpha),
+        "expected visual bell alpha in {min_alpha}..={max_alpha}, got {alpha}"
+    );
+    let expected = Color32::from_rgba_unmultiplied(
+        expected_rgb.r(),
+        expected_rgb.g(),
+        expected_rgb.b(),
+        alpha,
+    );
+    assert_eq!(
+        actual,
+        expected,
+        "expected visual bell RGB ({}, {}, {}) at alpha {alpha}, got {actual:?}",
+        expected_rgb.r(),
+        expected_rgb.g(),
+        expected_rgb.b()
+    );
 }
 
 // ===========================================================================
@@ -128,6 +165,7 @@ mod item11_tier1 {
             ..TerminalConfig::default()
         };
         let mut h = HeadlessTermHarness::scripted_with_config(cfg);
+        let default_fg = rgb_to_c32(h.config.theme.scheme.foreground);
         let _ = h.run_frame();
 
         h.runtime.input_mut().push_str("\x07");
@@ -135,39 +173,74 @@ mod item11_tier1 {
         assert!(peak.terminal_response.events.contains(&TerminalEvent::Bell));
         assert!(peak.repaint_requested);
         let term_rect = peak.terminal_response.response.rect;
-        let peak_alphas = visual_bell_flash_alphas(&peak.inspect_shapes(), term_rect);
-        assert_eq!(peak_alphas.len(), 1);
-        assert!(
-            (40..=52).contains(&peak_alphas[0]),
-            "expected ~0.18 opacity flash (~46 alpha), got {}",
-            peak_alphas[0]
-        );
+        let peak_colors = visual_bell_flash_colors(&peak.inspect_shapes(), term_rect);
+        assert_eq!(peak_colors.len(), 1);
+        assert_bell_tint_and_alpha(peak_colors[0], default_fg, 40, 52);
 
         // At t=0.10 (halfway through 200ms duration), flash decays strictly monotonically.
         h.advance_time(0.10);
         let mid = h.run_frame();
-        let mid_alphas = visual_bell_flash_alphas(&mid.inspect_shapes(), term_rect);
-        assert_eq!(mid_alphas.len(), 1);
-        assert!(mid_alphas[0] < peak_alphas[0] && mid_alphas[0] > 0);
+        let mid_colors = visual_bell_flash_colors(&mid.inspect_shapes(), term_rect);
+        assert_eq!(mid_colors.len(), 1);
+        assert_bell_tint_and_alpha(mid_colors[0], default_fg, 1, peak_colors[0].a() - 1);
 
         // At t=0.25 (past 200ms), flash disappears completely.
         h.advance_time(0.15);
         let done = h.run_frame();
-        assert!(visual_bell_flash_alphas(&done.inspect_shapes(), term_rect).is_empty());
+        assert!(visual_bell_flash_colors(&done.inspect_shapes(), term_rect).is_empty());
 
-        // Custom visual_bell_color & visual_bell_opacity persist cleanly in TerminalConfig.
-        h.config.visual_bell_color = Some(Color32::from_rgb(255, 60, 40));
+        // Custom visual_bell_color & visual_bell_opacity render with the configured RGB tint & alpha.
+        let custom_rgb = Color32::from_rgb(255, 60, 40);
+        assert_ne!(custom_rgb, default_fg);
+        h.config.visual_bell_color = Some(custom_rgb);
         h.config.visual_bell_opacity = 0.45;
+        h.runtime.input_mut().push_str("\x07");
+        let custom_peak = h.run_frame();
+        assert!(
+            custom_peak
+                .terminal_response
+                .events
+                .contains(&TerminalEvent::Bell)
+        );
+        assert!(custom_peak.repaint_requested);
+        let custom_peak_colors = visual_bell_flash_colors(&custom_peak.inspect_shapes(), term_rect);
+        assert_eq!(custom_peak_colors.len(), 1);
+        assert_bell_tint_and_alpha(custom_peak_colors[0], custom_rgb, 110, 120);
+
+        h.advance_time(0.10);
+        let custom_mid = h.run_frame();
+        let custom_mid_colors = visual_bell_flash_colors(&custom_mid.inspect_shapes(), term_rect);
+        assert_eq!(custom_mid_colors.len(), 1);
+        assert_bell_tint_and_alpha(
+            custom_mid_colors[0],
+            custom_rgb,
+            1,
+            custom_peak_colors[0].a() - 1,
+        );
+
+        // Updating visual_bell_color & visual_bell_opacity dynamically applies the new tint/alpha.
+        let live_rgb = Color32::from_rgb(40, 210, 120);
+        assert_ne!(live_rgb, custom_rgb);
+        assert_ne!(live_rgb, default_fg);
+        h.config.visual_bell_color = Some(live_rgb);
+        h.config.visual_bell_opacity = 0.70;
+        h.runtime.input_mut().push_str("\x07");
+        let live_peak = h.run_frame();
+        let live_colors = visual_bell_flash_colors(&live_peak.inspect_shapes(), term_rect);
+        assert_eq!(live_colors.len(), 1);
+        assert_bell_tint_and_alpha(live_colors[0], live_rgb, 174, 184);
+
+        h.advance_time(0.25);
+        let custom_done = h.run_frame();
+        assert!(visual_bell_flash_colors(&custom_done.inspect_shapes(), term_rect).is_empty());
+
         #[cfg(feature = "serde")]
         {
             let json = serde_json::to_string(&h.config).expect("serialize TerminalConfig");
             let roundtrip: TerminalConfig =
                 serde_json::from_str(&json).expect("deserialize TerminalConfig");
-            assert_eq!(
-                roundtrip.visual_bell_color,
-                Some(Color32::from_rgb(255, 60, 40))
-            );
-            assert!((roundtrip.visual_bell_opacity - 0.45).abs() < 1e-6);
+            assert_eq!(roundtrip.visual_bell_color, Some(live_rgb));
+            assert!((roundtrip.visual_bell_opacity - 0.70).abs() < 1e-6);
         }
     }
 
@@ -692,13 +765,37 @@ mod item11_tier2 {
         let cancelled = h.run_frame();
         assert!(visual_bell_flash_alphas(&cancelled.inspect_shapes(), term_rect).is_empty());
 
-        // Extreme / NaN opacity values in TerminalConfig never cause panic.
-        for opacity in [-1.0_f32, 0.0, 2.5, f32::NAN] {
+        // Extreme / NaN opacity values with custom color clamp cleanly and never cause panic.
+        let boundary_rgb = Color32::from_rgb(30, 180, 240);
+        h.config.visual_bell_color = Some(boundary_rgb);
+        for (opacity, expected_alpha_range) in [
+            (-1.0_f32, None),
+            (0.0, None),
+            (2.5, Some((255_u8, 255_u8))),
+            (f32::NAN, Some((40_u8, 52_u8))),
+        ] {
             h.config.visual_bell_duration_ms = 100;
             h.config.visual_bell_opacity = opacity;
             h.runtime.input_mut().push_str("\x07");
             let f = h.run_frame();
             assert!(f.terminal_response.cols >= 1);
+            let insp = f.inspect_shapes();
+            let flashes: Vec<Color32> = insp
+                .rect_fills
+                .iter()
+                .filter_map(|(r, c)| (covers_term_rect(*r, term_rect) && c.a() > 0).then_some(*c))
+                .collect();
+            match expected_alpha_range {
+                None => assert!(
+                    flashes.is_empty(),
+                    "opacity {opacity} should suppress visual bell flash"
+                ),
+                Some((min_a, max_a)) => {
+                    assert_eq!(flashes.len(), 1);
+                    assert_bell_tint_and_alpha(flashes[0], boundary_rgb, min_a, max_a);
+                }
+            }
+            h.advance_time(0.15);
         }
     }
 
