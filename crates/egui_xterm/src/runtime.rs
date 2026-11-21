@@ -295,6 +295,17 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                     && !search_bar_rect.is_some_and(|r| r.contains(*p))
                     && !scrollbar_rect.is_some_and(|r| r.contains(*p))
             });
+            let ctrl_or_cmd_held = ui.input(|i| {
+                i.modifiers.ctrl
+                    || i.modifiers.command
+                    || i.events.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            egui::Event::PointerButton { modifiers, .. }
+                                if modifiers.ctrl || modifiers.command
+                        )
+                    })
+            });
             crate::widgets::hyperlink::update_hyperlink_interaction(
                 ui,
                 &mut self.terminal,
@@ -302,6 +313,8 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                 &layout,
                 !mouse_captured,
                 input_out.clean_primary_click && !mouse_captured,
+                config.hyperlink_require_ctrl,
+                ctrl_or_cmd_held,
             )
         };
 
@@ -342,6 +355,15 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                     let _ = self.terminal.jump_to_prompt(delta);
                 }
             }
+        }
+
+        let events = self.terminal.drain_events();
+        if events
+            .iter()
+            .any(|ev| matches!(ev, egui_xterm_core::TerminalEvent::Bell))
+        {
+            self.renderer
+                .trigger_visual_bell(now_secs, config.visual_bell_duration_ms);
         }
 
         // 6. 4-stage cached rendering.
@@ -412,8 +434,6 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                 });
             });
         }
-
-        let events = self.terminal.drain_events();
 
         TerminalResponse {
             response: layout.response,

@@ -8162,3 +8162,396 @@ fn search_bar_escape_closes_when_window_unfocused() {
         "terminal must reclaim egui::Memory focus after Escape closes search bar"
     );
 }
+
+#[test]
+fn sgr_blink_schedules_repaint_only_when_visible_and_toggles_visibility() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let ctx = Context::default();
+    let (repaint_tx, repaint_rx) = mpsc::channel();
+    ctx.set_repaint_observer(move |info| repaint_tx.send(info.delay).unwrap());
+
+    let cfg = TerminalConfig {
+        cursor_blink: false,
+        idle_poll_interval_ms: 0,
+        enable_blink: true,
+        ..TerminalConfig::default()
+    };
+    let mut rt = TerminalRuntime::with_config(RingBufferInput::from_bytes(b"plain text"), cfg);
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    // No blinking cells in viewport -> no blink repaint scheduled.
+    run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    assert!(
+        !repaint_rx
+            .try_iter()
+            .any(|d| d > Duration::ZERO && d <= Duration::from_millis(500)),
+        "must not schedule blink repaint when no blinking cells are visible"
+    );
+
+    // Feed SGR 5 blinking text.
+    rt.terminal_mut().advance(b"\r\n\x1b[5mBLINK\x1b[0m");
+
+    // At t = 0.0 (on phase), BLINK is visible and schedules <= 500ms repaint.
+    let (clipped_on, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes_on = Vec::new();
+    collect_shapes(&clipped_on, &mut shapes_on);
+    let blink_visible_on = shapes_on.iter().any(|s| {
+        if let Shape::Text(t) = s {
+            t.galley.text().contains("BLINK")
+                && t.galley
+                    .rows
+                    .iter()
+                    .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
+        } else {
+            false
+        }
+    });
+    assert!(blink_visible_on, "blinking text should be visible at t=0.0");
+    assert!(
+        repaint_rx
+            .try_iter()
+            .any(|d| d > Duration::ZERO && d <= Duration::from_millis(500)),
+        "must schedule blink repaint when blinking cells are visible"
+    );
+
+    // At t = 0.6 (off phase), BLINK row's galley vertices for BLINK are transparent.
+    let (clipped_off, _) = run_frame_with(&ctx, screen, 1.0, 0.6, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes_off = Vec::new();
+    collect_shapes(&clipped_off, &mut shapes_off);
+    let blink_row_opaque = shapes_off.iter().any(|s| {
+        if let Shape::Text(t) = s {
+            t.galley.text().contains("BLINK")
+                && t.galley
+                    .rows
+                    .iter()
+                    .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
+        } else {
+            false
+        }
+    });
+    assert!(
+        !blink_row_opaque,
+        "blinking text should be hidden during off phase (t=0.6)"
+    );
+
+    // Disabling enable_blink keeps text visible and stops scheduling blink repaints.
+    rt.config_mut().enable_blink = false;
+    let _ = repaint_rx.try_iter().count();
+    let (clipped_disabled, _) = run_frame_with(&ctx, screen, 1.0, 0.6, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let mut shapes_disabled = Vec::new();
+    collect_shapes(&clipped_disabled, &mut shapes_disabled);
+    let blink_visible_disabled = shapes_disabled.iter().any(|s| {
+        if let Shape::Text(t) = s {
+            t.galley.text().contains("BLINK")
+                && t.galley
+                    .rows
+                    .iter()
+                    .any(|r| r.row.visuals.mesh.vertices.iter().any(|v| v.color.a() > 0))
+        } else {
+            false
+        }
+    });
+    assert!(
+        blink_visible_disabled,
+        "blinking text should stay visible when enable_blink=false"
+    );
+    assert!(
+        !repaint_rx
+            .try_iter()
+            .any(|d| d > Duration::ZERO && d <= Duration::from_millis(500)),
+        "must not schedule blink repaint when enable_blink=false"
+    );
+}
+
+#[test]
+fn visual_bell_flashes_and_decays_without_idle_repaints() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let ctx = Context::default();
+    let (repaint_tx, repaint_rx) = mpsc::channel();
+    ctx.set_repaint_observer(move |info| repaint_tx.send(info.delay).unwrap());
+
+    let cfg = TerminalConfig {
+        cursor_blink: false,
+        idle_poll_interval_ms: 0,
+        visual_bell_duration_ms: 150,
+        ..TerminalConfig::default()
+    };
+    let mut rt = TerminalRuntime::with_config(RingBufferInput::from_bytes(b"hello"), cfg);
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0));
+
+    let count_translucent_term_rects = |clipped: &[egui::epaint::ClippedShape]| -> Vec<u8> {
+        let mut shapes = Vec::new();
+        collect_shapes(clipped, &mut shapes);
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Rect(r) if r.fill.a() > 0 && r.fill.a() < 100 && r.rect.width() > 300.0 => {
+                    Some(r.fill.a())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Frame 0: no bell.
+    let (clipped0, _) = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    assert!(count_translucent_term_rects(&clipped0).is_empty());
+    let _ = repaint_rx.try_iter().count();
+
+    // Trigger BEL via input stream.
+    rt.input_mut().push_str("\x07");
+    let (clipped1, _) = run_frame_with(&ctx, screen, 1.0, 1.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let alphas1 = count_translucent_term_rects(&clipped1);
+    assert_eq!(alphas1.len(), 1, "visual bell flash should render on BEL");
+    assert!(
+        repaint_rx
+            .try_iter()
+            .any(|d| d > Duration::ZERO && d <= Duration::from_millis(20)),
+        "active visual bell must schedule decay repaint"
+    );
+
+    // Mid-decay at t = 1.075: lower alpha.
+    let (clipped2, _) = run_frame_with(&ctx, screen, 1.0, 1.075, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    let alphas2 = count_translucent_term_rects(&clipped2);
+    assert_eq!(alphas2.len(), 1);
+    assert!(alphas2[0] < alphas1[0], "visual bell alpha should decay");
+    let _ = repaint_rx.try_iter().count();
+
+    // Past duration at t = 1.20: flash gone and no further decay repaint.
+    let (clipped3, _) = run_frame_with(&ctx, screen, 1.0, 1.20, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+    assert!(count_translucent_term_rects(&clipped3).is_empty());
+    assert!(
+        !repaint_rx.try_iter().any(|d| d > Duration::ZERO),
+        "expired visual bell must not schedule repaints"
+    );
+}
+
+#[cfg(feature = "search")]
+#[test]
+fn search_bar_displays_regex_error_inline_and_supports_whole_word() {
+    let ctx = Context::default();
+    let mut rt = TerminalRuntime::new(RingBufferInput::from_bytes(b"cat scatter category\r\n"));
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+
+    let _ = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+
+    rt.open_search();
+    rt.search_bar_mut().is_regex = true;
+    let _ = run_frame_with(&ctx, screen, 1.0, 0.02, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            let _ = rt.show(ui);
+        });
+    });
+
+    // Type invalid regex `[unclosed` -> error stored and rendered inline.
+    let (clipped_err, _) = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.04,
+        vec![Event::Text("[unclosed".to_owned())],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+    assert!(rt.search_bar_mut().last_error.is_some());
+    let mut err_shapes = Vec::new();
+    collect_shapes(&clipped_err, &mut err_shapes);
+    assert!(
+        all_text(&err_shapes).contains("invalid search regex"),
+        "search bar must display regex compilation error inline"
+    );
+
+    // Switch to literal + whole_word and search for "cat" -> matches only whole word "cat" (1/1).
+    rt.search_bar_mut().is_regex = false;
+    rt.search_bar_mut().whole_word = true;
+    rt.search_bar_mut().query_text = "ca".to_owned();
+    let (clipped_ww, _) = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.06,
+        vec![Event::Text("t".to_owned())],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+    assert!(rt.search_bar_mut().last_error.is_none());
+    assert_eq!(rt.terminal().search_matches().len(), 1);
+    let mut ww_shapes = Vec::new();
+    collect_shapes(&clipped_ww, &mut ww_shapes);
+    assert!(all_text(&ww_shapes).contains("0/1"));
+}
+
+#[cfg(feature = "hyperlinks")]
+#[test]
+fn hyperlink_tooltip_and_require_ctrl_click() {
+    let ctx = Context::default();
+    let cfg = TerminalConfig {
+        hyperlink_require_ctrl: true,
+        ..TerminalConfig::default()
+    };
+    let mut rt = TerminalRuntime::with_config(
+        RingBufferInput::from_bytes(b"\x1b]8;;https://example.org/docs\x07docs\x1b]8;;\x07"),
+        cfg,
+    );
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+
+    let mut resp = None;
+    let _ = run_frame_with(&ctx, screen, 1.0, 0.0, Vec::new(), |ui| {
+        CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+            resp = Some(rt.show(ui));
+        });
+    });
+    let r = resp.expect("resp");
+    let link_pos = pos2(
+        r.response.rect.min.x + 1.5 * r.cell_size.x,
+        r.response.rect.min.y + 0.5 * r.cell_size.y,
+    );
+
+    // Hover without Ctrl: shows tooltip with URI (allow 2nd frame for egui Popup sizing),
+    // and does NOT set PointingHand.
+    let _ = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.1,
+        vec![Event::PointerMoved(link_pos)],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+    let (clipped_hover, plat_hover) = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.12,
+        vec![Event::PointerMoved(link_pos)],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+    assert_ne!(plat_hover.cursor_icon, CursorIcon::PointingHand);
+    let mut hover_shapes = Vec::new();
+    collect_shapes(&clipped_hover, &mut hover_shapes);
+    assert!(
+        all_text(&hover_shapes).contains("https://example.org/docs"),
+        "hovering hyperlink must show tooltip with target URI"
+    );
+
+    // Plain click without Ctrl: must NOT open URL when hyperlink_require_ctrl=true.
+    let (_, plat_plain_click) = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        0.2,
+        vec![
+            Event::PointerButton {
+                pos: link_pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            Event::PointerButton {
+                pos: link_pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+    assert!(
+        !plat_plain_click
+            .commands
+            .iter()
+            .any(|c| matches!(c, OutputCommand::OpenUrl(_))),
+        "plain click must not open URL when hyperlink_require_ctrl=true"
+    );
+
+    // Ctrl+Click (well after previous click so it's a single click): opens URL.
+    let (_, plat_ctrl_click) = run_frame_with(
+        &ctx,
+        screen,
+        1.0,
+        1.0,
+        vec![
+            Event::PointerButton {
+                pos: link_pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::CTRL,
+            },
+            Event::PointerButton {
+                pos: link_pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::CTRL,
+            },
+        ],
+        |ui| {
+            CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                let _ = rt.show(ui);
+            });
+        },
+    );
+    assert!(
+        plat_ctrl_click
+            .commands
+            .iter()
+            .any(|c| matches!(c, OutputCommand::OpenUrl(u) if u.url == "https://example.org/docs")),
+        "Ctrl+Click must open URL when hyperlink_require_ctrl=true"
+    );
+}

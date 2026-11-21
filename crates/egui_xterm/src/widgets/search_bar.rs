@@ -14,6 +14,8 @@ pub struct SearchBarState {
     pub is_regex: bool,
     /// Match case-sensitively when `true`.
     pub case_sensitive: bool,
+    /// Match whole words only (`\b...\b`) when `true`.
+    pub whole_word: bool,
     /// Last regex compilation error, if any.
     pub last_error: Option<String>,
     focus_requested: bool,
@@ -56,7 +58,7 @@ impl SearchBarState {
         if !self.open {
             return None;
         }
-        let bar_rect = compute_bar_rect(term_rect, clip_rect)?;
+        let bar_rect = compute_bar_rect(term_rect, clip_rect, self.last_error.is_some())?;
         Some(match self.last_rect {
             Some(prev)
                 if prev.intersects(bar_rect)
@@ -76,14 +78,18 @@ impl SearchBarState {
     }
 }
 
-pub(crate) fn compute_bar_rect(term_rect: Rect, clip_rect: Rect) -> Option<Rect> {
+pub(crate) fn compute_bar_rect(term_rect: Rect, clip_rect: Rect, has_error: bool) -> Option<Rect> {
     if term_rect.width() < 120.0 || term_rect.height() < 36.0 {
         return None;
     }
     let bar_w = (term_rect.width() - 16.0)
-        .clamp(104.0, 380.0)
+        .clamp(104.0, 410.0)
         .min(term_rect.width());
-    let bar_h = 30.0;
+    let bar_h = if has_error && term_rect.height() >= 56.0 {
+        48.0
+    } else {
+        30.0
+    };
     let bar_rect = Rect::from_min_size(
         pos2(
             (term_rect.max.x - bar_w - 8.0).max(term_rect.min.x),
@@ -95,10 +101,35 @@ pub(crate) fn compute_bar_rect(term_rect: Rect, clip_rect: Rect) -> Option<Rect>
     (bar_rect.width() >= 104.0 && bar_rect.height() >= 24.0).then_some(bar_rect)
 }
 
+fn escape_regex_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn apply_search_query(state: &mut SearchBarState, terminal: &mut Terminal) {
     if state.query_text.is_empty() {
         terminal.clear_search();
         state.last_error = None;
+    } else if state.whole_word {
+        let pattern = if state.is_regex {
+            format!(r"\b(?:{})\b", state.query_text)
+        } else {
+            format!(r"\b{}\b", escape_regex_literal(&state.query_text))
+        };
+        let query = SearchQuery::regex(pattern).with_case_sensitive(state.case_sensitive);
+        match terminal.search(&query) {
+            Ok(_) => state.last_error = None,
+            Err(err) => state.last_error = Some(err.to_string()),
+        }
     } else {
         let query = SearchQuery::literal(&state.query_text)
             .with_regex(state.is_regex)
@@ -161,7 +192,7 @@ pub(crate) fn show_search_bar(
         state.clear_hidden_focus();
         return false;
     }
-    let Some(bar_rect) = compute_bar_rect(term_rect, clip_rect) else {
+    let Some(bar_rect) = compute_bar_rect(term_rect, clip_rect, state.last_error.is_some()) else {
         state.clear_hidden_focus();
         return false;
     };
@@ -275,7 +306,9 @@ pub(crate) fn show_search_bar(
                                         + 2.0 * button_pad_x;
                                     let re_w = measure_body_text_w(ui, &body_font, ".*")
                                         + 2.0 * button_pad_x;
-                                    aa_w + re_w + 2.0 * item_spacing
+                                    let ww_w = measure_body_text_w(ui, &body_font, "\\b")
+                                        + 2.0 * button_pad_x;
+                                    aa_w + re_w + ww_w + 3.0 * item_spacing
                                 } else {
                                     0.0
                                 };
@@ -371,10 +404,14 @@ pub(crate) fn show_search_bar(
 
                                 let mut aa_id = None;
                                 let mut re_id = None;
+                                let mut ww_id = None;
                                 let mut aa_has_focus = false;
                                 let mut re_has_focus = false;
+                                let mut ww_has_focus = false;
                                 if show_toggles {
-                                    let aa_resp = ui.selectable_label(state.case_sensitive, "Aa");
+                                    let aa_resp = ui
+                                        .selectable_label(state.case_sensitive, "Aa")
+                                        .on_hover_text("Match case");
                                     aa_id = Some(aa_resp.id);
                                     if consume_bar_click(
                                         ui,
@@ -389,7 +426,26 @@ pub(crate) fn show_search_bar(
                                     }
                                     aa_has_focus = ui.memory(|m| m.has_focus(aa_resp.id));
 
-                                    let re_resp = ui.selectable_label(state.is_regex, ".*");
+                                    let ww_resp = ui
+                                        .selectable_label(state.whole_word, "\\b")
+                                        .on_hover_text("Match whole word");
+                                    ww_id = Some(ww_resp.id);
+                                    if consume_bar_click(
+                                        ui,
+                                        &ww_resp,
+                                        bar_rect,
+                                        pointer_pressed_outside_bar,
+                                    ) {
+                                        state.whole_word = !state.whole_word;
+                                        query_dirty = true;
+                                        bar_interacted = true;
+                                        edit_resp.request_focus();
+                                    }
+                                    ww_has_focus = ui.memory(|m| m.has_focus(ww_resp.id));
+
+                                    let re_resp = ui
+                                        .selectable_label(state.is_regex, ".*")
+                                        .on_hover_text("Use regular expression");
                                     re_id = Some(re_resp.id);
                                     if consume_bar_click(
                                         ui,
@@ -414,6 +470,7 @@ pub(crate) fn show_search_bar(
                                         || m.had_focus_last_frame(next_resp.id)
                                         || m.had_focus_last_frame(prev_resp.id)
                                         || aa_id.is_some_and(|id| m.had_focus_last_frame(id))
+                                        || ww_id.is_some_and(|id| m.had_focus_last_frame(id))
                                         || re_id.is_some_and(|id| m.had_focus_last_frame(id))
                                 });
                                 let bar_btn_has_focus = ui.memory(|m| {
@@ -421,6 +478,7 @@ pub(crate) fn show_search_bar(
                                         || m.has_focus(next_resp.id)
                                         || m.has_focus(prev_resp.id)
                                 }) || aa_has_focus
+                                    || ww_has_focus
                                     || re_has_focus;
                                 let bar_owns_escape = !pointer_pressed_outside_bar
                                     && (edit_has_focus_before_toggles
@@ -495,6 +553,17 @@ pub(crate) fn show_search_bar(
                         );
                     }
                 });
+                if state.open
+                    && let Some(err) = state.last_error.as_deref()
+                {
+                    let err_color = ui.visuals().error_fg_color;
+                    let err_resp = ui.add(
+                        egui::Label::new(egui::RichText::new(err).small().color(err_color))
+                            .truncate()
+                            .selectable(false),
+                    );
+                    err_resp.on_hover_text(err);
+                }
                 if state.open && step_dir != 0 {
                     apply_search_step(terminal, step_dir);
                     needs_repaint = true;

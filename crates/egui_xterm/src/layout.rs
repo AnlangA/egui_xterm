@@ -282,7 +282,7 @@ impl TerminalLayoutState {
 
         #[cfg(feature = "search")]
         let (search_bar_blocks_focus, prev_search_bar_rect) =
-            if crate::widgets::search_bar::compute_bar_rect(term_rect, clip_rect).is_some() {
+            if crate::widgets::search_bar::compute_bar_rect(term_rect, clip_rect, false).is_some() {
                 (search_bar_blocks_focus, prev_search_bar_rect)
             } else {
                 (false, None)

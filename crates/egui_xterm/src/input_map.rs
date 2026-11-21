@@ -1070,6 +1070,9 @@ fn encode_egui_key_kitty(
 fn egui_key_to_kitty(key: Key) -> Option<(egui_xterm_core::KittyKey, Option<char>, Option<char>)> {
     use egui_xterm_core::KittyKey;
 
+    // Note: `egui::Key` collapses numpad digits/operators into `Num0..=Num9`, `Enter`, `Plus`,
+    // `Minus`, `Period`, `Slash`, `Equals`, and `Comma`, which are handled by `key_to_ascii_pair`
+    // and the command keys below.
     if let Some((base, shifted)) = key_to_ascii_pair(key) {
         return Some((KittyKey::Char(base), Some(shifted), Some(base)));
     }
@@ -1095,6 +1098,8 @@ fn egui_key_to_kitty(key: Key) -> Option<(egui_xterm_core::KittyKey, Option<char
         Key::PrintScreen => KittyKey::PrintScreen,
         Key::Pause => KittyKey::Pause,
         Key::Menu => KittyKey::Menu,
+        Key::Clear => KittyKey::KeyCode(57409),
+        Key::IntlBackslash => return Some((KittyKey::Char('\\'), Some('|'), Some('\\'))),
         Key::ShiftLeft => KittyKey::LeftShift,
         Key::ShiftRight => KittyKey::RightShift,
         Key::ControlLeft => KittyKey::LeftControl,
@@ -1127,6 +1132,17 @@ fn egui_key_to_kitty(key: Key) -> Option<(egui_xterm_core::KittyKey, Option<char
         Key::F22 => KittyKey::F(22),
         Key::F23 => KittyKey::F(23),
         Key::F24 => KittyKey::F(24),
+        Key::F25 => KittyKey::F(25),
+        Key::F26 => KittyKey::F(26),
+        Key::F27 => KittyKey::F(27),
+        Key::F28 => KittyKey::F(28),
+        Key::F29 => KittyKey::F(29),
+        Key::F30 => KittyKey::F(30),
+        Key::F31 => KittyKey::F(31),
+        Key::F32 => KittyKey::F(32),
+        Key::F33 => KittyKey::F(33),
+        Key::F34 => KittyKey::F(34),
+        Key::F35 => KittyKey::F(35),
         _ => return None,
     };
     Some((kk, None, None))

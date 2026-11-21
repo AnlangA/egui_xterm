@@ -7,6 +7,10 @@ use crate::layout::{FrameLayout, snap_px, snap_rect, snap_size_at_least_1px};
 
 /// Evaluates pointer hover over `OSC 8` and implicit hyperlinks strictly inside the cell grid,
 /// returning visible spans to underline when hovered.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hyperlink interaction parameters"
+)]
 pub(crate) fn update_hyperlink_interaction(
     ui: &Ui,
     terminal: &mut Terminal,
@@ -14,6 +18,8 @@ pub(crate) fn update_hyperlink_interaction(
     layout: &FrameLayout,
     allow_click_activation: bool,
     clicked_primary: bool,
+    require_ctrl: bool,
+    ctrl_or_cmd_held: bool,
 ) -> Vec<HyperlinkSpan> {
     let Some(pos) = pointer_pos else {
         return Vec::new();
@@ -50,9 +56,31 @@ pub(crate) fn update_hyperlink_interaction(
     };
 
     let uri = info.uri.clone();
-    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    let activation_allowed = !require_ctrl || ctrl_or_cmd_held;
+    if activation_allowed {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
 
-    if allow_click_activation && clicked_primary {
+    let tooltip_text = if require_ctrl && !ctrl_or_cmd_held {
+        if cfg!(target_os = "macos") {
+            format!("{uri}\n(Cmd+Click to open)")
+        } else {
+            format!("{uri}\n(Ctrl+Click to open)")
+        }
+    } else {
+        uri.clone()
+    };
+    egui::Tooltip::always_open(
+        ui.ctx().clone(),
+        ui.layer_id(),
+        layout.response.id.with("hyperlink_tooltip"),
+        egui::PopupAnchor::Pointer,
+    )
+    .show(|ui| {
+        ui.label(tooltip_text);
+    });
+
+    if allow_click_activation && activation_allowed && clicked_primary {
         let _ = terminal.activate_hyperlink_at(col, row);
         ui.ctx().open_url(OpenUrl::new_tab(uri));
     }

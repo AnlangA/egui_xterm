@@ -53,12 +53,21 @@ struct VectorGlyphCell {
     color: Color32,
 }
 
+const BLINK_MASK: CellFlags = CellFlags::BLINK_SLOW.union(CellFlags::BLINK_RAPID);
+
+#[inline]
+fn is_cell_text_hidden(cell: egui_xterm_core::Cell, blink_hidden: bool) -> bool {
+    cell.flags.contains(CellFlags::HIDDEN) || (blink_hidden && cell.flags.intersects(BLINK_MASK))
+}
+
 #[derive(Debug, Clone, Default)]
 struct CachedRowSlot {
     valid: bool,
     row_gen: u64,
     selection_range: Option<(usize, usize)>,
     cursor_col: Option<u16>,
+    has_blink: bool,
+    blink_hidden: bool,
     start_col: u16,
     galley: Option<Arc<Galley>>,
     decorations: Vec<RowDecoration>,
@@ -163,6 +172,7 @@ pub(crate) struct TerminalRenderer {
     last_cfg_cursor_blink: bool,
     effective_cursor_blink: bool,
     last_input_time_secs: f64,
+    bell_until_secs: Option<f64>,
 }
 
 impl Default for TerminalRenderer {
@@ -193,6 +203,7 @@ impl Default for TerminalRenderer {
             last_cfg_cursor_blink: true,
             effective_cursor_blink: true,
             last_input_time_secs: f64::NEG_INFINITY,
+            bell_until_secs: None,
         }
     }
 }
@@ -201,6 +212,16 @@ impl TerminalRenderer {
     /// Records user interaction time so cursor blink stays momentarily solid while typing.
     pub(crate) fn note_input_activity(&mut self, now_secs: f64) {
         self.last_input_time_secs = now_secs;
+    }
+
+    /// Triggers a visual bell flash decaying over `duration_ms`.
+    pub(crate) fn trigger_visual_bell(&mut self, now_secs: f64, duration_ms: u32) {
+        if duration_ms == 0 || !now_secs.is_finite() {
+            self.bell_until_secs = None;
+            return;
+        }
+        let duration_secs = f64::from(duration_ms) / 1000.0;
+        self.bell_until_secs = Some(now_secs + duration_secs);
     }
 
     pub(crate) fn effective_cursor_shape(
@@ -326,6 +347,18 @@ impl TerminalRenderer {
                     is_on
                 }
             };
+
+            let (text_blink_on, next_text_blink_toggle) = if config.enable_blink {
+                let safe_now = if now_secs.is_finite() { now_secs } else { 0.0 };
+                let half = 0.5_f64;
+                let phase = (safe_now / half).floor();
+                let is_on = (phase as i64).rem_euclid(2) == 0;
+                let next_toggle = ((phase + 1.0) * half - safe_now).clamp(0.01, half);
+                (is_on, next_toggle)
+            } else {
+                (true, 0.0)
+            };
+            let blink_hidden = config.enable_blink && !text_blink_on;
 
             let block_cursor_active = cursor_visible
                 && has_focus
@@ -646,21 +679,25 @@ impl TerminalRenderer {
                         && slot.row_gen == row_gen
                         && slot.selection_range == row_sel
                         && slot.cursor_col == row_cursor_col
+                        && (!slot.has_blink || slot.blink_hidden == blink_hidden)
                     {
                         continue;
                     }
 
                     dirty_count += 1;
+                    let cells = row.cells();
+                    let row_cols = usize::from(snapshot.cols).min(cells.len());
                     slot.valid = true;
                     slot.row_gen = row_gen;
                     slot.selection_range = row_sel;
                     slot.cursor_col = row_cursor_col;
+                    slot.has_blink = cells.iter().take(row_cols).any(|c| {
+                        c.flags.intersects(BLINK_MASK) && !c.flags.contains(CellFlags::HIDDEN)
+                    });
+                    slot.blink_hidden = blink_hidden;
                     slot.decorations.clear();
                     #[cfg(feature = "vector-glyphs")]
                     slot.vector_cells.clear();
-
-                    let cells = row.cells();
-                    let row_cols = usize::from(snapshot.cols).min(cells.len());
                     let scan_end = row.trimmed_len().min(row_cols);
 
                     // Compute the exclusive end column of visible (non-vector, non-trailing-space)
@@ -677,7 +714,7 @@ impl TerminalRenderer {
                                 .cell_extra(c.extra_id)
                                 .is_some_and(|e| !e.combining.is_empty());
                         #[cfg(feature = "vector-glyphs")]
-                        if !c.flags.contains(CellFlags::HIDDEN)
+                        if !is_cell_text_hidden(c, blink_hidden)
                             && !has_comb
                             && is_vector_glyph(c.codepoint)
                         {
@@ -703,7 +740,7 @@ impl TerminalRenderer {
                             continue;
                         }
                         let col_u16 = col as u16;
-                        let is_hidden = cell.flags.contains(CellFlags::HIDDEN);
+                        let is_hidden = is_cell_text_hidden(cell, blink_hidden);
                         let has_combining = cell.extra_id != 0
                             && snapshot
                                 .cell_extra(cell.extra_id)
@@ -734,6 +771,7 @@ impl TerminalRenderer {
                                 default_bg,
                                 &config.theme,
                                 &snapshot,
+                                blink_hidden,
                             );
                             if has_deco {
                                 let cell_span_cols: u16 = if cell.is_wide_lead() { 2 } else { 1 };
@@ -849,6 +887,7 @@ impl TerminalRenderer {
                             extra_letter_spacing,
                             cell_w,
                             ppp,
+                            blink_hidden,
                         )
                     {
                         continue;
@@ -884,7 +923,7 @@ impl TerminalRenderer {
                                 && snapshot
                                     .cell_extra(cell.extra_id)
                                     .is_some_and(|e| !e.combining.is_empty());
-                            if !cell.flags.contains(CellFlags::HIDDEN)
+                            if !is_cell_text_hidden(cell, blink_hidden)
                                 && !has_comb
                                 && is_vector_glyph(cell.codepoint)
                             {
@@ -906,6 +945,7 @@ impl TerminalRenderer {
                             default_bg,
                             &config.theme,
                             &snapshot,
+                            blink_hidden,
                         );
 
                         let target_x = snap_px(f32::from(col_u16 - start_col) * cell_w, ppp);
@@ -1018,6 +1058,19 @@ impl TerminalRenderer {
             });
             if needs_repaint {
                 ui.ctx().request_repaint();
+            }
+            if config.enable_blink
+                && self
+                    .slots
+                    .iter()
+                    .take(usize::from(snapshot.rows))
+                    .any(|s| s.valid && s.has_blink)
+                && next_text_blink_toggle.is_finite()
+            {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                        next_text_blink_toggle,
+                    ));
             }
 
             // Stage 3: Vector glyphs, underlines, curly paths, prompt gutter, hyperlink underline,
@@ -1220,6 +1273,27 @@ impl TerminalRenderer {
                 ),
                 ppp,
             );
+            let char_count = ime_preedit.text.chars().count();
+            let active_span_x = ime_preedit.active_range_chars.as_ref().and_then(|range| {
+                let start = range.start.min(char_count);
+                let end = range.end.min(char_count);
+                if start >= end {
+                    return None;
+                }
+                let x0 = preedit_rect.min.x
+                    + preedit_galley
+                        .pos_from_cursor(egui::text::CCursor::new(start))
+                        .min
+                        .x;
+                let x1 = preedit_rect.min.x
+                    + preedit_galley
+                        .pos_from_cursor(egui::text::CCursor::new(end))
+                        .min
+                        .x;
+                let clamped_x0 = x0.clamp(preedit_rect.min.x, preedit_rect.max.x);
+                let clamped_x1 = x1.clamp(clamped_x0, preedit_rect.max.x);
+                (clamped_x1 > clamped_x0).then_some((clamped_x0, clamped_x1))
+            });
             if preedit_rect.is_positive() {
                 self.scratch_shapes
                     .push(egui::Shape::rect_filled(preedit_rect, 0.0, default_bg));
@@ -1234,27 +1308,109 @@ impl TerminalRenderer {
                     ),
                     ppp,
                 );
+                let base_ul_color = if active_span_x.is_some() {
+                    Color32::from_rgba_unmultiplied(
+                        default_fg.r(),
+                        default_fg.g(),
+                        default_fg.b(),
+                        140,
+                    )
+                } else {
+                    default_fg
+                };
                 self.scratch_shapes
-                    .push(egui::Shape::rect_filled(ul_rect, 0.0, default_fg));
+                    .push(egui::Shape::rect_filled(ul_rect, 0.0, base_ul_color));
+
+                if let Some((ax0, ax1)) = active_span_x {
+                    let active_bg = Color32::from_rgba_unmultiplied(
+                        default_fg.r(),
+                        default_fg.g(),
+                        default_fg.b(),
+                        36,
+                    );
+                    let active_bg_rect = snap_rect(
+                        Rect::from_min_max(
+                            pos2(ax0, preedit_rect.min.y),
+                            pos2(ax1, preedit_rect.max.y),
+                        ),
+                        ppp,
+                    );
+                    if active_bg_rect.is_positive() {
+                        self.scratch_shapes.push(egui::Shape::rect_filled(
+                            active_bg_rect,
+                            0.0,
+                            active_bg,
+                        ));
+                    }
+                    let active_ul_h = snap_size_at_least_1px(2.5, ppp);
+                    let active_ul_rect = snap_rect(
+                        Rect::from_min_max(
+                            pos2(
+                                ax0,
+                                (preedit_rect.max.y - active_ul_h).max(preedit_rect.min.y),
+                            ),
+                            pos2(ax1, preedit_rect.max.y),
+                        ),
+                        ppp,
+                    );
+                    if active_ul_rect.is_positive() {
+                        self.scratch_shapes.push(egui::Shape::rect_filled(
+                            active_ul_rect,
+                            0.0,
+                            default_fg,
+                        ));
+                    }
+                }
             }
             self.scratch_shapes.push(egui::Shape::Text(TextShape::new(
                 preedit_rect.min,
                 preedit_galley,
                 default_fg,
             )));
+            let anchor_x = active_span_x.map_or(preedit_rect.max.x, |(_, ax1)| ax1);
             snap_rect(
                 Rect::from_min_max(
                     pos2(
-                        (preedit_rect.max.x - 1.0 / ppp).max(preedit_rect.min.x),
+                        (anchor_x - 1.0 / ppp).max(preedit_rect.min.x),
                         preedit_rect.min.y,
                     ),
-                    preedit_rect.max,
+                    pos2(anchor_x, preedit_rect.max.y),
                 ),
                 ppp,
             )
         } else {
             ime_cursor_rect_base
         };
+
+        if let Some(until) = self.bell_until_secs {
+            let duration_secs = f64::from(config.visual_bell_duration_ms) / 1000.0;
+            if config.visual_bell_duration_ms == 0
+                || !now_secs.is_finite()
+                || now_secs >= until
+                || duration_secs <= 0.0
+            {
+                self.bell_until_secs = None;
+            } else {
+                let remaining = ((until - now_secs) / duration_secs).clamp(0.0, 1.0) as f32;
+                let alpha = (remaining * 46.0).round().clamp(1.0, 46.0) as u8;
+                let bell_color = Color32::from_rgba_unmultiplied(
+                    default_fg.r(),
+                    default_fg.g(),
+                    default_fg.b(),
+                    alpha,
+                );
+                let bell_rect = snap_rect(layout.term_rect, ppp);
+                if bell_rect.is_positive() {
+                    self.scratch_shapes
+                        .push(egui::Shape::rect_filled(bell_rect, 0.0, bell_color));
+                }
+                let next_step = (until - now_secs).clamp(0.001, 0.016);
+                if next_step.is_finite() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(next_step));
+                }
+            }
+        }
 
         painter.extend(self.scratch_shapes.drain(..));
         ime_cursor_rect
@@ -1339,9 +1495,9 @@ fn resolve_cell_fg(
     default_bg: Color32,
     theme: &Theme,
     snapshot: &RenderSnapshot<'_>,
+    blink_hidden: bool,
 ) -> Color32 {
-    let is_hidden = cell.flags.contains(CellFlags::HIDDEN);
-    if is_hidden {
+    if is_cell_text_hidden(cell, blink_hidden) {
         return Color32::TRANSPARENT;
     }
     let is_bold = cell.flags.contains(CellFlags::BOLD);
@@ -1516,6 +1672,7 @@ fn build_ascii_row_galley(
     extra_letter_spacing: f32,
     cell_w: f32,
     ppp: f32,
+    blink_hidden: bool,
 ) -> bool {
     if slice.is_empty() {
         return false;
@@ -1608,6 +1765,7 @@ fn build_ascii_row_galley(
             default_bg,
             theme,
             snapshot,
+            blink_hidden,
         );
 
         let byte_start = job.text.len();

@@ -93,6 +93,12 @@ pub struct TerminalConfig {
     pub cursor_config: CursorRenderConfig,
     /// Copy vs interrupt behavior override for copy shortcuts.
     pub copy_behavior: CopyBehavior,
+    /// Enable SGR blinking text (`SGR 5`/`6`) with a 500ms on/off cycle.
+    pub enable_blink: bool,
+    /// Duration in milliseconds of the visual bell flash on `BEL` (`0x07`). Set to `0` to disable.
+    pub visual_bell_duration_ms: u32,
+    /// When `true`, clicking a hyperlink requires holding `Ctrl` (or `Cmd` on macOS).
+    pub hyperlink_require_ctrl: bool,
 }
 
 impl Default for TerminalConfig {
@@ -111,6 +117,9 @@ impl Default for TerminalConfig {
             idle_poll_interval_ms: 50,
             cursor_config: CursorRenderConfig::default(),
             copy_behavior: CopyBehavior::CopyIfSelectionElseSendEtx,
+            enable_blink: true,
+            visual_bell_duration_ms: 150,
+            hyperlink_require_ctrl: false,
         }
     }
 }
