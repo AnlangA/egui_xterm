@@ -1,6 +1,6 @@
 # `AGENTS.md` — `egui_xterm` Workspace Guide
 
-> **Repository**: `https://github.com/AnlangA/egui_xterm` (`v0.2.0`)
+> **Repository**: `https://github.com/AnlangA/egui_xterm` (`v0.3.0`)
 > **Toolchain & Ecosystem**: Rust Edition `2024`, MSRV `1.95` (`rust-version = "1.95"`), `egui` / `eframe` / `epaint` `0.37`
 > **Targets**: Native desktops (`Windows`, `macOS`, `Linux`) and `wasm32-unknown-unknown`
 

@@ -46,11 +46,11 @@ Add `egui_xterm` to your `Cargo.toml` (Rust `1.95+`, Edition `2024`, `egui 0.37`
 ```toml
 [dependencies]
 egui = "0.37"
-egui_xterm = "0.2.0"
+egui_xterm = "0.3.0"
 
 # Optional cross-platform PTY (desktop portable-pty + wasm32 WebSocket WebPtyBackend)
 # and platform clipboard (desktop arboard + wasm32 Web Clipboard API):
-# egui_xterm = { version = "0.2.0", features = ["pty", "native-clipboard"] }
+# egui_xterm = { version = "0.3.0", features = ["pty", "native-clipboard"] }
 ```
 
 ### 1. Implement `TerminalInput` (or use `RingBufferInput` / `ChannelInput` / `FnInput`)
