@@ -1,9 +1,15 @@
-//! Desktop PTY backend for `egui_xterm` implementing [`TerminalInput`] via `portable-pty`.
+//! Cross-platform PTY backends for `egui_xterm` implementing [`TerminalInput`].
 //!
-//! On `wasm32` targets, compile-safe stub implementations of [`PtyBackend`],
-//! [`PtyConfig`], and [`RepaintCallback`] are exported alongside the core input
-//! contract types ([`TerminalInput`], [`TerminalIoError`], [`TerminalSize`]) so
-//! dependents remain `wasm32-unknown-unknown` compatible.
+//! - On native desktop targets (`Windows`, `macOS`, `Linux`), [`PtyBackend`] spawns local OS
+//!   shells via `portable-pty` with recycled read/write buffer pools and a non-blocking
+//!   background writer thread.
+//! - On `wasm32-unknown-unknown`, `WebPtyBackend` connects over browser `WebSocket`s to a
+//!   remote PTY gateway (supporting [`WebPtyProtocol::TaggedBinary`], [`WebPtyProtocol::Ttyd`],
+//!   [`WebPtyProtocol::JsonResize`], and [`WebPtyProtocol::Raw`]), while compile-safe
+//!   [`PtyBackend`] / [`PtyConfig`] stubs remain available for cross-platform callers.
+//! - On **all targets**, [`protocol`] and [`WebPtySession`] provide clean-room framing codecs
+//!   and a transport-agnostic session state machine for building custom Web PTY bridges or
+//!   server gateways.
 //!
 //! # Examples
 //!
@@ -28,6 +34,22 @@
 
 pub use egui_xterm_core::{TerminalInput, TerminalIoError, TerminalSize};
 
+/// Callback invoked when PTY output arrives, connection state changes, or EOF occurs.
+pub type RepaintCallback = Box<dyn Fn() + Send + Sync>;
+
+pub mod protocol;
+mod web;
+
+pub use protocol::{
+    ClientFrame, OwnedClientFrame, ServerFrame, WebPtyProtocol, WireMessage, validate_ws_url,
+};
+#[cfg(target_arch = "wasm32")]
+pub use web::WebPtyBackend;
+pub use web::{
+    DEFAULT_MAX_PENDING_TX_BYTES, DEFAULT_MAX_RX_BUFFER_BYTES, WebPtyConfig, WebPtySession,
+    WebPtyState,
+};
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shell;
 
@@ -37,8 +59,7 @@ mod wasm_stub {
 
     use egui_xterm_core::{TerminalInput, TerminalIoError, TerminalSize};
 
-    /// Callback invoked from the background PTY reader thread when output arrives or EOF occurs.
-    pub type RepaintCallback = Box<dyn Fn() + Send + Sync>;
+    pub use crate::RepaintCallback;
 
     /// Configuration for spawning a child process attached to a native PTY via [`PtyBackend`].
     #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -61,7 +82,7 @@ mod wasm_stub {
         last_size: TerminalSize,
     }
 
-    const WASM_UNSUPPORTED_MSG: &str = "native PTY is unavailable on wasm32 targets";
+    const WASM_UNSUPPORTED_MSG: &str = "local OS PTY is unavailable on wasm32 targets; use WebPtyBackend::connect with a WebSocket PTY endpoint";
 
     fn wasm_unsupported_error() -> TerminalIoError {
         TerminalIoError::message(WASM_UNSUPPORTED_MSG)
@@ -180,7 +201,7 @@ mod wasm_stub {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm_stub::{PtyBackend, PtyConfig, RepaintCallback};
+pub use wasm_stub::{PtyBackend, PtyConfig};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -221,8 +242,7 @@ mod native {
     /// threshold while accommodating any practical terminal viewport.
     const MAX_PTY_DIM: u16 = 4096;
 
-    /// Callback invoked from the background PTY reader thread when output arrives or EOF occurs.
-    pub type RepaintCallback = Box<dyn Fn() + Send + Sync>;
+    pub use crate::RepaintCallback;
 
     /// Configuration for spawning a child process attached to a native PTY via [`PtyBackend`].
     ///
@@ -2497,4 +2517,4 @@ mod native {
 #[doc(hidden)]
 pub use native::PtyMaster;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{PtyBackend, PtyConfig, RepaintCallback};
+pub use native::{PtyBackend, PtyConfig};

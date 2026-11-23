@@ -6,6 +6,7 @@ members = [
     "crates/egui_xterm_pty",
     "crates/egui_xterm_e2e",
     "examples/egui_xterm_demo",
+    "examples/egui_xterm_web_gateway",
 ]
 
 [workspace.package]
@@ -51,6 +52,12 @@ eframe = "0.37"
 # Desktop-only native integrations
 portable-pty = "0.9"
 arboard = "3.7"
+
+# Web / WASM32 browser integrations
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
 
 # Benchmarking
 criterion = "0.8"

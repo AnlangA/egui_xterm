@@ -32,18 +32,34 @@ kitty-graphics = ["egui_xterm_core/kitty-graphics"]
 sixel = ["egui_xterm_core/sixel"]
 vector-glyphs = []
 pty = ["dep:egui_xterm_pty"]
-native-clipboard = ["dep:arboard"]
+native-clipboard = [
+    "dep:arboard",
+    "dep:js-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+]
 serde = ["egui_xterm_core/serde", "egui/serde", "dep:serde"]
 metrics = ["egui_xterm_core/metrics"]
 
 [dependencies]
 egui_xterm_core = { workspace = true, default-features = false }
 egui = { workspace = true }
+egui_xterm_pty = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-egui_xterm_pty = { workspace = true, optional = true }
 arboard = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true, features = [
+    "Clipboard",
+    "Navigator",
+    "Window",
+] }
 
 [dev-dependencies]
 egui = { workspace = true, features = ["default_fonts"] }

@@ -1,9 +1,11 @@
 //! Interactive `eframe` 0.37 demo application showcasing `egui_xterm`.
 //!
-//! Demonstrates desktop PTY sessions (`egui_xterm::pty`), cross-platform trait-driven
-//! consoles ([`demo_shell::DemoShellInput`]), split-pane auto-layout inside [`egui::Frame`]
+//! Demonstrates desktop PTY sessions (`egui_xterm::pty::PtyBackend`), `wasm32` WebSocket PTY
+//! sessions (`egui_xterm::pty::WebPtyBackend`), cross-platform trait-driven consoles
+//! ([`demo_shell::DemoShellInput`]), split-pane auto-layout inside [`egui::Frame`]
 //! containers, [`ScaleMode::ReflowGrid`] vs [`ScaleMode::AutoScaleToFit`], themes,
-//! cursor customization, and optional features (`search`, `shell-integration`, `metrics`).
+//! cursor customization, platform/web clipboard integration, and optional features
+//! (`search`, `shell-integration`, `metrics`).
 
 #![forbid(unsafe_code)]
 
@@ -13,8 +15,12 @@ use std::borrow::Cow;
 
 use demo_shell::{DemoShellInput, SHOWCASE_COMMANDS};
 use eframe::egui;
+#[cfg(any(target_arch = "wasm32", test))]
+use egui_xterm::pty::WebPtyProtocol;
 #[cfg(not(target_arch = "wasm32"))]
 use egui_xterm::pty::{PtyBackend, PtyConfig};
+#[cfg(target_arch = "wasm32")]
+use egui_xterm::pty::{WebPtyBackend, WebPtyConfig};
 use egui_xterm::{
     ClipboardSelection, CursorShape, Osc52ReadPolicy, ProgressIndicator, ScaleMode, TerminalConfig,
     TerminalEvent, TerminalInput, TerminalIoError, TerminalResponse, TerminalRuntime, Theme,
@@ -37,11 +43,153 @@ fn main() -> eframe::Result {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn set_web_loading_error(document: Option<&web_sys::Document>, msg: &str) {
+    web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(msg));
+    if let Some(doc) = document
+        && let Some(loading) = doc.get_element_by_id("loading_text")
+    {
+        loading.set_text_content(Some(msg));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn main() {
-    // Keep wasm32 target compilation checking the entire eframe App implementation cleanly.
-    let _creator: fn(&eframe::CreationContext<'_>) -> EguiXtermDemoApp = EguiXtermDemoApp::new;
-    let _ui_fn: fn(&mut EguiXtermDemoApp, &mut egui::Ui, &mut eframe::Frame) =
-        <EguiXtermDemoApp as eframe::App>::ui;
+    use wasm_bindgen::JsCast as _;
+
+    wasm_bindgen_futures::spawn_local(async {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let document = window.document();
+        let Some(canvas_el) = document
+            .as_ref()
+            .and_then(|doc| doc.get_element_by_id("egui_xterm_canvas"))
+        else {
+            set_web_loading_error(
+                document.as_ref(),
+                "Missing <canvas id=\"egui_xterm_canvas\"> element.",
+            );
+            return;
+        };
+        let Ok(canvas) = canvas_el.dyn_into::<web_sys::HtmlCanvasElement>() else {
+            set_web_loading_error(
+                document.as_ref(),
+                "Element #egui_xterm_canvas is not an HTMLCanvasElement.",
+            );
+            return;
+        };
+
+        let runner = eframe::WebRunner::new();
+        match runner
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(|cc| Ok(Box::new(EguiXtermDemoApp::new(cc)))),
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Some(doc) = document
+                    && let Some(loading) = doc.get_element_by_id("loading_text")
+                {
+                    loading.remove();
+                }
+            }
+            Err(err) => {
+                set_web_loading_error(
+                    document.as_ref(),
+                    &format!("Failed to start egui_xterm Demo: {err:?}"),
+                );
+            }
+        }
+    });
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_query_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_web_pty_startup_params(
+    page_protocol: &str,
+    page_host: &str,
+    query: &str,
+) -> (String, WebPtyProtocol, bool) {
+    let mut url = if page_protocol.eq_ignore_ascii_case("https:") && !page_host.is_empty() {
+        format!("wss://{page_host}/ws")
+    } else {
+        "ws://127.0.0.1:7681/ws".to_owned()
+    };
+    let mut protocol = WebPtyProtocol::TaggedBinary;
+    let mut auto_connect = false;
+
+    let trimmed_query = query.strip_prefix('?').unwrap_or(query);
+    for pair in trimmed_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_val) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_component(raw_key);
+        let val = decode_query_component(raw_val);
+        if key.eq_ignore_ascii_case("ws") {
+            let candidate = val.trim();
+            if !candidate.is_empty() {
+                url = candidate.to_owned();
+            }
+        } else if key.eq_ignore_ascii_case("proto") {
+            let p = val.trim();
+            if p.eq_ignore_ascii_case("tagged") || p.eq_ignore_ascii_case("tagged_binary") {
+                protocol = WebPtyProtocol::TaggedBinary;
+            } else if p.eq_ignore_ascii_case("ttyd") {
+                protocol = WebPtyProtocol::Ttyd;
+            } else if p.eq_ignore_ascii_case("json") || p.eq_ignore_ascii_case("json_resize") {
+                protocol = WebPtyProtocol::JsonResize;
+            } else if p.eq_ignore_ascii_case("raw") {
+                protocol = WebPtyProtocol::Raw;
+            }
+        } else if key.eq_ignore_ascii_case("autoconnect") {
+            let v = val.trim();
+            auto_connect =
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes");
+        }
+    }
+
+    (url, protocol, auto_connect)
 }
 
 trait AnyRuntime {
@@ -55,8 +203,11 @@ trait AnyRuntime {
     fn take_io_error(&mut self) -> Option<TerminalIoError>;
     fn pending_osc52_read(&self) -> Option<ClipboardSelection>;
     fn approve_osc52_read(&mut self, text: &str) -> bool;
+    fn approve_osc52_read_from_clipboard(&mut self, ctx: &egui::Context) -> bool;
     fn deny_osc52_read(&mut self) -> bool;
     fn provide_clipboard_read(&mut self, selection: ClipboardSelection, text: &str);
+    fn request_clipboard_paste(&mut self, ctx: &egui::Context);
+    fn has_pending_clipboard_read(&self) -> bool;
     #[cfg(feature = "search")]
     fn toggle_search(&mut self);
     #[cfg(feature = "shell-integration")]
@@ -114,12 +265,24 @@ impl<I: TerminalInput> AnyRuntime for TerminalRuntime<I> {
         TerminalRuntime::approve_osc52_read(self, text)
     }
 
+    fn approve_osc52_read_from_clipboard(&mut self, ctx: &egui::Context) -> bool {
+        TerminalRuntime::approve_osc52_read_from_clipboard(self, ctx)
+    }
+
     fn deny_osc52_read(&mut self) -> bool {
         TerminalRuntime::deny_osc52_read(self)
     }
 
     fn provide_clipboard_read(&mut self, selection: ClipboardSelection, text: &str) {
         self.terminal_mut().provide_clipboard_read(selection, text);
+    }
+
+    fn request_clipboard_paste(&mut self, ctx: &egui::Context) {
+        TerminalRuntime::request_clipboard_paste(self, ctx);
+    }
+
+    fn has_pending_clipboard_read(&self) -> bool {
+        TerminalRuntime::has_pending_clipboard_read(self)
     }
 
     #[cfg(feature = "search")]
@@ -140,8 +303,9 @@ impl<I: TerminalInput> AnyRuntime for TerminalRuntime<I> {
 enum PaneBackend {
     #[cfg(not(target_arch = "wasm32"))]
     Pty(TerminalRuntime<PtyBackend>),
+    #[cfg(target_arch = "wasm32")]
+    WebPty(TerminalRuntime<WebPtyBackend>),
     Trait(TerminalRuntime<DemoShellInput>),
-    #[cfg(not(target_arch = "wasm32"))]
     Error(String),
 }
 
@@ -194,8 +358,9 @@ impl TerminalTab {
         match &self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             PaneBackend::Pty(rt) => Some(rt),
+            #[cfg(target_arch = "wasm32")]
+            PaneBackend::WebPty(rt) => Some(rt),
             PaneBackend::Trait(rt) => Some(rt),
-            #[cfg(not(target_arch = "wasm32"))]
             PaneBackend::Error(_) => None,
         }
     }
@@ -204,8 +369,9 @@ impl TerminalTab {
         match &mut self.backend {
             #[cfg(not(target_arch = "wasm32"))]
             PaneBackend::Pty(rt) => Some(rt),
+            #[cfg(target_arch = "wasm32")]
+            PaneBackend::WebPty(rt) => Some(rt),
             PaneBackend::Trait(rt) => Some(rt),
-            #[cfg(not(target_arch = "wasm32"))]
             PaneBackend::Error(_) => None,
         }
     }
@@ -252,15 +418,17 @@ impl TerminalTab {
                 let rt: Option<&mut dyn AnyRuntime> = match &mut self.backend {
                     #[cfg(not(target_arch = "wasm32"))]
                     PaneBackend::Pty(rt) => Some(rt),
+                    #[cfg(target_arch = "wasm32")]
+                    PaneBackend::WebPty(rt) => Some(rt),
                     PaneBackend::Trait(rt) => Some(rt),
-                    #[cfg(not(target_arch = "wasm32"))]
                     PaneBackend::Error(err_msg) => {
                         ui.vertical_centered(|ui| {
                             ui.add_space(24.0);
-                            ui.colored_label(
-                                egui::Color32::from_rgb(240, 100, 100),
-                                "Failed to launch native PTY session",
-                            );
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let title = "Failed to launch native PTY session";
+                            #[cfg(target_arch = "wasm32")]
+                            let title = "Failed to connect Web PTY session";
+                            ui.colored_label(egui::Color32::from_rgb(240, 100, 100), title);
                             ui.add_space(6.0);
                             ui.monospace(err_msg.as_str());
                         });
@@ -341,8 +509,30 @@ impl TerminalTab {
         approved
     }
 
+    fn approve_osc52_read_from_clipboard(&mut self, ctx: &egui::Context) -> bool {
+        let approved = self
+            .runtime_mut()
+            .is_some_and(|rt| rt.approve_osc52_read_from_clipboard(ctx));
+        if approved {
+            self.sync_io_error_from_runtime();
+        }
+        approved
+    }
+
     fn deny_osc52_read(&mut self) -> bool {
         self.runtime_mut().is_some_and(AnyRuntime::deny_osc52_read)
+    }
+
+    fn request_clipboard_paste(&mut self, ctx: &egui::Context) {
+        if let Some(rt) = self.runtime_mut() {
+            rt.request_clipboard_paste(ctx);
+            self.sync_io_error_from_runtime();
+        }
+    }
+
+    fn has_pending_clipboard_read(&self) -> bool {
+        self.runtime()
+            .is_some_and(AnyRuntime::has_pending_clipboard_read)
     }
 
     fn apply_events(
@@ -433,10 +623,34 @@ struct EguiXtermDemoApp {
     auto_cols_draft: u16,
     auto_rows_draft: u16,
     osc52_reply_draft: String,
+    #[cfg(target_arch = "wasm32")]
+    web_pty_url_draft: String,
+    #[cfg(target_arch = "wasm32")]
+    web_pty_protocol: WebPtyProtocol,
+    #[cfg(target_arch = "wasm32")]
+    web_pty_auth_token_draft: String,
 }
 
 impl EguiXtermDemoApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let (initial_ws_url, initial_ws_proto, auto_connect_ws) =
+            web_sys::window().map(|w| w.location()).map_or_else(
+                || {
+                    (
+                        "ws://127.0.0.1:7681/ws".to_owned(),
+                        WebPtyProtocol::TaggedBinary,
+                        false,
+                    )
+                },
+                |loc| {
+                    let proto = loc.protocol().unwrap_or_default();
+                    let host = loc.host().unwrap_or_default();
+                    let search = loc.search().unwrap_or_default();
+                    parse_web_pty_startup_params(&proto, &host, &search)
+                },
+            );
+
         let mut app = Self {
             tabs: Vec::new(),
             active_tab_idx: 0,
@@ -447,6 +661,12 @@ impl EguiXtermDemoApp {
             auto_cols_draft: 80,
             auto_rows_draft: 24,
             osc52_reply_draft: "egui_xterm clipboard".to_owned(),
+            #[cfg(target_arch = "wasm32")]
+            web_pty_url_draft: initial_ws_url,
+            #[cfg(target_arch = "wasm32")]
+            web_pty_protocol: initial_ws_proto,
+            #[cfg(target_arch = "wasm32")]
+            web_pty_auth_token_draft: String::new(),
         };
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -457,9 +677,11 @@ impl EguiXtermDemoApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let _unused_cc = cc;
             app.add_trait_tab("Trait Demo", TerminalConfig::default());
             app.add_trait_tab("Trait Console #2", TerminalConfig::default());
+            if auto_connect_ws {
+                app.add_web_pty_tab(&cc.egui_ctx, TerminalConfig::default());
+            }
         }
 
         app
@@ -507,7 +729,69 @@ impl EguiXtermDemoApp {
             && tab.is_pty
         {
             tab.backend = Self::spawn_pty_backend(ctx, &tab.config);
+            tab.last_response = None;
             tab.last_notice = Some("PTY restarted".to_owned());
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn connect_web_pty_backend(
+        ctx: &egui::Context,
+        url: &str,
+        protocol: WebPtyProtocol,
+        auth_token: &str,
+        config: &TerminalConfig,
+    ) -> PaneBackend {
+        let repaint_ctx = ctx.clone();
+        let mut ws_cfg = WebPtyConfig::new(url.trim()).with_protocol(protocol);
+        if protocol == WebPtyProtocol::Ttyd && !auth_token.is_empty() {
+            ws_cfg = ws_cfg.with_auth_token(auth_token);
+        }
+        match WebPtyBackend::connect_with_repaint(
+            ws_cfg,
+            Box::new(move || repaint_ctx.request_repaint()),
+        ) {
+            Ok(pty) => PaneBackend::WebPty(TerminalRuntime::with_config(pty, config.clone())),
+            Err(err) => PaneBackend::Error(err.to_string()),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn add_web_pty_tab(&mut self, ctx: &egui::Context, config: TerminalConfig) {
+        let id = self.alloc_tab_id();
+        let backend = Self::connect_web_pty_backend(
+            ctx,
+            &self.web_pty_url_draft,
+            self.web_pty_protocol,
+            &self.web_pty_auth_token_draft,
+            &config,
+        );
+        self.tabs.push(TerminalTab {
+            id,
+            label: format!("Web PTY #{id}"),
+            is_pty: true,
+            config,
+            backend,
+            last_response: None,
+            last_notice: None,
+            last_notification: None,
+        });
+        let new_idx = self.tabs.len() - 1;
+        self.select_tab(new_idx);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn reconnect_active_web_pty(&mut self, ctx: &egui::Context) {
+        let url = self.web_pty_url_draft.clone();
+        let protocol = self.web_pty_protocol;
+        let auth_token = self.web_pty_auth_token_draft.clone();
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_idx)
+            && tab.is_pty
+        {
+            tab.backend =
+                Self::connect_web_pty_backend(ctx, &url, protocol, &auth_token, &tab.config);
+            tab.last_response = None;
+            tab.last_notice = Some("Web PTY reconnecting".to_owned());
         }
     }
 
@@ -657,6 +941,64 @@ impl EguiXtermDemoApp {
                 self.restart_active_pty(&ctx);
             }
         }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.web_pty_url_draft)
+                    .desired_width(180.0)
+                    .hint_text("ws://127.0.0.1:7681/ws"),
+            );
+            let proto_label = match self.web_pty_protocol {
+                WebPtyProtocol::TaggedBinary => "Tagged",
+                WebPtyProtocol::Ttyd => "ttyd",
+                WebPtyProtocol::JsonResize => "JSON",
+                WebPtyProtocol::Raw => "Raw",
+                _ => "Custom",
+            };
+            if ui
+                .button(format!("Proto: {proto_label}"))
+                .on_hover_text("Cycle Web PTY wire protocol (Tagged -> ttyd -> JSON -> Raw)")
+                .clicked()
+            {
+                self.web_pty_protocol = match self.web_pty_protocol {
+                    WebPtyProtocol::TaggedBinary => WebPtyProtocol::Ttyd,
+                    WebPtyProtocol::Ttyd => WebPtyProtocol::JsonResize,
+                    WebPtyProtocol::JsonResize => WebPtyProtocol::Raw,
+                    _ => WebPtyProtocol::TaggedBinary,
+                };
+            }
+            if self.web_pty_protocol == WebPtyProtocol::Ttyd {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.web_pty_auth_token_draft)
+                        .password(true)
+                        .desired_width(120.0)
+                        .hint_text("AuthToken"),
+                );
+            }
+            if ui.button("Connect Web PTY").clicked() {
+                let base_cfg = self
+                    .tabs
+                    .get(self.active_tab_idx)
+                    .map(|t| t.config.clone())
+                    .unwrap_or_default();
+                let ctx = ui.ctx().clone();
+                self.add_web_pty_tab(&ctx, base_cfg);
+            }
+            let is_pty_active = self.tabs.get(self.active_tab_idx).is_some_and(|t| t.is_pty);
+            if is_pty_active && ui.button("Reconnect Web PTY").clicked() {
+                let ctx = ui.ctx().clone();
+                self.reconnect_active_web_pty(&ctx);
+            }
+            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx)
+                && let PaneBackend::WebPty(rt) = &mut tab.backend
+                && rt.input().state() != egui_xterm::pty::WebPtyState::Closed
+                && ui.button("Close Web PTY").clicked()
+            {
+                rt.input_mut().close();
+                tab.last_notice = Some("Web PTY closing".to_owned());
+            }
+        }
     }
 
     fn draw_layout_and_font_controls(&mut self, ui: &mut egui::Ui) {
@@ -781,6 +1123,23 @@ impl EguiXtermDemoApp {
             }
             ui.checkbox(&mut tab.config.osc52_write_enabled, "OSC 52 Write")
                 .on_hover_text("Allow OSC 52 sequences to write to the host clipboard");
+            let paste_hint = if TerminalRuntime::<DemoShellInput>::is_platform_clipboard_available()
+            {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    "Paste from browser Web Clipboard API (falls back to egui RequestPaste)"
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    "Paste from OS clipboard via native-clipboard"
+                }
+            } else {
+                "Request paste via egui clipboard fallback"
+            };
+            if ui.button("Paste").on_hover_text(paste_hint).clicked() {
+                let ctx = ui.ctx().clone();
+                tab.request_clipboard_paste(&ctx);
+            }
         }
 
         ui.toggle_value(&mut self.show_showcase_panel, "Showcase");
@@ -881,8 +1240,25 @@ impl EguiXtermDemoApp {
                 }
                 if tab.is_pty {
                     ui.separator();
-                    let status = if snap.closed { "Exited" } else { "Running" };
-                    ui.label(format!("PTY: {status}"));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let status = if snap.closed { "Exited" } else { "Running" };
+                        ui.label(format!("PTY: {status}"));
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let status = match &tab.backend {
+                            PaneBackend::WebPty(rt) => match rt.input().state() {
+                                egui_xterm::pty::WebPtyState::Connecting => "Connecting",
+                                egui_xterm::pty::WebPtyState::Open => "Open",
+                                egui_xterm::pty::WebPtyState::Closing => "Closing",
+                                egui_xterm::pty::WebPtyState::Closed => "Closed",
+                            },
+                            _ if snap.closed => "Closed",
+                            _ => "Running",
+                        };
+                        ui.label(format!("Web PTY: {status}"));
+                    }
                 }
                 #[cfg(any(feature = "kitty-graphics", feature = "sixel"))]
                 if snap.image_count > 0 {
@@ -912,6 +1288,10 @@ impl EguiXtermDemoApp {
                     egui::Color32::from_rgb(255, 193, 7),
                     format!("OSC 52 Pending ({})", clipboard_selection_label(selection)),
                 );
+            }
+            if tab.has_pending_clipboard_read() {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(255, 193, 7), "Clipboard: Reading…");
             }
             if let Some(notification) = &tab.last_notification {
                 ui.separator();
@@ -1001,6 +1381,20 @@ impl EguiXtermDemoApp {
                     && tab.deny_osc52_read()
                 {
                     tab.last_notice = Some(format!("OSC 52 read denied ({selection_label})"));
+                }
+                if TerminalRuntime::<DemoShellInput>::is_platform_clipboard_available()
+                    && ui
+                        .button("Read Clipboard")
+                        .on_hover_text("Approve OSC 52 read using the host/browser clipboard API")
+                        .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    if let Some(tab) = self.tabs.get_mut(tab_idx)
+                        && tab.approve_osc52_read_from_clipboard(&ctx)
+                    {
+                        tab.last_notice =
+                            Some(format!("OSC 52 read via clipboard ({selection_label})"));
+                    }
                 }
             });
         });
@@ -1099,6 +1493,12 @@ mod tests {
             auto_cols_draft: 80,
             auto_rows_draft: 24,
             osc52_reply_draft: "egui_xterm clipboard".to_owned(),
+            #[cfg(target_arch = "wasm32")]
+            web_pty_url_draft: "ws://127.0.0.1:7681/ws".to_owned(),
+            #[cfg(target_arch = "wasm32")]
+            web_pty_protocol: WebPtyProtocol::TaggedBinary,
+            #[cfg(target_arch = "wasm32")]
+            web_pty_auth_token_draft: String::new(),
         };
         for idx in 0..count {
             app.add_trait_tab(&format!("Tab #{idx}"), TerminalConfig::default());
@@ -1467,6 +1867,76 @@ mod tests {
         assert!(
             has_textured_mesh,
             "expected textured meshes for Kitty & Sixel graphics"
+        );
+    }
+
+    #[test]
+    fn parse_web_pty_startup_params_handles_defaults_https_and_query_overrides() {
+        assert_eq!(
+            parse_web_pty_startup_params("http:", "127.0.0.1:8080", ""),
+            (
+                "ws://127.0.0.1:7681/ws".to_owned(),
+                WebPtyProtocol::TaggedBinary,
+                false
+            )
+        );
+        assert_eq!(
+            parse_web_pty_startup_params("https:", "term.example.com", ""),
+            (
+                "wss://term.example.com/ws".to_owned(),
+                WebPtyProtocol::TaggedBinary,
+                false
+            )
+        );
+        assert_eq!(
+            parse_web_pty_startup_params(
+                "http:",
+                "127.0.0.1:8080",
+                "?ws=wss%3A%2F%2Fhost%3A8443%2Fpty%3Froom%3D1&proto=ttyd&autoconnect=1"
+            ),
+            (
+                "wss://host:8443/pty?room=1".to_owned(),
+                WebPtyProtocol::Ttyd,
+                true
+            )
+        );
+        assert_eq!(
+            parse_web_pty_startup_params("http:", "localhost:8080", "?proto=json&autoconnect=true"),
+            (
+                "ws://127.0.0.1:7681/ws".to_owned(),
+                WebPtyProtocol::JsonResize,
+                true
+            )
+        );
+        assert_eq!(
+            parse_web_pty_startup_params("http:", "localhost:8080", "?proto=RAW&autoconnect=YES"),
+            (
+                "ws://127.0.0.1:7681/ws".to_owned(),
+                WebPtyProtocol::Raw,
+                true
+            )
+        );
+        assert_eq!(
+            parse_web_pty_startup_params("http:", "localhost:8080", "?proto=tagged&autoconnect=0"),
+            (
+                "ws://127.0.0.1:7681/ws".to_owned(),
+                WebPtyProtocol::TaggedBinary,
+                false
+            )
+        );
+        assert_eq!(decode_query_component("a+b%ZZ%20%"), "a b%ZZ %");
+    }
+
+    #[test]
+    fn paste_toolbar_button_renders_in_demo_ui() {
+        let mut app = test_app_with_tabs(1);
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(make_raw_input(vec![]), |ui| app.show_ui(ui));
+        let paste_rect = find_text_rect_in_shapes(&out.shapes, "Paste");
+        out.drop_without_applying_deltas();
+        assert!(
+            paste_rect.is_some(),
+            "expected Paste button in demo toolbar"
         );
     }
 }

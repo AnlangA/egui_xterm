@@ -1091,7 +1091,11 @@ dependencies = [
  "egui",
  "egui_xterm_core",
  "egui_xterm_pty",
+ "js-sys",
  "serde",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -1114,6 +1118,9 @@ dependencies = [
  "eframe",
  "egui",
  "egui_xterm",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -1134,7 +1141,17 @@ version = "0.2.0"
 dependencies = [
  "criterion",
  "egui_xterm_core",
+ "js-sys",
  "portable-pty",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "egui_xterm_web_gateway"
+version = "0.2.0"
+dependencies = [
+ "egui_xterm_pty",
 ]
 
 [[package]]

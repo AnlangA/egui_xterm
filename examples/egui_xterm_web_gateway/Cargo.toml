@@ -1,0 +1,13 @@
+[package]
+name = "egui_xterm_web_gateway"
+version.workspace = true
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+egui_xterm_pty = { workspace = true }

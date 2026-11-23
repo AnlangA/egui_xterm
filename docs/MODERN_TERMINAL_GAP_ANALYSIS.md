@@ -110,8 +110,8 @@ Using the canonical bottleneck IDs from [`docs/BENCHMARK_BASELINE.md`](./BENCHMA
 | `TerminalRuntime`, `TerminalWidget`, `TerminalConfig`, `ScaleMode`, auto-layout, `bg_mesh`/`text_mesh`/`overlay_mesh`, `progress_bar`, `scrollbar`, `context_menu` | `egui_xterm` | `src/{lib,config,layout,input_map,renderer,runtime}.rs`, `src/widgets/*` | Always on | Yes | Yes |
 | Serializable `TerminalSnapshot`, `TerminalConfig`, `Theme`, `ColorScheme`, `SearchQuery` | `egui_xterm_core`, `egui_xterm` | `serde` derives across core & widget types | `serde` | No | Yes |
 | `TerminalMetrics` (`bytes_processed`, `frames_rendered`, `reflow_count`, etc.) | `egui_xterm_core`, `egui_xterm` | `core/src/features/metrics.rs` | `metrics` | No | Yes |
-| Desktop `PtyBackend` (`portable-pty 0.9`, recycled reader/writer pools, ConPTY handshake) | `egui_xterm_pty`, `egui_xterm` | `crates/egui_xterm_pty/src/{lib,shell}.rs` | `pty` | No | Stubs only on `wasm32` |
-| OS clipboard fallback (`arboard`) | `egui_xterm` | `src/input_map.rs` | `native-clipboard` | No | **No** (Desktop) |
+| Desktop `PtyBackend` (`portable-pty 0.9`, recycled reader/writer pools, ConPTY handshake) + `wasm32` `WebSocket` `WebPtyBackend` + cross-platform `protocol` & `WebPtySession` | `egui_xterm_pty`, `egui_xterm` | `crates/egui_xterm_pty/src/{lib,shell,protocol,web}.rs` | `pty` | No | **Yes (Desktop + Web)** |
+| Platform clipboard fallback (`arboard` on desktop, async browser Web Clipboard API on `wasm32`) | `egui_xterm` | `src/clipboard.rs` | `native-clipboard` | No | **Yes (Desktop + Web)** |
 
 ---
 

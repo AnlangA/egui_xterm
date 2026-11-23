@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/egui_xterm_pty"
-description = "Desktop PTY backend for egui_xterm implementing TerminalInput via portable-pty"
-keywords = ["terminal", "pty", "conpty", "egui", "shell"]
-categories = ["emulators", "os"]
+description = "Cross-platform PTY backend for egui_xterm (desktop portable-pty and wasm32 WebSocket PTY)"
+keywords = ["terminal", "pty", "conpty", "websocket", "wasm"]
+categories = ["emulators", "os", "wasm"]
 
 [lints]
 workspace = true
@@ -19,6 +19,18 @@ egui_xterm_core = { workspace = true, default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 portable-pty = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = [
+    "BinaryType",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "MessageEvent",
+    "WebSocket",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { workspace = true }

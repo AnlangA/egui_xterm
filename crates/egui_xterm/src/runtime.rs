@@ -9,8 +9,11 @@ use egui_xterm_core::{
     TerminalInput, TerminalIoError,
 };
 
+#[cfg(any(all(feature = "native-clipboard", target_arch = "wasm32"), test))]
+use crate::clipboard::ClipboardCompletion;
+use crate::clipboard::{ClipboardBridge, Osc52ReadDispatch, copy_text_everywhere};
 use crate::config::{ProgressIndicator, TerminalConfig, TerminalResponse};
-use crate::input_map::{InputMapperState, copy_text_everywhere, try_read_native_clipboard};
+use crate::input_map::InputMapperState;
 use crate::layout::TerminalLayoutState;
 use crate::renderer::TerminalRenderer;
 use crate::widgets::WidgetAction;
@@ -36,6 +39,9 @@ struct RuntimeInner<I: TerminalInput> {
     layout_state: TerminalLayoutState,
     renderer: TerminalRenderer,
     input_mapper: InputMapperState,
+    clipboard: ClipboardBridge,
+    #[cfg(any(all(feature = "native-clipboard", target_arch = "wasm32"), test))]
+    clipboard_completions: Vec<ClipboardCompletion>,
     poll_scratch: Vec<u8>,
     poll_staging: Vec<u8>,
     outgoing_scratch: Vec<u8>,
@@ -80,6 +86,9 @@ impl<I: TerminalInput> TerminalRuntime<I> {
                 layout_state: TerminalLayoutState::default(),
                 renderer: TerminalRenderer::default(),
                 input_mapper: InputMapperState::default(),
+                clipboard: ClipboardBridge::default(),
+                #[cfg(any(all(feature = "native-clipboard", target_arch = "wasm32"), test))]
+                clipboard_completions: Vec::new(),
                 poll_scratch: vec![0u8; POLL_CHUNK_BYTES],
                 poll_staging: Vec::new(),
                 outgoing_scratch: Vec::new(),
@@ -218,7 +227,126 @@ impl<I: TerminalInput> TerminalRuntime<I> {
     /// Dismisses a pending `OSC 52` clipboard read prompt without transmitting clipboard data,
     /// returning `true` if a prompt was pending.
     pub fn deny_osc52_read(&mut self) -> bool {
+        self.inner.clipboard.cancel_pending_osc52();
         self.inner.pending_osc52_read.take().is_some()
+    }
+
+    /// Triggers a clipboard paste into the terminal.
+    ///
+    /// On desktop targets with `native-clipboard`, reads the OS clipboard synchronously and
+    /// writes formatted paste bytes (respecting `DEC ?2004` bracketed paste) to the backend.
+    /// On `wasm32` with `native-clipboard`, initiates an asynchronous Web Clipboard API
+    /// `navigator.clipboard.readText()` request whose result is delivered on a subsequent
+    /// [`Self::show`] frame. Falls back to [`egui::ViewportCommand::RequestPaste`] when
+    /// platform clipboard access is disabled or unavailable.
+    pub fn request_clipboard_paste(&mut self, ctx: &egui::Context) {
+        self.inner.outgoing_scratch.clear();
+        if self.inner.clipboard.trigger_paste(
+            ctx,
+            &self.inner.terminal,
+            &mut self.inner.outgoing_scratch,
+        ) && !self.inner.outgoing_scratch.is_empty()
+        {
+            self.inner
+                .renderer
+                .note_input_activity(ctx.input(|i| i.time));
+            if let Err(err) = self.inner.input.write_bytes(&self.inner.outgoing_scratch)
+                && !err.is_closed()
+            {
+                self.inner.last_io_error = Some(err);
+            }
+            self.inner.outgoing_scratch.clear();
+        }
+    }
+
+    /// Approves a pending `OSC 52` clipboard read prompt by reading the host platform clipboard.
+    ///
+    /// Requires the `native-clipboard` feature (`arboard` on desktop, asynchronous Web Clipboard
+    /// API `navigator.clipboard.readText()` on `wasm32`). Returns `true` if a pending prompt
+    /// existed and the clipboard read completed (desktop) or started asynchronously (`wasm32`);
+    /// returns `false` without clearing the pending prompt if no prompt is active or platform
+    /// clipboard access is unavailable.
+    pub fn approve_osc52_read_from_clipboard(&mut self, ctx: &egui::Context) -> bool {
+        if self.inner.terminal.osc52_read_policy() == Osc52ReadPolicy::Deny {
+            self.inner.pending_osc52_read = None;
+            return false;
+        }
+        let Some(selection) = self.inner.pending_osc52_read else {
+            return false;
+        };
+        match self
+            .inner
+            .clipboard
+            .trigger_osc52_read(ctx, selection, &mut self.inner.terminal)
+        {
+            #[cfg(all(feature = "native-clipboard", not(target_arch = "wasm32")))]
+            Osc52ReadDispatch::CompletedSync => {
+                self.inner.pending_osc52_read = None;
+                let outgoing = self.inner.terminal.drain_outgoing();
+                if !outgoing.is_empty()
+                    && let Err(err) = self.inner.input.write_bytes(&outgoing)
+                    && !err.is_closed()
+                {
+                    self.inner.last_io_error = Some(err);
+                }
+                true
+            }
+            #[cfg(all(feature = "native-clipboard", target_arch = "wasm32"))]
+            Osc52ReadDispatch::StartedAsync => {
+                self.inner.pending_osc52_read = None;
+                true
+            }
+            Osc52ReadDispatch::Unavailable => false,
+        }
+    }
+
+    /// Reads the host platform clipboard to fulfill an `OSC 52` read request for `selection`.
+    ///
+    /// Respects the active [`Osc52ReadPolicy`] and returns `false` under
+    /// [`Osc52ReadPolicy::Deny`] or when platform clipboard access is unavailable.
+    pub fn request_osc52_read_from_clipboard(
+        &mut self,
+        ctx: &egui::Context,
+        selection: ClipboardSelection,
+    ) -> bool {
+        if self.inner.terminal.osc52_read_policy() == Osc52ReadPolicy::Deny {
+            return false;
+        }
+        match self
+            .inner
+            .clipboard
+            .trigger_osc52_read(ctx, selection, &mut self.inner.terminal)
+        {
+            #[cfg(all(feature = "native-clipboard", not(target_arch = "wasm32")))]
+            Osc52ReadDispatch::CompletedSync => {
+                let outgoing = self.inner.terminal.drain_outgoing();
+                if !outgoing.is_empty()
+                    && let Err(err) = self.inner.input.write_bytes(&outgoing)
+                    && !err.is_closed()
+                {
+                    self.inner.last_io_error = Some(err);
+                }
+                true
+            }
+            #[cfg(all(feature = "native-clipboard", target_arch = "wasm32"))]
+            Osc52ReadDispatch::StartedAsync => true,
+            Osc52ReadDispatch::Unavailable => false,
+        }
+    }
+
+    /// Returns `true` while an asynchronous platform clipboard read (such as browser
+    /// `navigator.clipboard.readText()`) is in flight or awaiting frame delivery.
+    #[must_use]
+    pub fn has_pending_clipboard_read(&self) -> bool {
+        self.inner.clipboard.has_pending_read()
+    }
+
+    /// Returns `true` when the `native-clipboard` feature is enabled and the host platform
+    /// exposes platform clipboard read access (on `wasm32`, verifies a secure context and
+    /// `window.navigator.clipboard.readText`).
+    #[must_use]
+    pub fn is_platform_clipboard_available() -> bool {
+        ClipboardBridge::is_platform_clipboard_available()
     }
 
     /// Explicitly updates the tracked `CapsLock` and `NumLock` modifier states used for Kitty
@@ -266,6 +394,7 @@ impl<I: TerminalInput> RuntimeInner<I> {
                 .set_osc52_read_policy(config.osc52_read_policy);
             if config.osc52_read_policy == Osc52ReadPolicy::Deny {
                 self.pending_osc52_read = None;
+                self.clipboard.cancel_pending_osc52();
             }
         }
 
@@ -460,7 +589,7 @@ impl<I: TerminalInput> RuntimeInner<I> {
         let scrollbar_pointer_active = scrollbar_frame.is_some_and(|s| s.pointer_active)
             || scrollbar_secondary_started_in_track;
 
-        let input_out = self.input_mapper.process_frame_events(
+        let input_out = self.input_mapper.process_frame_events_with_clipboard(
             ui,
             layout.response.id,
             &layout.response,
@@ -471,6 +600,7 @@ impl<I: TerminalInput> RuntimeInner<I> {
             now_secs,
             config,
             &mut self.terminal,
+            &self.clipboard,
             search_bar_focused,
             search_bar_actually_focused,
             search_bar_rect,
@@ -485,6 +615,34 @@ impl<I: TerminalInput> RuntimeInner<I> {
         if !input_out.bytes_to_write.is_empty() {
             self.outgoing_scratch
                 .extend_from_slice(&input_out.bytes_to_write);
+        }
+        // Drain completed asynchronous platform clipboard reads *after* input mapping so an
+        // authoritative browser `Event::Paste` in the same frame cancels any superseded async
+        // paste completion before it can be emitted twice.
+        #[cfg(any(all(feature = "native-clipboard", target_arch = "wasm32"), test))]
+        {
+            self.clipboard
+                .drain_completions(&mut self.clipboard_completions);
+            for completion in self.clipboard_completions.drain(..) {
+                match completion {
+                    ClipboardCompletion::Paste(text) => {
+                        if !text.is_empty() {
+                            self.renderer.note_input_activity(now_secs);
+                            self.terminal
+                                .format_paste_into(&text, &mut self.outgoing_scratch);
+                        }
+                    }
+                    ClipboardCompletion::PasteRejected => {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    }
+                    ClipboardCompletion::Osc52Read { selection, text } => {
+                        if self.terminal.osc52_read_policy() != Osc52ReadPolicy::Deny {
+                            self.terminal.provide_clipboard_read(selection, &text);
+                        }
+                    }
+                }
+            }
         }
         #[cfg(feature = "search")]
         if input_out.open_search_requested {
@@ -575,12 +733,12 @@ impl<I: TerminalInput> RuntimeInner<I> {
                     }
                 }
                 WidgetAction::PasteClipboard => {
-                    if let Some(text) = try_read_native_clipboard() {
-                        self.terminal
-                            .format_paste_into(&text, &mut self.outgoing_scratch);
-                    } else {
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    if self.clipboard.trigger_paste(
+                        ui.ctx(),
+                        &self.terminal,
+                        &mut self.outgoing_scratch,
+                    ) {
+                        self.renderer.note_input_activity(now_secs);
                     }
                 }
                 WidgetAction::ClearScrollback => {
@@ -1445,5 +1603,276 @@ mod tests {
             rev2 > rev1,
             "expected revision bump on animation frame advance"
         );
+    }
+
+    #[test]
+    fn async_clipboard_completions_handle_bracketed_paste_rejection_and_osc52_policy() {
+        let ctx = Context::default();
+        let mut rt =
+            TerminalRuntime::new(egui_xterm_core::RingBufferInput::from_bytes(b"\x1b[?2004h"));
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 400.0));
+
+        // Frame 1 enables bracketed paste (?2004).
+        let out1 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out1.drop_without_applying_deltas();
+        assert!(!rt.has_pending_clipboard_read());
+
+        // Simulate async Web Clipboard paste resolving with an embedded ESC[201~ escape attempt.
+        let paste_handle = rt.inner.clipboard.begin_test_paste().expect("paste handle");
+        assert!(rt.has_pending_clipboard_read());
+        assert!(paste_handle.resolve_paste("hello\x1b[201~world"));
+
+        let out2 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out2.drop_without_applying_deltas();
+        assert!(!rt.has_pending_clipboard_read());
+        let pasted = rt.input_mut().drain_written();
+        assert!(pasted.starts_with(b"\x1b[200~"));
+        assert!(pasted.ends_with(b"\x1b[201~"));
+        let inner = &pasted[6..pasted.len() - 6];
+        assert!(
+            !inner.windows(6).any(|w| w == b"\x1b[201~"),
+            "bracketed paste end marker must be sanitized: {inner:?}"
+        );
+
+        // Simulate browser denying clipboard permission -> falls back to ViewportCommand::RequestPaste.
+        let rej_handle = rt
+            .inner
+            .clipboard
+            .begin_test_paste()
+            .expect("reject handle");
+        assert!(rej_handle.reject_paste());
+        let out3 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.2),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        let root_cmds = out3
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.as_slice())
+            .unwrap_or(&[]);
+        assert!(
+            root_cmds
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::RequestPaste)),
+            "expected RequestPaste fallback on rejected async clipboard read"
+        );
+        out3.drop_without_applying_deltas();
+
+        // Async OSC 52 completion transmits when policy is Prompt/Allow, and coalesced distinct
+        // selections (Clipboard + Primary) both receive replies on a single read resolution.
+        rt.config_mut().osc52_read_policy = Osc52ReadPolicy::Prompt;
+        let osc_ok = rt
+            .inner
+            .clipboard
+            .begin_test_osc52(ClipboardSelection::Clipboard)
+            .expect("osc52 handle");
+        assert!(
+            rt.inner
+                .clipboard
+                .begin_test_osc52(ClipboardSelection::Primary)
+                .is_none()
+        );
+        assert!(osc_ok.resolve_osc52("web-clip"));
+        let out4 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.3),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out4.drop_without_applying_deltas();
+        assert_eq!(
+            rt.input_mut().drain_written(),
+            b"\x1b]52;c;d2ViLWNsaXA=\x1b\\\x1b]52;p;d2ViLWNsaXA=\x1b\\"
+        );
+
+        // Downgrading policy to Deny and then returning to Prompt before an old in-flight async
+        // OSC 52 read resolves MUST cancel the stale read so revoked consent never leaks.
+        let osc_revoked = rt
+            .inner
+            .clipboard
+            .begin_test_osc52(ClipboardSelection::Clipboard)
+            .expect("osc52 revoked handle");
+        rt.config_mut().osc52_read_policy = Osc52ReadPolicy::Deny;
+        let out5 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.4),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out5.drop_without_applying_deltas();
+
+        rt.config_mut().osc52_read_policy = Osc52ReadPolicy::Prompt;
+        let out6 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.5),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out6.drop_without_applying_deltas();
+        assert!(!osc_revoked.resolve_osc52("secret"));
+        let out7 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.6),
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out7.drop_without_applying_deltas();
+        assert!(rt.input_mut().drain_written().is_empty());
+    }
+
+    #[test]
+    fn event_paste_deduplicates_ctrl_shift_v_and_cancels_queued_async_paste() {
+        let ctx = Context::default();
+        let mut rt = TerminalRuntime::new(egui_xterm_core::RingBufferInput::new());
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 400.0));
+
+        // Frame 1: click to focus terminal.
+        let click = pos2(100.0, 100.0);
+        let out1 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                focused: true,
+                time: Some(0.0),
+                events: vec![
+                    egui::Event::PointerMoved(click),
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out1.drop_without_applying_deltas();
+        let _ = rt.input_mut().drain_written();
+
+        // Case A: Same frame carries BOTH Ctrl+Shift+V keydown AND browser Event::Paste("once")
+        // -> must paste EXACTLY once and NOT trigger a second platform read or RequestPaste.
+        let out2 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                focused: true,
+                time: Some(0.1),
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    },
+                    egui::Event::Paste("once".to_owned()),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        let root_cmds = out2
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.as_slice())
+            .unwrap_or(&[]);
+        assert!(
+            !root_cmds
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::RequestPaste)),
+            "same-frame Event::Paste must suppress fallback RequestPaste"
+        );
+        out2.drop_without_applying_deltas();
+        assert_eq!(rt.input_mut().drain_written(), b"once");
+
+        // Case B: Cross-frame race where an async Web Clipboard paste resolved BEFORE the frame
+        // runs AND browser Event::Paste("once") also arrives in the same frame -> must cancel
+        // the queued async completion and paste EXACTLY once.
+        let async_handle = rt.inner.clipboard.begin_test_paste().expect("async handle");
+        assert!(async_handle.resolve_paste("once"));
+        let out3 = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                focused: true,
+                time: Some(0.2),
+                events: vec![egui::Event::Paste("once".to_owned())],
+                ..Default::default()
+            },
+            |ui| {
+                CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
+                    drop(rt.show(ui));
+                });
+            },
+        );
+        out3.drop_without_applying_deltas();
+        assert_eq!(rt.input_mut().drain_written(), b"once");
+        assert!(!rt.has_pending_clipboard_read());
     }
 }

@@ -12,6 +12,7 @@ use egui_xterm_core::{
     SelectionKind, Terminal,
 };
 
+use crate::clipboard::{ClipboardBridge, copy_text_everywhere};
 use crate::config::{CopyBehavior, TerminalConfig};
 use crate::renderer::ImePreeditState;
 
@@ -111,6 +112,7 @@ impl InputMapperState {
 
     /// Applies focus lock, processes pointer/mouse/keyboard/IME/clipboard events, and updates
     /// selection and IME preedit state, borrowing the reusable `outgoing_scratch` buffer.
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments, reason = "per-frame input coordinator")]
     pub(crate) fn process_frame_events(
         &mut self,
@@ -132,6 +134,53 @@ impl InputMapperState {
         scrollbar_pointer_active: bool,
         context_menu_open: bool,
     ) -> InputFrameOutcome<'_> {
+        let clipboard = ClipboardBridge::default();
+        self.process_frame_events_with_clipboard(
+            ui,
+            id,
+            response,
+            term_rect,
+            cell_size,
+            cols,
+            rows,
+            now_secs,
+            config,
+            terminal,
+            &clipboard,
+            search_bar_focused,
+            search_bar_actually_focused,
+            search_bar_rect,
+            scrollbar_rect,
+            scrollbar_dragging,
+            scrollbar_pointer_active,
+            context_menu_open,
+        )
+    }
+
+    /// Applies focus lock, processes pointer/mouse/keyboard/IME/clipboard events with a
+    /// persistent [`ClipboardBridge`], and borrows the reusable `outgoing_scratch` buffer.
+    #[expect(clippy::too_many_arguments, reason = "per-frame input coordinator")]
+    pub(crate) fn process_frame_events_with_clipboard(
+        &mut self,
+        ui: &Ui,
+        id: egui::Id,
+        response: &egui::Response,
+        term_rect: Rect,
+        cell_size: Vec2,
+        cols: u16,
+        rows: u16,
+        now_secs: f64,
+        config: &TerminalConfig,
+        terminal: &mut Terminal,
+        clipboard: &ClipboardBridge,
+        search_bar_focused: bool,
+        search_bar_actually_focused: bool,
+        search_bar_rect: Option<Rect>,
+        scrollbar_rect: Option<Rect>,
+        scrollbar_dragging: bool,
+        scrollbar_pointer_active: bool,
+        context_menu_open: bool,
+    ) -> InputFrameOutcome<'_> {
         let mut scratch = std::mem::take(&mut self.outgoing_scratch);
         scratch.clear();
         let flags = self.process_frame_events_into(
@@ -145,6 +194,7 @@ impl InputMapperState {
             now_secs,
             config,
             terminal,
+            clipboard,
             search_bar_focused,
             search_bar_actually_focused,
             search_bar_rect,
@@ -180,6 +230,7 @@ impl InputMapperState {
         now_secs: f64,
         config: &TerminalConfig,
         terminal: &mut Terminal,
+        clipboard: &ClipboardBridge,
         search_bar_focused: bool,
         search_bar_actually_focused: bool,
         search_bar_rect: Option<Rect>,
@@ -731,6 +782,9 @@ impl InputMapperState {
 
         let is_mac = ui.ctx().os().is_mac();
         let filtered_events = ui.input(|i| i.filtered_events(&filter));
+        let frame_has_paste_event = filtered_events
+            .iter()
+            .any(|ev| matches!(ev, Event::Paste(_)));
         let mouse_protocol = terminal.active_modes().mouse_protocol;
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mut skip_next_text = false;
@@ -808,6 +862,9 @@ impl InputMapperState {
                     }
                 }
                 Event::Paste(text) => {
+                    // Authoritative host/browser paste event supersedes any pending async read
+                    // (e.g. `Ctrl+Shift+V` on browsers where both `keydown` and `paste` fire).
+                    clipboard.cancel_pending_paste();
                     out.any_user_activity = true;
                     terminal.format_paste_into(text, out_bytes);
                 }
@@ -944,11 +1001,10 @@ impl InputMapperState {
                             continue;
                         }
                         if *key == Key::V {
-                            if let Some(text) = try_read_native_clipboard() {
-                                terminal.format_paste_into(&text, out_bytes);
-                            } else {
-                                ui.ctx()
-                                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                            if !frame_has_paste_event
+                                && clipboard.trigger_paste(ui.ctx(), terminal, out_bytes)
+                            {
+                                out.any_user_activity = true;
                             }
                             skip_next_text = paired_text.is_some();
                             continue;
@@ -1055,29 +1111,6 @@ fn handle_copy_shortcut(
                 out_bytes.push(0x03);
             }
         }
-    }
-}
-
-pub(crate) fn copy_text_everywhere(ui: &Ui, text: String) {
-    #[cfg(all(feature = "native-clipboard", not(target_arch = "wasm32")))]
-    {
-        if let Ok(mut cb) = arboard::Clipboard::new()
-            && cb.set_text(text.clone()).is_err()
-        {
-            // Best-effort native clipboard write; `ui.ctx().copy_text` below is authoritative.
-        }
-    }
-    ui.ctx().copy_text(text);
-}
-
-pub(crate) fn try_read_native_clipboard() -> Option<String> {
-    #[cfg(all(feature = "native-clipboard", not(target_arch = "wasm32")))]
-    {
-        arboard::Clipboard::new().ok()?.get_text().ok()
-    }
-    #[cfg(not(all(feature = "native-clipboard", not(target_arch = "wasm32"))))]
-    {
-        None
     }
 }
 

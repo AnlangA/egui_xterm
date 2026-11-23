@@ -80,6 +80,7 @@
 
 #![forbid(unsafe_code)]
 
+mod clipboard;
 pub mod config;
 mod input_map;
 mod layout;
@@ -118,5 +119,5 @@ pub use egui_xterm_core::{SearchError, SearchMatch, SearchQuery};
 #[cfg(feature = "shell-integration")]
 pub use egui_xterm_core::{ShellZone, ZoneKind};
 
-#[cfg(all(feature = "pty", not(target_arch = "wasm32")))]
+#[cfg(feature = "pty")]
 pub use egui_xterm_pty as pty;

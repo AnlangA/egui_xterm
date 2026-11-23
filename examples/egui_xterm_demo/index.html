@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>egui_xterm Demo</title>
+    <link data-trunk rel="rust" />
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #121418;
+            color: #e6edf3;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            outline: none;
+        }
+
+        #loading_text {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            text-align: center;
+            font-size: 14px;
+            color: #9fb0c4;
+            background-color: #121418;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="egui_xterm_canvas"></canvas>
+    <div id="loading_text">Loading egui_xterm Demo…</div>
+</body>
+</html>

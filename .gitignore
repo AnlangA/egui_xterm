@@ -1,5 +1,6 @@
 # Build outputs
 /target/
+/examples/egui_xterm_demo/dist/
 **/*.rs.bk
 *.pdb
 

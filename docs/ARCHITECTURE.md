@@ -13,9 +13,9 @@
 
 | ID | Requirement | Architectural Response |
 |---|---|---|
-| **R1** | Multi-crate layout, single input trait, `egui` auto-layout/scaling/reflow | Split into `egui_xterm_core` (pure engine), `egui_xterm` (`egui` widget & runtime), `egui_xterm_pty` (desktop PTY), `egui_xterm_e2e` (opaque-box tests), and `examples/egui_xterm_demo`. Consumers implement a single non-blocking `TerminalInput::poll_read` method; calling `TerminalRuntime::show(ui)` inside any `egui::Frame` / panel detects `available_rect_before_wrap()`, recomputes grid dimensions or font scale, triggers lossless reflow, and debounces backend resizes. |
+| **R1** | Multi-crate layout, single input trait, `egui` auto-layout/scaling/reflow | Split into `egui_xterm_core` (pure engine), `egui_xterm` (`egui` widget & runtime), `egui_xterm_pty` (desktop `portable-pty` + `wasm32` WebSocket PTY), `egui_xterm_e2e` (opaque-box tests), `examples/egui_xterm_demo`, and `examples/egui_xterm_web_gateway`. Consumers implement a single non-blocking `TerminalInput::poll_read` method; calling `TerminalRuntime::show(ui)` inside any `egui::Frame` / panel detects `available_rect_before_wrap()`, recomputes grid dimensions or font scale, triggers lossless reflow, and debounces backend resizes. |
 | **R2** | Modern terminal capabilities & feature-gated extensions | Core provides VT500/VT520 ANSI parsing, 16/256/24-bit TrueColor, `OSC 5` special colors, UTF-8 + wide/grapheme handling, rectangular ops (`DECCRA`/`ERA`/`FRA`/`SERA`), `DECSCA`/`DECSED`/`DECSEL`, `DECLRMM`/`DECSLRM`, `XTPUSHSGR`/`XTPOPSGR`, `XTWINOPS`, `XTGETTCAP`/`DECRQSS`/`XTVERSION`, `G0..G3` charsets, lossless wrap/reflow, ring scrollback, selection/clipboard, mouse reporting (`?1016` SGR-pixels), `modifyOtherKeys`, alternate screen, DEC 2026 sync output, `OSC 6`/`9;4`/`22`/`52`/`66`/`99`. High-level features (`search`, `hyperlinks`, `shell-integration`, `kitty-keyboard`, `kitty-graphics`, `sixel`, `vector-glyphs`, `serde`, `metrics`) are additive Cargo features. |
-| **R3** | Native & `wasm32-unknown-unknown` portability | `egui_xterm_core` (`#![forbid(unsafe_code)]`) and default `egui_xterm` features are 100% pure-Rust and WASM-safe (using `ui.input(\|i\| i.time)` rather than OS clocks or threads). Desktop-only OS APIs live behind `pty` (`egui_xterm_pty`), `native-clipboard` (`arboard`), and desktop-gated `t=f/t/s` Kitty file/shm policies. |
+| **R3** | Native & `wasm32-unknown-unknown` portability | `egui_xterm_core` (`#![forbid(unsafe_code)]`) and every `egui_xterm` feature are WASM-safe (using `ui.input(\|i\| i.time)` rather than OS clocks or threads). Opt-in `pty` supports desktop `portable-pty` (`PtyBackend`) plus `wasm32` browser `WebSocket` (`WebPtyBackend`) and cross-platform `protocol`/`WebPtySession`; opt-in `native-clipboard` supports desktop `arboard` plus `wasm32` async Web Clipboard API (`navigator.clipboard`); Kitty `t=f/t/s` file/shm policies remain desktop-gated (`EBADF` on `wasm32`). |
 | **R4** | Smooth 60 fps (`<16ms`/frame) end-to-end performance | Split `Parser` + `TerminalState`, 8-byte SWAR ASCII + batch UTF-8 + `memchr` string/CSI fast-paths, 20-byte `Copy` `Cell` with `ExtraSlot` reuse, `Row::trimmed_len_cache` + row pooling, `O(Z log Z + L)` reflow, zero-alloc `RenderSnapshot<'_>`, coalesced `bg_mesh`/`text_mesh`/`overlay_mesh` with 1-row patching, and `PtyBackend` recycled read/write buffer pools. |
 | **R5** | Repository sync & clean-room boundary | Synchronized with `https://github.com/AnlangA/egui_xterm` preserving `AGENTS.md`. |
 
@@ -47,15 +47,15 @@ See [`MODERN_TERMINAL_GAP_ANALYSIS.md`](./MODERN_TERMINAL_GAP_ANALYSIS.md) for t
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │                   examples/egui_xterm_demo                           │
-│   (eframe 0.37 app: PTY tab on desktop + Trait-driven DemoShell tab) │
+│  (eframe 0.37: desktop PTY, wasm32 WebSocket PTY, Trait DemoShell)   │
 └───────────────┬──────────────────────────────────┬───────────────────┘
-                │                                  │ (desktop cfg)
+                │                                  │
                 ▼                                  ▼
 ┌───────────────────────────────┐      ┌───────────────────────────────┐
 │         egui_xterm            │      │        egui_xterm_pty         │
-│  TerminalRuntime<I>, Config,  │◄─────┤  PtyBackend (portable-pty)    │
-│  Auto-Layout/Scale, Coalesced │ opt  │  Recycled reader/writer pools │
-│  Mesh Renderer, Widgets       │      │  + decoupled child waiter     │
+│  TerminalRuntime<I>, Config,  │◄─────┤  PtyBackend + WebPtyBackend   │
+│  Auto-Layout/Scale, Coalesced │ opt  │  + protocol / WebPtySession   │
+│  Mesh Renderer, Widgets       │      │  (used by web_gateway too)    │
 └───────────────┬───────────────┘      └───────────────┬───────────────┘
                 │ (default-features = false)           │
                 ▼                                      ▼
@@ -151,14 +151,14 @@ pub trait TerminalInput {
 | `vector-glyphs` | `egui_xterm` | **Yes** | Yes | Crisp pixel-snapped vector Box Drawing, Block Elements, Braille, and Powerline glyphs |
 | `serde` | `egui_xterm_core`, `egui_xterm` | No | Yes | `Serialize`/`Deserialize` on sizes, colors, cells, config, themes, and `TerminalSnapshot` |
 | `metrics` | `egui_xterm_core`, `egui_xterm` | No | Yes | Parser throughput & per-frame timing counters (`TerminalMetrics`) |
-| `pty` | `egui_xterm` (`egui_xterm_pty`) | No | **No (Desktop)** | `portable-pty 0.9` `PtyBackend` with recycled buffer pools & background writer |
-| `native-clipboard` | `egui_xterm` (`arboard`) | No | **No (Desktop)** | OS clipboard fallback outside `egui` event context |
+| `pty` | `egui_xterm` (`egui_xterm_pty`) | No | **Yes (Desktop + Web)** | Desktop `portable-pty 0.9` `PtyBackend`, `wasm32` WebSocket `WebPtyBackend`, and cross-platform `protocol` + `WebPtySession` (`TaggedBinary`, `Ttyd`, `JsonResize`, `Raw`) |
+| `native-clipboard` | `egui_xterm` | No | **Yes (Desktop + Web)** | Platform clipboard outside `egui::Event::Paste`: sync `arboard` on desktop, async browser Web Clipboard API (`navigator.clipboard`) on `wasm32` |
 
 ### WASM32 & Safety Invariants
 
 1. All workspace crates enforce `#![forbid(unsafe_code)]`; `egui_xterm_core` contains zero `std::thread`, `std::process`, socket, or `std::time::Instant` usage, and `t=f/t/s` filesystem/shm transmission returns `EBADF` on `wasm32`.
 2. `egui_xterm` uses `ui.input(|i| i.time)` for all monotonic frame timing (cursor/SGR blink, visual bell decay, animation playback, resize debounce, and DEC Mode 2026 watchdog).
-3. Desktop-only dependencies (`egui_xterm_pty`, `arboard`) are strictly opt-in and excluded from `default` features.
+3. Target-specific dependencies (`portable-pty`/`arboard` on desktop, `web-sys`/`js-sys`/`wasm-bindgen`/`wasm-bindgen-futures` on `wasm32`) are cleanly gated behind opt-in `pty` and `native-clipboard` features and excluded from `default`.
 
 ---
 
@@ -182,7 +182,7 @@ pub trait TerminalInput {
 - `cargo test --workspace` & `cargo test --workspace --all-features`
 - `cargo test --doc --workspace`, `cargo test --doc --workspace --all-features`, `cargo test --doc -p egui_xterm_core --no-default-features`
 - `cargo check -p egui_xterm_core --no-default-features` & `cargo check -p egui_xterm --no-default-features`
-- `cargo +1.95.0 check --target wasm32-unknown-unknown -p egui_xterm_core -p egui_xterm` (plus `--no-default-features`, `--all-features` on core, `egui_xterm_pty`, and `egui_xterm_demo`)
+- `cargo check --target wasm32-unknown-unknown -p egui_xterm_core -p egui_xterm` (plus `--no-default-features`, `--all-features` on `egui_xterm_core` & `egui_xterm`, `egui_xterm_pty`, and `egui_xterm_demo`)
 
 ### Benchmark & Analysis Reports
 

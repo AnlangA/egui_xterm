@@ -13,9 +13,9 @@ Add `egui_xterm` to your `Cargo.toml` (Rust `1.95+`, Edition `2024`, `egui 0.37`
 egui = "0.37"
 egui_xterm = "0.2.0"
 
-# Optional on desktop targets for OS PTY sessions and arboard clipboard fallback:
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-egui_xterm = { version = "0.2.0", features = ["pty", "native-clipboard"] }
+# Optional cross-platform PTY (desktop portable-pty + wasm32 WebSocket WebPtyBackend)
+# and platform clipboard (desktop arboard + wasm32 Web Clipboard API):
+# egui_xterm = { version = "0.2.0", features = ["pty", "native-clipboard"] }
 ```
 
 ## Quickstart
@@ -88,15 +88,15 @@ fn show_terminal(ui: &mut egui::Ui, runtime: &mut TerminalRuntime<EchoInput>) {
 | `vector-glyphs` | **Yes** | Yes | Pixel-aligned analytical rendering for Box Drawing, Block Elements, Braille, and Powerline glyphs |
 | `serde` | No | Yes | `Serialize`/`Deserialize` on `TerminalConfig`, `ScaleMode`, `Theme`, `ColorScheme`, and `TerminalSnapshot` |
 | `metrics` | No | Yes | Lightweight `TerminalMetrics` throughput and frame counters |
-| `pty` | No | **No (Desktop)** | Re-exports `egui_xterm_pty` as `egui_xterm::pty` on `not(target_arch = "wasm32")` |
-| `native-clipboard` | No | **No (Desktop)** | `arboard` OS clipboard fallback outside `egui::Event::Paste` on `not(target_arch = "wasm32")` |
+| `pty` | No | **Yes (Desktop + Web)** | Re-exports `egui_xterm_pty` as `egui_xterm::pty` (desktop `portable-pty` `PtyBackend`, `wasm32` WebSocket `WebPtyBackend`, and cross-platform `protocol` + `WebPtySession`) |
+| `native-clipboard` | No | **Yes (Desktop + Web)** | Platform clipboard integration outside `egui::Event::Paste` (`arboard` on desktop, async Web Clipboard API `navigator.clipboard` on `wasm32`) |
 
 ## `wasm32-unknown-unknown` Verification
 
-Default features of `egui_xterm` compile cleanly for WebAssembly (`#![forbid(unsafe_code)]`):
+All features of `egui_xterm` compile cleanly for WebAssembly (`#![forbid(unsafe_code)]`):
 
 ```sh
-cargo +1.95.0 check -p egui_xterm --target wasm32-unknown-unknown
+cargo check -p egui_xterm --target wasm32-unknown-unknown --all-features
 ```
 
 [API documentation](https://docs.rs/egui_xterm) · [Architecture guide](https://github.com/AnlangA/egui_xterm/blob/main/docs/ARCHITECTURE.md) · [Modern terminal gap analysis](https://github.com/AnlangA/egui_xterm/blob/main/docs/MODERN_TERMINAL_GAP_ANALYSIS.md)
